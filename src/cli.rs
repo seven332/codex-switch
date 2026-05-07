@@ -24,9 +24,9 @@ pub enum Command {
     Import {
         /// Account display name.
         name: String,
-        /// Path to auth.json.
+        /// Path to auth.json. Defaults to the current Codex auth.json.
         #[arg(long)]
-        file: PathBuf,
+        file: Option<PathBuf>,
     },
     /// Switch Codex to a stored account.
     Switch {
