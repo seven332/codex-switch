@@ -10,6 +10,7 @@ use crate::types::{AuthData, StoredAccount, parse_chatgpt_id_token_claims};
 
 const DEFAULT_ISSUER: &str = "https://auth.openai.com";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const TOKEN_EXPIRY_REFRESH_MARGIN_SECONDS: i64 = 5 * 60;
 const TOKEN_REFRESH_INTERVAL_DAYS: i64 = 8;
 
 #[derive(Debug, Serialize)]
@@ -95,7 +96,8 @@ pub async fn refresh_chatgpt_tokens(account: &StoredAccount) -> Result<StoredAcc
 
 fn auth_expired_or_needs_refresh(account: &StoredAccount, access_token: &str) -> bool {
     if let Some(expires_at) = parse_jwt_expiration(access_token) {
-        return expires_at <= Utc::now();
+        return expires_at
+            <= Utc::now() + chrono::Duration::seconds(TOKEN_EXPIRY_REFRESH_MARGIN_SECONDS);
     }
 
     match account.token_last_refresh_at {
@@ -119,6 +121,70 @@ fn parse_jwt_expiration(token: &str) -> Option<DateTime<Utc>> {
     json.get("exp")
         .and_then(|value| value.as_i64())
         .and_then(|exp| DateTime::<Utc>::from_timestamp(exp, 0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{auth_expired_or_needs_refresh, parse_jwt_expiration};
+    use crate::types::{AuthData, AuthMode, StoredAccount};
+    use base64::Engine;
+    use chrono::{Duration, Utc};
+
+    #[test]
+    fn parse_jwt_expiration_reads_exp_claim() {
+        let exp = Utc::now().timestamp() + 3600;
+        let token = test_jwt_with_exp(exp);
+
+        assert_eq!(
+            parse_jwt_expiration(&token).map(|dt| dt.timestamp()),
+            Some(exp)
+        );
+    }
+
+    #[test]
+    fn auth_refreshes_when_access_token_is_near_expiry() {
+        let token = test_jwt_with_exp((Utc::now() + Duration::minutes(4)).timestamp());
+        let account = test_chatgpt_account(token.clone());
+
+        assert!(auth_expired_or_needs_refresh(&account, &token));
+    }
+
+    #[test]
+    fn auth_does_not_refresh_when_access_token_has_enough_lifetime() {
+        let token = test_jwt_with_exp((Utc::now() + Duration::minutes(10)).timestamp());
+        let account = test_chatgpt_account(token.clone());
+
+        assert!(!auth_expired_or_needs_refresh(&account, &token));
+    }
+
+    fn test_jwt_with_exp(exp: i64) -> String {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"exp":{exp}}}"#));
+        format!("{header}.{payload}.")
+    }
+
+    fn test_chatgpt_account(access_token: String) -> StoredAccount {
+        StoredAccount {
+            id: "account-id".to_string(),
+            name: "test".to_string(),
+            email: None,
+            plan_type: None,
+            chatgpt_user_id: None,
+            chatgpt_account_is_fedramp: false,
+            token_last_refresh_at: Some(Utc::now()),
+            subscription_expires_at: None,
+            auth_mode: AuthMode::ChatGPT,
+            auth_data: AuthData::ChatGPT {
+                id_token: "id-token".to_string(),
+                access_token,
+                refresh_token: "refresh-token".to_string(),
+                account_id: None,
+            },
+            created_at: Utc::now(),
+            last_used_at: None,
+        }
+    }
 }
 
 async fn refresh_tokens_with_refresh_token(refresh_token: &str) -> Result<RefreshTokenResponse> {

@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use futures::{StreamExt, stream};
 use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue, USER_AGENT};
 
@@ -20,17 +19,17 @@ pub async fn get_account_usage(account: &StoredAccount) -> Result<UsageInfo> {
 }
 
 pub async fn get_all_account_usage(accounts: &[StoredAccount]) -> Vec<UsageInfo> {
-    let concurrency = accounts.len().clamp(1, 10);
-    stream::iter(accounts.iter().cloned())
-        .map(|account| async move {
-            match get_account_usage(&account).await {
-                Ok(info) => info,
-                Err(err) => UsageInfo::error(account.id.clone(), err.to_string()),
-            }
-        })
-        .buffer_unordered(concurrency)
-        .collect()
-        .await
+    let mut results = Vec::with_capacity(accounts.len());
+
+    for account in accounts {
+        let info = match get_account_usage(account).await {
+            Ok(info) => info,
+            Err(err) => UsageInfo::error(account.id.clone(), err.to_string()),
+        };
+        results.push(info);
+    }
+
+    results
 }
 
 async fn get_usage_with_chatgpt_auth(account: &StoredAccount) -> Result<UsageInfo> {
