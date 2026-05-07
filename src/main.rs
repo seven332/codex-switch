@@ -37,6 +37,13 @@ async fn run() -> Result<()> {
             store::ensure_name_available(&name)?;
             process::ensure_can_switch()?;
             let account = oauth::login(name).await?;
+            if let Some(existing) = store::find_duplicate_account(&account)? {
+                anyhow::bail!(
+                    "account is already stored as {} ({})",
+                    existing.name,
+                    store::short_id(&existing.id)
+                );
+            }
             process::ensure_can_switch()?;
             let stored = store::add_account(account)?;
             let active = switcher::switch_to_account(&stored.id).await?;
@@ -47,10 +54,28 @@ async fn run() -> Result<()> {
             );
         }
         Command::Import { name, file } => {
-            store::ensure_name_available(&name)?;
+            let file = match file {
+                Some(file) => file,
+                None => auth_json::codex_auth_file()?,
+            };
             let account = auth_json::import_from_auth_json(&file, name)?;
+
+            if let Some(existing) = store::find_duplicate_account(&account)? {
+                anyhow::bail!(
+                    "auth.json is already imported as {} ({})",
+                    existing.name,
+                    store::short_id(&existing.id)
+                );
+            }
+
+            store::ensure_name_available(&account.name)?;
             let stored = store::add_account(account)?;
-            println!("Imported {} ({})", stored.name, store::short_id(&stored.id));
+            println!(
+                "Imported {} ({}) from {}",
+                stored.name,
+                store::short_id(&stored.id),
+                file.display()
+            );
         }
         Command::Switch { account } => {
             let active = switcher::switch_to_account(&account).await?;

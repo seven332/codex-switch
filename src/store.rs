@@ -122,6 +122,53 @@ pub fn add_account(account: StoredAccount) -> Result<StoredAccount> {
     Ok(stored)
 }
 
+pub fn find_duplicate_account(account: &StoredAccount) -> Result<Option<StoredAccount>> {
+    let store = load_accounts()?;
+    Ok(store
+        .accounts
+        .into_iter()
+        .find(|existing| has_same_auth_identity(existing, account)))
+}
+
+fn has_same_auth_identity(left: &StoredAccount, right: &StoredAccount) -> bool {
+    match (&left.auth_data, &right.auth_data) {
+        (AuthData::ApiKey { key: left_key }, AuthData::ApiKey { key: right_key }) => {
+            left_key == right_key
+        }
+        (
+            AuthData::ChatGPT {
+                id_token: left_id_token,
+                refresh_token: left_refresh_token,
+                account_id: left_account_id,
+                ..
+            },
+            AuthData::ChatGPT {
+                id_token: right_id_token,
+                refresh_token: right_refresh_token,
+                account_id: right_account_id,
+                ..
+            },
+        ) => {
+            same_non_empty_option(left_account_id.as_deref(), right_account_id.as_deref())
+                || same_non_empty(left_refresh_token, right_refresh_token)
+                || same_non_empty(left_id_token, right_id_token)
+                || (same_non_empty_option(
+                    left.chatgpt_user_id.as_deref(),
+                    right.chatgpt_user_id.as_deref(),
+                ) && same_non_empty_option(left.email.as_deref(), right.email.as_deref()))
+        }
+        _ => false,
+    }
+}
+
+fn same_non_empty(left: &str, right: &str) -> bool {
+    !left.is_empty() && left == right
+}
+
+fn same_non_empty_option(left: Option<&str>, right: Option<&str>) -> bool {
+    matches!((left, right), (Some(left), Some(right)) if same_non_empty(left, right))
+}
+
 pub fn resolve_account_id(store: &AccountsStore, selector: &str) -> Result<String> {
     if let Some(account) = store.accounts.iter().find(|account| account.id == selector) {
         return Ok(account.id.clone());
@@ -328,4 +375,64 @@ pub fn update_account_chatgpt_tokens(
 
 pub fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_same_auth_identity;
+    use crate::types::{NewChatGptAccount, StoredAccount};
+    use chrono::Utc;
+
+    #[test]
+    fn duplicate_auth_matches_api_key() {
+        let left = StoredAccount::new_api_key("left".to_string(), "sk-test".to_string());
+        let right = StoredAccount::new_api_key("right".to_string(), "sk-test".to_string());
+
+        assert!(has_same_auth_identity(&left, &right));
+    }
+
+    #[test]
+    fn duplicate_auth_matches_chatgpt_account_id() {
+        let left = chatgpt_account("left", Some("account-id"), "refresh-left", "id-left");
+        let right = chatgpt_account("right", Some("account-id"), "refresh-right", "id-right");
+
+        assert!(has_same_auth_identity(&left, &right));
+    }
+
+    #[test]
+    fn duplicate_auth_matches_chatgpt_refresh_token() {
+        let left = chatgpt_account("left", None, "refresh-token", "id-left");
+        let right = chatgpt_account("right", None, "refresh-token", "id-right");
+
+        assert!(has_same_auth_identity(&left, &right));
+    }
+
+    #[test]
+    fn duplicate_auth_rejects_different_chatgpt_accounts() {
+        let left = chatgpt_account("left", Some("left-account"), "left-refresh", "left-id");
+        let right = chatgpt_account("right", Some("right-account"), "right-refresh", "right-id");
+
+        assert!(!has_same_auth_identity(&left, &right));
+    }
+
+    fn chatgpt_account(
+        name: &str,
+        account_id: Option<&str>,
+        refresh_token: &str,
+        id_token: &str,
+    ) -> StoredAccount {
+        StoredAccount::new_chatgpt(NewChatGptAccount {
+            name: name.to_string(),
+            email: None,
+            plan_type: None,
+            chatgpt_user_id: None,
+            chatgpt_account_is_fedramp: false,
+            token_last_refresh_at: Utc::now(),
+            subscription_expires_at: None,
+            id_token: id_token.to_string(),
+            access_token: "access-token".to_string(),
+            refresh_token: refresh_token.to_string(),
+            account_id: account_id.map(str::to_string),
+        })
+    }
 }
