@@ -1,0 +1,184 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+env:
+  BIN_NAME: codex-switch
+  CARGO_TERM_COLOR: always
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+  CC_aarch64_unknown_linux_musl: musl-gcc
+  TARGET: aarch64-unknown-linux-musl
+
+jobs:
+  detect:
+    name: Detect version change
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.version.outputs.release }}
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect package version change
+        id: version
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          extract_version() {
+            awk '
+              /^\[package\]/ { in_package = 1; next }
+              /^\[/ && in_package { exit }
+              in_package && /^version = / {
+                split($0, fields, "\"")
+                print fields[2]
+                exit
+              }
+            ' "$1"
+          }
+
+          version="$(extract_version Cargo.toml)"
+          if [ -z "$version" ]; then
+            echo "Package version not found in Cargo.toml" >&2
+            exit 1
+          fi
+
+          release=false
+          if printf '%s' "$BEFORE_SHA" | grep -Eq '^0+$'; then
+            release=true
+          else
+            previous_cargo_toml="$(mktemp)"
+            previous_version=""
+            if git show "$BEFORE_SHA:Cargo.toml" > "$previous_cargo_toml" 2>/dev/null; then
+              previous_version="$(extract_version "$previous_cargo_toml")"
+            fi
+            rm -f "$previous_cargo_toml"
+
+            if [ "$previous_version" != "$version" ]; then
+              release=true
+            fi
+          fi
+
+          {
+            echo "release=$release"
+            echo "tag=v$version"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build Linux ARM64 musl
+    needs: detect
+    if: needs.detect.outputs.release == 'true'
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      asset_name: ${{ steps.package.outputs.asset_name }}
+      artifact_name: ${{ steps.package.outputs.artifact_name }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          rustc --version
+          cargo --version
+          uname -m
+
+      - name: Install musl tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install target
+        run: rustup target add "$TARGET"
+
+      - name: Build
+        run: cargo build --release --locked --target "$TARGET"
+
+      - name: Package
+        id: package
+        run: |
+          asset_name="$BIN_NAME-$TARGET"
+
+          mkdir -p dist
+          cp "target/$TARGET/release/$BIN_NAME" "dist/$asset_name"
+          chmod 0755 "dist/$asset_name"
+
+          {
+            echo "asset_name=$asset_name"
+            echo "artifact_name=$asset_name"
+            echo "artifact_path=dist/$asset_name"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: ${{ steps.package.outputs.artifact_path }}
+          if-no-files-found: error
+
+  release:
+    name: Tag and release
+    needs:
+      - detect
+      - build
+    if: needs.detect.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: dist
+
+      - name: Create tag
+        env:
+          TAG: ${{ needs.detect.outputs.tag }}
+        run: |
+          tag_commit="$(git rev-list -n 1 "$TAG" 2>/dev/null || true)"
+
+          if [ -n "$tag_commit" ]; then
+            if [ "$tag_commit" != "$GITHUB_SHA" ]; then
+              echo "Tag $TAG already points to $tag_commit, expected $GITHUB_SHA" >&2
+              exit 1
+            fi
+            echo "Tag $TAG already points to $GITHUB_SHA"
+          else
+            git tag "$TAG" "$GITHUB_SHA"
+            git push origin "refs/tags/$TAG"
+          fi
+
+      - name: Create release
+        env:
+          ASSET_NAME: ${{ needs.build.outputs.asset_name }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.detect.outputs.tag }}
+        run: |
+          asset="dist/$ASSET_NAME"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$asset" --clobber
+          else
+            gh release create "$TAG" "$asset" \
+              --target "$GITHUB_SHA" \
+              --title "$TAG" \
+              --notes "Automated release for $TAG."
+          fi
