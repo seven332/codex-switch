@@ -11,6 +11,7 @@ use crate::types::{NewChatGptAccount, StoredAccount, parse_chatgpt_id_token_clai
 const DEFAULT_ISSUER: &str = "https://auth.openai.com";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEVICE_AUTH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const DEFAULT_DEVICE_AUTH_POLL_INTERVAL_SECS: u64 = 5;
 
 #[derive(Debug, Clone)]
 struct DeviceCode {
@@ -114,7 +115,7 @@ async fn request_device_code(client: &reqwest::Client, issuer: &str) -> Result<D
         verification_url: format!("{issuer}/codex/device"),
         user_code: user_code.user_code,
         device_auth_id: user_code.device_auth_id,
-        interval: user_code.interval,
+        interval: normalize_poll_interval(user_code.interval),
     })
 }
 
@@ -208,9 +209,21 @@ where
     }
 
     match Option::<Interval>::deserialize(deserializer)? {
-        Some(Interval::String(value)) => value.trim().parse::<u64>().map_err(de::Error::custom),
-        Some(Interval::Number(value)) => Ok(value),
+        Some(Interval::String(value)) => value
+            .trim()
+            .parse::<u64>()
+            .map(normalize_poll_interval)
+            .map_err(de::Error::custom),
+        Some(Interval::Number(value)) => Ok(normalize_poll_interval(value)),
         None => Ok(0),
+    }
+}
+
+fn normalize_poll_interval(seconds: u64) -> u64 {
+    if seconds == 0 {
+        DEFAULT_DEVICE_AUTH_POLL_INTERVAL_SECS
+    } else {
+        seconds
     }
 }
 
@@ -224,4 +237,19 @@ fn print_device_code_prompt(device_code: &DeviceCode) {
     println!("   {}", device_code.user_code);
     println!();
     println!("Waiting for authorization...");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_poll_interval;
+
+    #[test]
+    fn normalize_poll_interval_uses_default_for_zero() {
+        assert_eq!(normalize_poll_interval(0), 5);
+    }
+
+    #[test]
+    fn normalize_poll_interval_preserves_server_value() {
+        assert_eq!(normalize_poll_interval(2), 2);
+    }
 }

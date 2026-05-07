@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use uuid::Uuid;
 
 use crate::types::{AccountsStore, AuthData, StoredAccount};
 
@@ -49,15 +50,32 @@ pub fn write_private_file(path: &Path, content: &str) -> Result<()> {
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+        let temp_path = temp_file_path(path);
         let mut file = fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
-            .open(path)
-            .with_context(|| format!("Failed to open private file: {}", path.display()))?;
+            .open(&temp_path)
+            .with_context(|| format!("Failed to open private file: {}", temp_path.display()))?;
         file.write_all(content.as_bytes())
-            .with_context(|| format!("Failed to write private file: {}", path.display()))?;
+            .with_context(|| format!("Failed to write private file: {}", temp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("Failed to sync private file: {}", temp_path.display()))?;
+        drop(file);
+
+        fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o600)).with_context(|| {
+            format!(
+                "Failed to set private file permissions: {}",
+                temp_path.display()
+            )
+        })?;
+        fs::rename(&temp_path, path).with_context(|| {
+            format!(
+                "Failed to replace private file {} with {}",
+                path.display(),
+                temp_path.display()
+            )
+        })?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .with_context(|| format!("Failed to set file permissions: {}", path.display()))?;
     }
@@ -69,6 +87,14 @@ pub fn write_private_file(path: &Path, content: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn temp_file_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("private");
+    path.with_file_name(format!(".{file_name}.{}.tmp", Uuid::new_v4()))
 }
 
 pub fn ensure_name_available(name: &str) -> Result<()> {
