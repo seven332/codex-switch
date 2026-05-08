@@ -34,7 +34,19 @@ enum UsageDecision {
 pub async fn auto_switch(threshold: f64) -> Result<AutoSwitchResult> {
     validate_threshold(threshold)?;
     process::ensure_can_switch()?;
+    auto_switch_inner(threshold, false).await
+}
 
+pub async fn auto_switch_allow_running(threshold: f64) -> Result<AutoSwitchResult> {
+    validate_threshold(threshold)?;
+    auto_switch_inner(threshold, true).await
+}
+
+pub fn usage_requires_switch(info: &UsageInfo, threshold: f64) -> bool {
+    matches!(assess_usage(info, threshold), UsageDecision::Unavailable(_))
+}
+
+async fn auto_switch_inner(threshold: f64, allow_running: bool) -> Result<AutoSwitchResult> {
     let store = store::load_accounts()?;
     if store.accounts.is_empty() {
         anyhow::bail!("No accounts stored.");
@@ -99,7 +111,11 @@ pub async fn auto_switch(threshold: f64) -> Result<AutoSwitchResult> {
 
         match assess_usage(&info, threshold) {
             UsageDecision::Usable(_) => {
-                let switched = switcher::switch_to_account(&account.id).await?;
+                let switched = if allow_running {
+                    switcher::switch_to_account_unchecked(&account.id).await?
+                } else {
+                    switcher::switch_to_account(&account.id).await?
+                };
                 return Ok(AutoSwitchResult::Switched {
                     from: active.map(Box::new),
                     to: Box::new(switched),

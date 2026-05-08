@@ -42,6 +42,18 @@ pub enum Command {
         #[arg(long, default_value_t = 100.0)]
         threshold: f64,
     },
+    /// Run Codex with runtime account auto-switching.
+    Run {
+        /// Usage percent threshold that marks an account unavailable.
+        #[arg(long, default_value_t = 100.0)]
+        threshold: f64,
+        /// Codex executable to launch.
+        #[arg(long, default_value = "codex")]
+        codex_bin: String,
+        /// Arguments forwarded to `codex`.
+        #[arg(value_name = "CODEX_ARGS", num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true)]
+        codex_args: Vec<String>,
+    },
     /// Show usage for one account, the active account, or all accounts.
     Usage {
         /// Query every stored account.
