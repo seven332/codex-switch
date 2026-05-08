@@ -4,8 +4,8 @@ use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue, USER_AG
 
 use crate::token;
 use crate::types::{
-    AdditionalRateLimitDetails, AuthData, CreditStatusDetails, RateLimitDetails,
-    RateLimitStatusPayload, RateLimitWindow, StoredAccount, UsageInfo, UsageLimitInfo,
+    AdditionalRateLimitDetails, AuthData, CreditStatusDetails, RateLimitStatusDetails,
+    RateLimitStatusPayload, RateLimitWindowSnapshot, StoredAccount, UsageInfo, UsageLimitInfo,
 };
 
 const CHATGPT_BACKEND_API: &str = "https://chatgpt.com/backend-api";
@@ -132,18 +132,19 @@ async fn parse_usage_response(account_id: &str, response: reqwest::Response) -> 
 }
 
 fn convert_payload_to_usage_info(account_id: &str, payload: RateLimitStatusPayload) -> UsageInfo {
-    let plan_type = Some(payload.plan_type.clone());
+    let plan_type = Some(payload.plan_type.as_str().to_string());
     let rate_limit_reached_type = payload
         .rate_limit_reached_type
         .as_ref()
-        .map(|details| details.kind.clone());
+        .and_then(|details| details.as_ref())
+        .and_then(|details| details.kind.as_str().map(str::to_string));
     let mut snapshots = vec![make_usage_snapshot(
         Some("codex".to_string()),
         None,
         payload.rate_limit,
     )];
 
-    if let Some(additional) = payload.additional_rate_limits {
+    if let Some(Some(additional)) = payload.additional_rate_limits {
         snapshots.extend(additional.into_iter().map(make_additional_usage_snapshot));
     }
 
@@ -167,7 +168,7 @@ fn convert_payload_to_usage_info(account_id: &str, payload: RateLimitStatusPaylo
         secondary_resets_at: preferred.secondary_resets_at,
         has_credits: credits.as_ref().map(|credits| credits.has_credits),
         unlimited_credits: credits.as_ref().map(|credits| credits.unlimited),
-        credits_balance: credits.and_then(|credits| credits.balance),
+        credits_balance: credits.and_then(|credits| credits.balance.flatten()),
         rate_limit_reached_type,
         additional_limits: snapshots,
         error: None,
@@ -185,25 +186,29 @@ fn make_additional_usage_snapshot(details: AdditionalRateLimitDetails) -> UsageL
 fn make_usage_snapshot(
     limit_id: Option<String>,
     limit_name: Option<String>,
-    rate_limit: Option<RateLimitDetails>,
+    rate_limit: Option<Option<Box<RateLimitStatusDetails>>>,
 ) -> UsageLimitInfo {
     let (primary, secondary) = extract_rate_limits(rate_limit);
 
     UsageLimitInfo {
         limit_id,
         limit_name,
-        primary_used_percent: primary.as_ref().map(|window| window.used_percent),
+        primary_used_percent: primary
+            .as_ref()
+            .map(|window| f64::from(window.used_percent)),
         primary_window_minutes: primary
             .as_ref()
-            .and_then(|window| window.limit_window_seconds)
+            .map(|window| window.limit_window_seconds)
             .map(window_minutes_from_seconds),
-        primary_resets_at: primary.as_ref().and_then(|window| window.reset_at),
-        secondary_used_percent: secondary.as_ref().map(|window| window.used_percent),
+        primary_resets_at: primary.as_ref().map(|window| i64::from(window.reset_at)),
+        secondary_used_percent: secondary
+            .as_ref()
+            .map(|window| f64::from(window.used_percent)),
         secondary_window_minutes: secondary
             .as_ref()
-            .and_then(|window| window.limit_window_seconds)
+            .map(|window| window.limit_window_seconds)
             .map(window_minutes_from_seconds),
-        secondary_resets_at: secondary.as_ref().and_then(|window| window.reset_at),
+        secondary_resets_at: secondary.as_ref().map(|window| i64::from(window.reset_at)),
     }
 }
 
@@ -212,14 +217,67 @@ fn window_minutes_from_seconds(seconds: i32) -> i64 {
 }
 
 fn extract_rate_limits(
-    rate_limit: Option<RateLimitDetails>,
-) -> (Option<RateLimitWindow>, Option<RateLimitWindow>) {
-    match rate_limit {
-        Some(details) => (details.primary_window, details.secondary_window),
-        None => (None, None),
-    }
+    rate_limit: Option<Option<Box<RateLimitStatusDetails>>>,
+) -> (
+    Option<RateLimitWindowSnapshot>,
+    Option<RateLimitWindowSnapshot>,
+) {
+    let Some(details) = rate_limit.flatten() else {
+        return (None, None);
+    };
+    let details = *details;
+    (
+        details.primary_window.flatten().map(|window| *window),
+        details.secondary_window.flatten().map(|window| *window),
+    )
 }
 
-fn extract_credits(credits: Option<CreditStatusDetails>) -> Option<CreditStatusDetails> {
-    credits
+fn extract_credits(
+    credits: Option<Option<Box<CreditStatusDetails>>>,
+) -> Option<CreditStatusDetails> {
+    credits.flatten().map(|credits| *credits)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::convert_payload_to_usage_info;
+    use crate::types::RateLimitStatusPayload;
+
+    #[test]
+    fn usage_payload_accepts_codex_rate_limit_reached_type_field() {
+        let payload: RateLimitStatusPayload = serde_json::from_value(serde_json::json!({
+            "plan_type": "plus",
+            "rate_limit": {
+                "allowed": false,
+                "limit_reached": true,
+                "primary_window": {
+                    "used_percent": 100,
+                    "limit_window_seconds": 18000,
+                    "reset_after_seconds": 300,
+                    "reset_at": 1_800_000_000
+                },
+                "secondary_window": null
+            },
+            "credits": {
+                "has_credits": true,
+                "unlimited": false,
+                "balance": "12.5"
+            },
+            "rate_limit_reached_type": {
+                "type": "workspace_member_usage_limit_reached"
+            }
+        }))
+        .expect("payload should parse");
+
+        let info = convert_payload_to_usage_info("account-id", payload);
+
+        assert_eq!(
+            info.rate_limit_reached_type.as_deref(),
+            Some("workspace_member_usage_limit_reached")
+        );
+        assert_eq!(info.primary_used_percent, Some(100.0));
+        assert_eq!(info.primary_window_minutes, Some(300));
+        assert_eq!(info.primary_resets_at, Some(1_800_000_000));
+        assert_eq!(info.credits_balance.as_deref(), Some("12.5"));
+    }
 }

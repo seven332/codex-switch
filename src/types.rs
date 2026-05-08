@@ -291,47 +291,157 @@ impl UsageInfo {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RateLimitStatusPayload {
-    pub plan_type: String,
-    #[serde(default)]
-    pub rate_limit: Option<RateLimitDetails>,
-    #[serde(default)]
-    pub additional_rate_limits: Option<Vec<AdditionalRateLimitDetails>>,
-    #[serde(default)]
-    pub credits: Option<CreditStatusDetails>,
-    #[serde(default)]
-    pub rate_limit_reached_type: Option<RateLimitReachedTypeDetails>,
+    #[serde(rename = "plan_type")]
+    pub plan_type: PlanType,
+    #[serde(rename = "rate_limit", default)]
+    pub rate_limit: Option<Option<Box<RateLimitStatusDetails>>>,
+    #[serde(rename = "credits", default)]
+    pub credits: Option<Option<Box<CreditStatusDetails>>>,
+    #[serde(rename = "additional_rate_limits", default)]
+    pub additional_rate_limits: Option<Option<Vec<AdditionalRateLimitDetails>>>,
+    #[serde(rename = "rate_limit_reached_type", default)]
+    pub rate_limit_reached_type: Option<Option<RateLimitReachedType>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AdditionalRateLimitDetails {
+    #[serde(rename = "limit_name")]
     pub limit_name: String,
+    #[serde(rename = "metered_feature")]
     pub metered_feature: String,
-    #[serde(default)]
-    pub rate_limit: Option<RateLimitDetails>,
+    #[serde(rename = "rate_limit", default)]
+    pub rate_limit: Option<Option<Box<RateLimitStatusDetails>>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct RateLimitReachedTypeDetails {
-    pub kind: String,
+pub struct RateLimitReachedType {
+    #[serde(rename = "type")]
+    pub kind: RateLimitReachedKind,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct RateLimitDetails {
-    pub primary_window: Option<RateLimitWindow>,
-    pub secondary_window: Option<RateLimitWindow>,
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub enum RateLimitReachedKind {
+    #[serde(rename = "rate_limit_reached")]
+    RateLimitReached,
+    #[serde(rename = "workspace_owner_credits_depleted")]
+    WorkspaceOwnerCreditsDepleted,
+    #[serde(rename = "workspace_member_credits_depleted")]
+    WorkspaceMemberCreditsDepleted,
+    #[serde(rename = "workspace_owner_usage_limit_reached")]
+    WorkspaceOwnerUsageLimitReached,
+    #[serde(rename = "workspace_member_usage_limit_reached")]
+    WorkspaceMemberUsageLimitReached,
+    #[serde(rename = "unknown", other)]
+    Unknown,
 }
 
+impl RateLimitReachedKind {
+    pub fn as_str(self) -> Option<&'static str> {
+        match self {
+            Self::RateLimitReached => Some("rate_limit_reached"),
+            Self::WorkspaceOwnerCreditsDepleted => Some("workspace_owner_credits_depleted"),
+            Self::WorkspaceMemberCreditsDepleted => Some("workspace_member_credits_depleted"),
+            Self::WorkspaceOwnerUsageLimitReached => Some("workspace_owner_usage_limit_reached"),
+            Self::WorkspaceMemberUsageLimitReached => Some("workspace_member_usage_limit_reached"),
+            Self::Unknown => None,
+        }
+    }
+}
+
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
-pub struct RateLimitWindow {
-    pub used_percent: f64,
-    pub limit_window_seconds: Option<i32>,
-    pub reset_at: Option<i64>,
+pub struct RateLimitStatusDetails {
+    #[serde(rename = "allowed")]
+    pub allowed: bool,
+    #[serde(rename = "limit_reached")]
+    pub limit_reached: bool,
+    #[serde(rename = "primary_window", default)]
+    pub primary_window: Option<Option<Box<RateLimitWindowSnapshot>>>,
+    #[serde(rename = "secondary_window", default)]
+    pub secondary_window: Option<Option<Box<RateLimitWindowSnapshot>>>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct RateLimitWindowSnapshot {
+    #[serde(rename = "used_percent")]
+    pub used_percent: i32,
+    #[serde(rename = "limit_window_seconds")]
+    pub limit_window_seconds: i32,
+    #[serde(rename = "reset_after_seconds")]
+    pub reset_after_seconds: i32,
+    #[serde(rename = "reset_at")]
+    pub reset_at: i32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreditStatusDetails {
+    #[serde(rename = "has_credits")]
     pub has_credits: bool,
+    #[serde(rename = "unlimited")]
     pub unlimited: bool,
-    #[serde(default)]
-    pub balance: Option<String>,
+    #[serde(rename = "balance", default)]
+    pub balance: Option<Option<String>>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub enum PlanType {
+    #[serde(rename = "guest")]
+    Guest,
+    #[serde(rename = "free")]
+    Free,
+    #[serde(rename = "go")]
+    Go,
+    #[serde(rename = "plus")]
+    Plus,
+    #[serde(rename = "pro")]
+    Pro,
+    #[serde(rename = "prolite")]
+    ProLite,
+    #[serde(rename = "free_workspace")]
+    FreeWorkspace,
+    #[serde(rename = "team")]
+    Team,
+    #[serde(rename = "self_serve_business_usage_based")]
+    SelfServeBusinessUsageBased,
+    #[serde(rename = "business")]
+    Business,
+    #[serde(rename = "enterprise_cbp_usage_based")]
+    EnterpriseCbpUsageBased,
+    #[serde(rename = "education")]
+    Education,
+    #[serde(rename = "quorum")]
+    Quorum,
+    #[serde(rename = "k12")]
+    K12,
+    #[serde(rename = "enterprise")]
+    Enterprise,
+    #[serde(rename = "edu")]
+    Edu,
+    #[serde(rename = "unknown", other)]
+    Unknown,
+}
+
+impl PlanType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Guest => "guest",
+            Self::Free => "free",
+            Self::Go => "go",
+            Self::Plus => "plus",
+            Self::Pro => "pro",
+            Self::ProLite => "prolite",
+            Self::FreeWorkspace => "free_workspace",
+            Self::Team => "team",
+            Self::SelfServeBusinessUsageBased => "self_serve_business_usage_based",
+            Self::Business => "business",
+            Self::EnterpriseCbpUsageBased => "enterprise_cbp_usage_based",
+            Self::Education => "education",
+            Self::Quorum => "quorum",
+            Self::K12 => "k12",
+            Self::Enterprise => "enterprise",
+            Self::Edu => "edu",
+            Self::Unknown => "unknown",
+        }
+    }
 }
