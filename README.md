@@ -40,6 +40,8 @@ On Unix, both files are written with `0600` permissions.
 
 `login` uses ChatGPT/OpenAI browser OAuth by default. It starts a local callback server, opens the browser, saves the account, and switches it active.
 
+The browser callback server uses the same ports as Codex: `1455` by default, with `1457` as the fallback.
+
 Use `codex-switch login <name> --device-auth` for device authorization. The CLI prints a verification URL and one-time code, then waits for authorization.
 
 ## Import
@@ -54,10 +56,11 @@ Usage reporting is supported for ChatGPT OAuth accounts. API key accounts are li
 
 ## Release
 
-The GitHub Actions release workflow builds `aarch64-unknown-linux-musl`. On pushes to `master`, it compares the current Cargo package version with the previous `Cargo.toml` version. When the version changes, it creates tag `v{version}`, creates a GitHub release, and uploads the raw binary:
+The GitHub Actions release workflow builds Linux musl binaries for `aarch64` and `x86_64`. On pushes to `master`, it compares the current Cargo package version with the previous `Cargo.toml` version. When the version changes, it creates tag `v{version}`, creates a GitHub release, and uploads the raw binaries:
 
 ```text
 codex-switch-aarch64-unknown-linux-musl
+codex-switch-x86_64-unknown-linux-musl
 ```
 
 ## Development
