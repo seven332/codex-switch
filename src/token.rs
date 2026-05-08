@@ -10,7 +10,6 @@ use crate::types::{AuthData, StoredAccount, parse_chatgpt_id_token_claims};
 
 const DEFAULT_ISSUER: &str = "https://auth.openai.com";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-const TOKEN_EXPIRY_REFRESH_MARGIN_SECONDS: i64 = 5 * 60;
 const TOKEN_REFRESH_INTERVAL_DAYS: i64 = 8;
 
 #[derive(Debug, Serialize)]
@@ -96,8 +95,7 @@ pub async fn refresh_chatgpt_tokens(account: &StoredAccount) -> Result<StoredAcc
 
 fn auth_expired_or_needs_refresh(account: &StoredAccount, access_token: &str) -> bool {
     if let Some(expires_at) = parse_jwt_expiration(access_token) {
-        return expires_at
-            <= Utc::now() + chrono::Duration::seconds(TOKEN_EXPIRY_REFRESH_MARGIN_SECONDS);
+        return expires_at <= Utc::now();
     }
 
     match account.token_last_refresh_at {
@@ -142,16 +140,16 @@ mod tests {
     }
 
     #[test]
-    fn auth_refreshes_when_access_token_is_near_expiry() {
-        let token = test_jwt_with_exp((Utc::now() + Duration::minutes(4)).timestamp());
+    fn auth_refreshes_when_access_token_is_expired() {
+        let token = test_jwt_with_exp((Utc::now() - Duration::minutes(1)).timestamp());
         let account = test_chatgpt_account(token.clone());
 
         assert!(auth_expired_or_needs_refresh(&account, &token));
     }
 
     #[test]
-    fn auth_does_not_refresh_when_access_token_has_enough_lifetime() {
-        let token = test_jwt_with_exp((Utc::now() + Duration::minutes(10)).timestamp());
+    fn auth_does_not_refresh_before_access_token_expiry() {
+        let token = test_jwt_with_exp((Utc::now() + Duration::minutes(4)).timestamp());
         let account = test_chatgpt_account(token.clone());
 
         assert!(!auth_expired_or_needs_refresh(&account, &token));
