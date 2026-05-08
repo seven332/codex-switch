@@ -15,10 +15,13 @@ pub struct Cli {
 pub enum Command {
     /// List stored accounts.
     List,
-    /// Log in with ChatGPT/OpenAI device authorization and switch to the new account.
+    /// Log in with ChatGPT/OpenAI OAuth and switch to the new account.
     Login {
         /// Account display name.
         name: String,
+        /// Use device authorization instead of browser OAuth.
+        #[arg(long = "device-auth")]
+        device_auth: bool,
     },
     /// Import an existing Codex CLI auth.json.
     Import {

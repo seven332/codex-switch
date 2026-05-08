@@ -33,10 +33,15 @@ async fn run() -> Result<()> {
             let store = store::load_accounts()?;
             print_accounts(&store);
         }
-        Command::Login { name } => {
+        Command::Login { name, device_auth } => {
             store::ensure_name_available(&name)?;
             process::ensure_can_switch()?;
-            let account = oauth::login(name).await?;
+            let flow = if device_auth {
+                oauth::LoginFlow::DeviceAuth
+            } else {
+                oauth::LoginFlow::Browser
+            };
+            let account = oauth::login(name, flow).await?;
             if let Some(existing) = store::find_duplicate_account(&account)? {
                 anyhow::bail!(
                     "account is already stored as {} ({})",
