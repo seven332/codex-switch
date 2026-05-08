@@ -15,6 +15,7 @@ codex-switch list
 codex-switch login <name> [--device-auth]
 codex-switch import <name> [--file <path>]
 codex-switch switch <name-or-id>
+codex-switch auto-switch [--threshold <percent>]
 codex-switch usage [name-or-id]
 codex-switch usage --all
 codex-switch delete <name-or-id>
@@ -35,6 +36,8 @@ On Unix, both files are written with `0600` permissions.
 ## Switching
 
 `switch` refuses to write Codex auth data while active Codex processes are detected. Close Codex before switching accounts.
+
+`auto-switch` also refuses to switch while Codex is running. When Codex is not running, it checks the active ChatGPT OAuth account. If the account is out of credits, rate-limited, usage-limited, or at the configured usage threshold, it switches to the first stored ChatGPT OAuth account that is still usable. API key accounts are not usage-checkable and are skipped as replacement candidates.
 
 ## Login
 
