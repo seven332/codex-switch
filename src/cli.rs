@@ -36,6 +36,12 @@ pub enum Command {
         /// Account name, full ID, or unique ID prefix.
         account: String,
     },
+    /// Switch to a usable account when the active account is out of usage.
+    AutoSwitch {
+        /// Usage percent threshold that marks an account unavailable.
+        #[arg(long, default_value_t = 100.0)]
+        threshold: f64,
+    },
     /// Show usage for one account, the active account, or all accounts.
     Usage {
         /// Query every stored account.

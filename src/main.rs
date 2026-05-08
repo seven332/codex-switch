@@ -1,4 +1,5 @@
 mod auth_json;
+mod auto_switch;
 mod cli;
 mod oauth;
 mod process;
@@ -90,6 +91,10 @@ async fn run() -> Result<()> {
                 store::short_id(&active.id)
             );
         }
+        Command::AutoSwitch { threshold } => {
+            let result = auto_switch::auto_switch(threshold).await?;
+            print_auto_switch_result(result);
+        }
         Command::Usage { all, account } => {
             if all {
                 print_all_usage().await?;
@@ -123,6 +128,46 @@ async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn print_auto_switch_result(result: auto_switch::AutoSwitchResult) {
+    match result {
+        auto_switch::AutoSwitchResult::ActiveKept { account, reason } => {
+            println!(
+                "Active account is usable: {} ({}) - {}",
+                account.name,
+                store::short_id(&account.id),
+                reason
+            );
+        }
+        auto_switch::AutoSwitchResult::ActiveUnsupported { account, reason } => {
+            println!(
+                "Active account was not switched: {} ({}) - {}",
+                account.name,
+                store::short_id(&account.id),
+                reason
+            );
+        }
+        auto_switch::AutoSwitchResult::Switched { from, to, reason } => {
+            if let Some(from) = from {
+                println!(
+                    "Switched from {} ({}) to {} ({}) - {}",
+                    from.name,
+                    store::short_id(&from.id),
+                    to.name,
+                    store::short_id(&to.id),
+                    reason
+                );
+            } else {
+                println!(
+                    "Switched to {} ({}) - {}",
+                    to.name,
+                    store::short_id(&to.id),
+                    reason
+                );
+            }
+        }
+    }
 }
 
 async fn print_all_usage() -> Result<()> {
