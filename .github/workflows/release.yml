@@ -12,8 +12,9 @@ env:
   BIN_NAME: codex-switch
   CARGO_TERM_COLOR: always
   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
   CC_aarch64_unknown_linux_musl: musl-gcc
-  TARGET: aarch64-unknown-linux-musl
+  CC_x86_64_unknown_linux_musl: musl-gcc
 
 jobs:
   detect:
@@ -76,13 +77,18 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   build:
-    name: Build Linux ARM64 musl
+    name: Build ${{ matrix.target }}
     needs: detect
     if: needs.detect.outputs.release == 'true'
-    runs-on: ubuntu-24.04-arm
-    outputs:
-      asset_name: ${{ steps.package.outputs.asset_name }}
-      artifact_name: ${{ steps.package.outputs.artifact_name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
 
     steps:
       - name: Checkout
@@ -100,18 +106,18 @@ jobs:
           sudo apt-get install -y musl-tools
 
       - name: Install target
-        run: rustup target add "$TARGET"
+        run: rustup target add "${{ matrix.target }}"
 
       - name: Build
-        run: cargo build --release --locked --target "$TARGET"
+        run: cargo build --release --locked --target "${{ matrix.target }}"
 
       - name: Package
         id: package
         run: |
-          asset_name="$BIN_NAME-$TARGET"
+          asset_name="$BIN_NAME-${{ matrix.target }}"
 
           mkdir -p dist
-          cp "target/$TARGET/release/$BIN_NAME" "dist/$asset_name"
+          cp "target/${{ matrix.target }}/release/$BIN_NAME" "dist/$asset_name"
           chmod 0755 "dist/$asset_name"
 
           {
@@ -146,8 +152,8 @@ jobs:
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
-          name: ${{ needs.build.outputs.artifact_name }}
           path: dist
+          merge-multiple: true
 
       - name: Create tag
         env:
@@ -168,16 +174,25 @@ jobs:
 
       - name: Create release
         env:
-          ASSET_NAME: ${{ needs.build.outputs.asset_name }}
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.detect.outputs.tag }}
         run: |
-          asset="dist/$ASSET_NAME"
+          assets=(
+            "dist/$BIN_NAME-aarch64-unknown-linux-musl"
+            "dist/$BIN_NAME-x86_64-unknown-linux-musl"
+          )
+
+          for asset in "${assets[@]}"; do
+            if [ ! -f "$asset" ]; then
+              echo "Missing release asset: $asset" >&2
+              exit 1
+            fi
+          done
 
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$asset" --clobber
+            gh release upload "$TAG" "${assets[@]}" --clobber
           else
-            gh release create "$TAG" "$asset" \
+            gh release create "$TAG" "${assets[@]}" \
               --target "$GITHUB_SHA" \
               --title "$TAG" \
               --notes "Automated release for $TAG."
