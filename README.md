@@ -12,7 +12,7 @@ cargo install --path .
 
 ```sh
 codex-switch list
-codex-switch login <name>
+codex-switch login <name> [--device-auth]
 codex-switch import <name> [--file <path>]
 codex-switch switch <name-or-id>
 codex-switch usage [name-or-id]
@@ -38,7 +38,9 @@ On Unix, both files are written with `0600` permissions.
 
 ## Login
 
-`login` uses ChatGPT/OpenAI device authorization. The CLI prints a verification URL and one-time code, waits for authorization, saves the account, and switches it active.
+`login` uses ChatGPT/OpenAI browser OAuth by default. It starts a local callback server, opens the browser, saves the account, and switches it active.
+
+Use `codex-switch login <name> --device-auth` for device authorization. The CLI prints a verification URL and one-time code, then waits for authorization.
 
 ## Import
 
