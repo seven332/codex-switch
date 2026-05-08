@@ -3,6 +3,7 @@ mod auto_switch;
 mod cli;
 mod oauth;
 mod process;
+mod runtime;
 mod store;
 mod switcher;
 mod token;
@@ -94,6 +95,16 @@ async fn run() -> Result<()> {
         Command::AutoSwitch { threshold } => {
             let result = auto_switch::auto_switch(threshold).await?;
             print_auto_switch_result(result);
+        }
+        Command::Run {
+            threshold,
+            codex_bin,
+            codex_args,
+        } => {
+            let status = runtime::run_codex(threshold, codex_bin, codex_args).await?;
+            if !status.success() {
+                std::process::exit(status.code().unwrap_or(1));
+            }
         }
         Command::Usage { all, account } => {
             if all {
