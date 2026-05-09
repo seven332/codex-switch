@@ -20,6 +20,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, accept_hdr_async, conne
 use uuid::Uuid;
 
 use crate::auto_switch::{self, AutoSwitchResult};
+use crate::codex_http;
 use crate::store;
 use crate::token;
 use crate::types::{AuthData, StoredAccount};
@@ -37,6 +38,7 @@ pub async fn run_codex(
     codex_bin: String,
     codex_args: Vec<String>,
 ) -> Result<ExitStatus> {
+    codex_http::set_codex_bin_for_user_agent(codex_bin.clone());
     validate_remote_capable_codex_args(&codex_args)?;
     reject_remote_args(&codex_args)?;
     let current_dir = std::env::current_dir().context("Failed to read current directory")?;
@@ -648,22 +650,10 @@ async fn connect_app_server_websocket(websocket_url: &str, token: &str) -> Resul
 }
 
 async fn initialize_app_server(websocket: &mut WsStream) -> Result<()> {
+    let initialize_request_id = json!(1);
     send_json(
         websocket,
-        json!({
-            "id": "initialize",
-            "method": "initialize",
-            "params": {
-                "clientInfo": {
-                    "name": "codex-switch",
-                    "title": null,
-                    "version": env!("CARGO_PKG_VERSION")
-                },
-                "capabilities": {
-                    "experimentalApi": true
-                }
-            }
-        }),
+        initialize_app_server_request(initialize_request_id.clone()),
     )
     .await?;
 
@@ -682,13 +672,36 @@ async fn initialize_app_server(websocket: &mut WsStream) -> Result<()> {
         let Some(value) = message_json(&message)? else {
             continue;
         };
-        if value.get("id").and_then(Value::as_str) == Some("initialize") {
-            return response_to_result(&value);
+        if value.get("id") == Some(&initialize_request_id) {
+            response_to_result(&value)?;
+            send_json(
+                websocket,
+                json!({
+                    "method": "initialized",
+                    "params": null
+                }),
+            )
+            .await?;
+            return Ok(());
         }
         if is_jsonrpc_request(&value) {
             send_error_response(websocket, value.get("id").cloned(), "unsupported request").await?;
         }
     }
+}
+
+fn initialize_app_server_request(request_id: Value) -> Value {
+    json!({
+        "id": request_id,
+        "method": "initialize",
+        "params": {
+            "clientInfo": {
+                "name": codex_http::CODEX_APP_SERVER_DAEMON_CLIENT_NAME,
+                "title": "Codex App Server Daemon",
+                "version": codex_http::codex_version()
+            }
+        }
+    })
 }
 
 async fn login_request(request_id: Value, account: &StoredAccount) -> Result<Value> {
@@ -873,9 +886,40 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        codex_args_with_default_cwd, has_cwd_arg, rate_limit_notification_requires_switch,
-        usage_limit_error_requires_switch, validate_remote_capable_codex_args,
+        codex_args_with_default_cwd, has_cwd_arg, initialize_app_server_request,
+        rate_limit_notification_requires_switch, usage_limit_error_requires_switch,
+        validate_remote_capable_codex_args,
     };
+
+    #[test]
+    fn app_server_probe_uses_codex_daemon_identity() {
+        let request = initialize_app_server_request(json!(1));
+
+        assert_eq!(request.get("id"), Some(&json!(1)));
+        assert_eq!(
+            request.get("method").and_then(|value| value.as_str()),
+            Some("initialize")
+        );
+        assert_eq!(
+            request
+                .pointer("/params/clientInfo/name")
+                .and_then(|value| value.as_str()),
+            Some(crate::codex_http::CODEX_APP_SERVER_DAEMON_CLIENT_NAME)
+        );
+        assert_eq!(
+            request
+                .pointer("/params/clientInfo/title")
+                .and_then(|value| value.as_str()),
+            Some("Codex App Server Daemon")
+        );
+        assert!(
+            request
+                .pointer("/params/clientInfo/version")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert!(request.pointer("/params/capabilities").is_none());
+    }
 
     #[test]
     fn rate_limit_notification_triggers_when_threshold_is_reached() {

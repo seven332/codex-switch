@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use reqwest::StatusCode;
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue, USER_AGENT};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 
+use crate::codex_http;
 use crate::token;
 use crate::types::{
     AdditionalRateLimitDetails, AuthData, CreditStatusDetails, RateLimitStatusDetails,
@@ -9,7 +10,6 @@ use crate::types::{
 };
 
 const CHATGPT_BACKEND_API: &str = "https://chatgpt.com/backend-api";
-const CODEX_USER_AGENT: &str = "codex-cli";
 
 pub async fn get_account_usage(account: &StoredAccount) -> Result<UsageInfo> {
     match &account.auth_data {
@@ -87,7 +87,7 @@ fn build_chatgpt_headers(
     chatgpt_account_is_fedramp: bool,
 ) -> Result<HeaderMap> {
     let mut headers = HeaderMap::new();
-    headers.insert(USER_AGENT, HeaderValue::from_static(CODEX_USER_AGENT));
+    codex_http::insert_codex_user_agent_header(&mut headers)?;
     headers.insert(
         AUTHORIZATION,
         HeaderValue::from_str(&format!("Bearer {access_token}")).context("Invalid access token")?,
