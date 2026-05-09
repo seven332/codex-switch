@@ -2,6 +2,13 @@
 name = "codex-switch"
 version = "0.1.5"
 edition = "2024"
+description = "Local CLI account switcher for Codex"
+license = "MIT"
+repository = "https://github.com/seven332/codex-switch"
+readme = "README.md"
+keywords = ["codex", "cli", "openai", "oauth"]
+categories = ["command-line-utilities"]
+exclude = [".github/**"]
 
 [dependencies]
 anyhow = "1"

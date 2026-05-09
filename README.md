@@ -5,6 +5,12 @@ Local CLI account switcher for Codex.
 ## Install
 
 ```sh
+cargo install codex-switch
+```
+
+For local development:
+
+```sh
 cargo install --path .
 ```
 
