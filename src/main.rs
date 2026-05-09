@@ -1,6 +1,7 @@
 mod auth_json;
 mod auto_switch;
 mod cli;
+mod codex_http;
 mod oauth;
 mod process;
 mod runtime;

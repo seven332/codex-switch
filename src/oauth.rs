@@ -13,11 +13,11 @@ use tokio::time::{sleep, timeout};
 
 use chrono::Utc;
 
+use crate::codex_http;
 use crate::types::{NewChatGptAccount, StoredAccount, parse_chatgpt_id_token_claims};
 
 const DEFAULT_ISSUER: &str = "https://auth.openai.com";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 const DEFAULT_BROWSER_CALLBACK_PORT: u16 = 1455;
 const FALLBACK_BROWSER_CALLBACK_PORT: u16 = 1457;
 const DEVICE_AUTH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -264,6 +264,7 @@ async fn exchange_authorization_code_for_tokens(
 }
 
 fn build_authorize_url(issuer: &str, redirect_uri: &str, pkce: &PkceCodes, state: &str) -> String {
+    let originator = codex_http::originator_value();
     let query = [
         ("response_type", "code"),
         ("client_id", CLIENT_ID),
@@ -274,7 +275,7 @@ fn build_authorize_url(issuer: &str, redirect_uri: &str, pkce: &PkceCodes, state
         ("id_token_add_organizations", "true"),
         ("codex_cli_simplified_flow", "true"),
         ("state", state),
-        ("originator", CODEX_ORIGINATOR),
+        ("originator", originator.as_str()),
     ]
     .into_iter()
     .map(|(key, value)| format!("{key}={}", urlencoding::encode(value)))
@@ -659,7 +660,7 @@ mod tests {
         );
         assert_eq!(
             params.get("originator").map(String::as_str),
-            Some(super::CODEX_ORIGINATOR)
+            Some(crate::codex_http::originator_value().as_str())
         );
         assert_eq!(params.get("state").map(String::as_str), Some("state"));
     }

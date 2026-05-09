@@ -5,10 +5,12 @@ use serde::Serialize;
 use tokio::time::{Duration, sleep};
 
 use crate::auth_json;
+use crate::codex_http;
 use crate::store;
 use crate::types::{AuthData, StoredAccount, parse_chatgpt_id_token_claims};
 
-const DEFAULT_ISSUER: &str = "https://auth.openai.com";
+const REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR: &str = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const TOKEN_REFRESH_INTERVAL_DAYS: i64 = 8;
 
@@ -123,7 +125,10 @@ fn parse_jwt_expiration(token: &str) -> Option<DateTime<Utc>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{auth_expired_or_needs_refresh, parse_jwt_expiration};
+    use super::{
+        REFRESH_TOKEN_URL, auth_expired_or_needs_refresh, parse_jwt_expiration,
+        refresh_token_endpoint_from_env,
+    };
     use crate::types::{AuthData, AuthMode, StoredAccount};
     use base64::Engine;
     use chrono::{Duration, Utc};
@@ -153,6 +158,22 @@ mod tests {
         let account = test_chatgpt_account(token.clone());
 
         assert!(!auth_expired_or_needs_refresh(&account, &token));
+    }
+
+    #[test]
+    fn refresh_token_endpoint_uses_override_when_present() {
+        assert_eq!(
+            refresh_token_endpoint_from_env(Ok(" https://example.com/oauth/token ".to_string())),
+            "https://example.com/oauth/token"
+        );
+    }
+
+    #[test]
+    fn refresh_token_endpoint_uses_default_when_override_is_empty() {
+        assert_eq!(
+            refresh_token_endpoint_from_env(Ok(" ".to_string())),
+            REFRESH_TOKEN_URL
+        );
     }
 
     fn test_jwt_with_exp(exp: i64) -> String {
@@ -187,6 +208,8 @@ mod tests {
 
 async fn refresh_tokens_with_refresh_token(refresh_token: &str) -> Result<RefreshTokenResponse> {
     let client = reqwest::Client::new();
+    let endpoint = refresh_token_endpoint();
+    let headers = codex_http::codex_default_headers()?;
     let body = RefreshTokenRequest {
         client_id: CLIENT_ID,
         grant_type: "refresh_token",
@@ -198,7 +221,8 @@ async fn refresh_tokens_with_refresh_token(refresh_token: &str) -> Result<Refres
 
     for attempt in 1..=3u8 {
         match client
-            .post(format!("{DEFAULT_ISSUER}/oauth/token"))
+            .post(&endpoint)
+            .headers(headers.clone())
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
@@ -235,4 +259,16 @@ async fn refresh_tokens_with_refresh_token(refresh_token: &str) -> Result<Refres
         .json::<RefreshTokenResponse>()
         .await
         .context("Failed to parse token refresh response")
+}
+
+fn refresh_token_endpoint() -> String {
+    refresh_token_endpoint_from_env(std::env::var(REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR))
+}
+
+fn refresh_token_endpoint_from_env(value: Result<String, std::env::VarError>) -> String {
+    value
+        .ok()
+        .map(|endpoint| endpoint.trim().to_string())
+        .filter(|endpoint| !endpoint.is_empty())
+        .unwrap_or_else(|| REFRESH_TOKEN_URL.to_string())
 }
