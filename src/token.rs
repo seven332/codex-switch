@@ -123,6 +123,73 @@ fn parse_jwt_expiration(token: &str) -> Option<DateTime<Utc>> {
         .and_then(|exp| DateTime::<Utc>::from_timestamp(exp, 0))
 }
 
+async fn refresh_tokens_with_refresh_token(refresh_token: &str) -> Result<RefreshTokenResponse> {
+    let client = reqwest::Client::new();
+    let endpoint = refresh_token_endpoint();
+    let headers = codex_http::codex_default_headers()?;
+    let body = RefreshTokenRequest {
+        client_id: CLIENT_ID,
+        grant_type: "refresh_token",
+        refresh_token: refresh_token.to_string(),
+    };
+
+    let mut last_send_error = None;
+    let mut response = None;
+
+    for attempt in 1..=3u8 {
+        match client
+            .post(&endpoint)
+            .headers(headers.clone())
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                response = Some(resp);
+                break;
+            }
+            Err(err) => {
+                last_send_error = Some(err);
+                if attempt < 3 {
+                    sleep(Duration::from_millis(250 * u64::from(attempt))).await;
+                }
+            }
+        }
+    }
+
+    let response = match response {
+        Some(resp) => resp,
+        None => {
+            let err = last_send_error.context("Failed to send token refresh request")?;
+            return Err(err.into());
+        }
+    };
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("Token refresh failed: {status} - {body}");
+    }
+
+    response
+        .json::<RefreshTokenResponse>()
+        .await
+        .context("Failed to parse token refresh response")
+}
+
+fn refresh_token_endpoint() -> String {
+    refresh_token_endpoint_from_env(std::env::var(REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR))
+}
+
+fn refresh_token_endpoint_from_env(value: Result<String, std::env::VarError>) -> String {
+    value
+        .ok()
+        .map(|endpoint| endpoint.trim().to_string())
+        .filter(|endpoint| !endpoint.is_empty())
+        .unwrap_or_else(|| REFRESH_TOKEN_URL.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -204,71 +271,4 @@ mod tests {
             last_used_at: None,
         }
     }
-}
-
-async fn refresh_tokens_with_refresh_token(refresh_token: &str) -> Result<RefreshTokenResponse> {
-    let client = reqwest::Client::new();
-    let endpoint = refresh_token_endpoint();
-    let headers = codex_http::codex_default_headers()?;
-    let body = RefreshTokenRequest {
-        client_id: CLIENT_ID,
-        grant_type: "refresh_token",
-        refresh_token: refresh_token.to_string(),
-    };
-
-    let mut last_send_error = None;
-    let mut response = None;
-
-    for attempt in 1..=3u8 {
-        match client
-            .post(&endpoint)
-            .headers(headers.clone())
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                response = Some(resp);
-                break;
-            }
-            Err(err) => {
-                last_send_error = Some(err);
-                if attempt < 3 {
-                    sleep(Duration::from_millis(250 * u64::from(attempt))).await;
-                }
-            }
-        }
-    }
-
-    let response = match response {
-        Some(resp) => resp,
-        None => {
-            let err = last_send_error.context("Failed to send token refresh request")?;
-            return Err(err.into());
-        }
-    };
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("Token refresh failed: {status} - {body}");
-    }
-
-    response
-        .json::<RefreshTokenResponse>()
-        .await
-        .context("Failed to parse token refresh response")
-}
-
-fn refresh_token_endpoint() -> String {
-    refresh_token_endpoint_from_env(std::env::var(REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR))
-}
-
-fn refresh_token_endpoint_from_env(value: Result<String, std::env::VarError>) -> String {
-    value
-        .ok()
-        .map(|endpoint| endpoint.trim().to_string())
-        .filter(|endpoint| !endpoint.is_empty())
-        .unwrap_or_else(|| REFRESH_TOKEN_URL.to_string())
 }
