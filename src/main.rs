@@ -38,7 +38,6 @@ async fn run() -> Result<()> {
         }
         Command::Login { name, device_auth } => {
             store::ensure_name_available(&name)?;
-            process::ensure_can_switch()?;
             let flow = if device_auth {
                 oauth::LoginFlow::DeviceAuth
             } else {
@@ -52,13 +51,11 @@ async fn run() -> Result<()> {
                     store::short_id(&existing.id)
                 );
             }
-            process::ensure_can_switch()?;
             let stored = store::add_account(account)?;
-            let active = switcher::switch_to_account(&stored.id).await?;
             println!(
-                "Logged in and switched to {} ({})",
-                active.name,
-                store::short_id(&active.id)
+                "Logged in {} ({})",
+                stored.name,
+                store::short_id(&stored.id)
             );
         }
         Command::Import { name, file } => {

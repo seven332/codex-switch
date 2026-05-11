@@ -60,7 +60,7 @@ codex-switch run -- resume <session-id>
 
 ## Login
 
-`login` uses ChatGPT/OpenAI browser OAuth by default. It starts a local callback server, opens the browser, saves the account, and switches it active.
+`login` uses ChatGPT/OpenAI browser OAuth by default. It starts a local callback server, opens the browser, and saves the account. It does not switch the active account or write Codex `auth.json`; run `codex-switch switch <name-or-id>` when you want to use the new account.
 
 The browser callback server uses the same ports as Codex: `1455` by default, with `1457` as the fallback.
 

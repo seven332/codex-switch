@@ -15,7 +15,7 @@ pub struct Cli {
 pub enum Command {
     /// List stored accounts.
     List,
-    /// Log in with ChatGPT/OpenAI OAuth and switch to the new account.
+    /// Log in with ChatGPT/OpenAI OAuth and save the account.
     Login {
         /// Account display name.
         name: String,
