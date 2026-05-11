@@ -78,7 +78,9 @@ Usage reporting is supported for ChatGPT OAuth accounts. API key accounts are li
 
 ## Release
 
-The GitHub Actions release workflow builds Linux musl binaries for `aarch64` and `x86_64`, plus a macOS arm64 binary. On pushes to `master`, it compares the current Cargo package version with the previous `Cargo.toml` version. When the version changes, it creates tag `v{version}`, creates a GitHub release, and uploads the raw binaries:
+The GitHub Actions release workflow builds Linux musl binaries for `aarch64` and `x86_64`, plus a macOS arm64 binary. On pushes to `master`, it compares the current Cargo package version with the previous `Cargo.toml` version. When the version changes, it creates tag `v{version}`, creates a GitHub release, uploads the raw binaries, and publishes the crate to crates.io.
+
+Publishing to crates.io requires a repository Actions secret named `CARGO_REGISTRY_TOKEN`.
 
 ```text
 codex-switch-aarch64-unknown-linux-musl
