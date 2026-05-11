@@ -10,6 +10,12 @@ keywords = ["codex", "cli", "openai", "oauth"]
 categories = ["command-line-utilities"]
 exclude = [".github/**"]
 
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+all = "deny"
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
