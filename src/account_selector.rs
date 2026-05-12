@@ -527,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn simulator_can_compare_drain_first_baseline() {
+    fn simulator_compares_deadline_aware_against_drain_first_baseline() {
         let deadline_aware_max = max_sustainable_burn_for_policy(2, DeadlineAwarePolicy::default);
         let drain_first_max =
             max_sustainable_burn_for_policy(
@@ -539,6 +539,10 @@ mod tests {
 
         assert!(deadline_aware_max <= theoretical_weekly_max + 0.01);
         assert!(drain_first_max <= theoretical_weekly_max + 0.01);
+        assert!(
+            deadline_aware_max + 0.01 >= drain_first_max,
+            "deadline-aware max burn {deadline_aware_max:.3} should not be worse than drain-first {drain_first_max:.3}"
+        );
 
         let mut deadline_aware = DeadlineAwarePolicy::default();
         let mut drain_first = DrainFirstPolicy::new(SelectionConfig::default());
@@ -551,27 +555,30 @@ mod tests {
     }
 
     #[test]
-    fn deadline_aware_reduces_user_unavailable_time_against_drain_first_for_burst_workload() {
-        let mut drain_first_accounts = burst_fragmentation_accounts();
-        let mut deadline_aware_accounts = burst_fragmentation_accounts();
-        let demands = burst_fragmentation_demands();
+    fn deadline_aware_reduces_unavailable_time_for_constant_burn_near_capacity() {
+        let mut saw_improvement = false;
 
-        let drain_first_stats = simulate_demands(
-            &mut DrainFirstPolicy::new(SelectionConfig::default()),
-            &mut drain_first_accounts,
-            &demands,
-        );
-        let deadline_aware_stats = simulate_demands(
-            &mut DeadlineAwarePolicy::default(),
-            &mut deadline_aware_accounts,
-            &demands,
-        );
+        for credits_per_minute in [4.1, 4.2, 4.3, 4.35, 4.4] {
+            let mut deadline_aware = DeadlineAwarePolicy::default();
+            let mut drain_first = DrainFirstPolicy::new(SelectionConfig::default());
+            let deadline_aware_stats =
+                simulate_policy_work_week(&mut deadline_aware, 2, credits_per_minute);
+            let drain_first_stats =
+                simulate_policy_work_week(&mut drain_first, 2, credits_per_minute);
 
-        assert_eq!(drain_first_stats.user_unavailable_minutes(), 1);
-        assert_eq!(deadline_aware_stats.user_unavailable_minutes(), 0);
+            assert!(
+                deadline_aware_stats.user_unavailable_minutes()
+                    <= drain_first_stats.user_unavailable_minutes(),
+                "deadline-aware should not be worse at {credits_per_minute:.2} credits/min: {deadline_aware_stats:?} vs {drain_first_stats:?}"
+            );
+
+            saw_improvement |= deadline_aware_stats.user_unavailable_minutes()
+                < drain_first_stats.user_unavailable_minutes();
+        }
+
         assert!(
-            deadline_aware_stats.user_unavailable_minutes()
-                < drain_first_stats.user_unavailable_minutes()
+            saw_improvement,
+            "deadline-aware should improve at least one steady burn rate near capacity"
         );
     }
 
@@ -592,27 +599,6 @@ mod tests {
             second_usage.secondary_resets_at,
             Some(WEEKLY_WINDOW_MINUTES / 2)
         );
-    }
-
-    fn burst_fragmentation_accounts() -> Vec<SimAccount> {
-        vec![
-            SimAccount::with_initial_usage("later-reset", 12.5, 300, 12.5, 300),
-            SimAccount::with_initial_usage("earlier-reset", 500.0, 100, 500.0, 1_000),
-        ]
-    }
-
-    fn burst_fragmentation_demands() -> Vec<Demand> {
-        let mut demands = (0..50)
-            .map(|minute| Demand {
-                minute,
-                credits: 10.0,
-            })
-            .collect::<Vec<_>>();
-        demands.push(Demand {
-            minute: 50,
-            credits: 900.0,
-        });
-        demands
     }
 
     const FIVE_HOUR_WINDOW_MINUTES: i64 = 300;
@@ -727,41 +713,6 @@ mod tests {
         stats
     }
 
-    fn simulate_demands<P: AccountSelectionPolicy>(
-        policy: &mut P,
-        accounts: &mut [SimAccount],
-        demands: &[Demand],
-    ) -> SimStats {
-        let mut stats = SimStats {
-            served_credits: 0.0,
-            failed_credits: 0.0,
-            preventable_failures: 0,
-            unavailable_minutes: 0,
-            max_contiguous_unavailable_minutes: 0,
-            account_switches: 0,
-            min_five_hour_remaining: f64::INFINITY,
-            min_weekly_remaining: f64::INFINITY,
-        };
-        let mut last_account_index = None;
-        let mut contiguous_unavailable_minutes = 0;
-
-        for demand in demands {
-            for account in accounts.iter_mut() {
-                account.expire(demand.minute);
-            }
-            serve_demand(
-                policy,
-                accounts,
-                *demand,
-                &mut stats,
-                &mut last_account_index,
-                &mut contiguous_unavailable_minutes,
-            );
-        }
-
-        stats
-    }
-
     fn serve_demand<P: AccountSelectionPolicy>(
         policy: &mut P,
         accounts: &mut [SimAccount],
@@ -857,26 +808,6 @@ mod tests {
                 account: chatgpt_account(id, None),
                 five_hour_events: VecDeque::from([five_hour_seed]),
                 weekly_events: VecDeque::from([weekly_seed]),
-            }
-        }
-
-        fn with_initial_usage(
-            id: &str,
-            five_hour_credits: f64,
-            five_hour_resets_at: i64,
-            weekly_credits: f64,
-            weekly_resets_at: i64,
-        ) -> Self {
-            Self {
-                account: chatgpt_account(id, None),
-                five_hour_events: VecDeque::from([UsageEvent {
-                    at_minute: five_hour_resets_at - FIVE_HOUR_WINDOW_MINUTES,
-                    credits: five_hour_credits,
-                }]),
-                weekly_events: VecDeque::from([UsageEvent {
-                    at_minute: weekly_resets_at - WEEKLY_WINDOW_MINUTES,
-                    credits: weekly_credits,
-                }]),
             }
         }
 
