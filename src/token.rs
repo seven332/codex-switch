@@ -1,7 +1,12 @@
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
 use anyhow::{Context, Result};
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use tokio::sync::Mutex;
 use tokio::time::{Duration, sleep};
 
 use crate::auth_json;
@@ -13,6 +18,12 @@ const REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR: &str = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const TOKEN_REFRESH_INTERVAL_DAYS: i64 = 8;
+const ACCESS_TOKEN_REFRESH_SKEW: chrono::Duration = chrono::Duration::minutes(5);
+const TOKEN_REFRESH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const TOKEN_REFRESH_LOCK_RETRY_DELAY: Duration = Duration::from_millis(250);
+const TOKEN_REFRESH_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+
+static TOKEN_REFRESH_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug, Serialize)]
 struct RefreshTokenRequest {
@@ -31,6 +42,16 @@ struct RefreshTokenResponse {
     refresh_token: Option<String>,
 }
 
+struct TokenRefreshFileLock {
+    path: PathBuf,
+}
+
+impl Drop for TokenRefreshFileLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 pub async fn ensure_chatgpt_tokens_fresh(account: &StoredAccount) -> Result<StoredAccount> {
     match &account.auth_data {
         AuthData::ApiKey { .. } => Ok(account.clone()),
@@ -45,6 +66,24 @@ pub async fn ensure_chatgpt_tokens_fresh(account: &StoredAccount) -> Result<Stor
 }
 
 pub async fn refresh_chatgpt_tokens(account: &StoredAccount) -> Result<StoredAccount> {
+    if matches!(account.auth_data, AuthData::ApiKey { .. }) {
+        return Ok(account.clone());
+    }
+
+    let _guard = TOKEN_REFRESH_LOCK.lock().await;
+    let _file_lock = acquire_token_refresh_file_lock().await?;
+    let latest_account = latest_account_for_refresh(account)?;
+
+    if chatgpt_auth_changed(account, &latest_account)
+        && !chatgpt_account_needs_refresh(&latest_account)
+    {
+        return Ok(latest_account);
+    }
+
+    refresh_chatgpt_tokens_locked(&latest_account).await
+}
+
+async fn refresh_chatgpt_tokens_locked(account: &StoredAccount) -> Result<StoredAccount> {
     let (current_refresh_token, current_account_id) = match &account.auth_data {
         AuthData::ApiKey { .. } => return Ok(account.clone()),
         AuthData::ChatGPT {
@@ -95,9 +134,129 @@ pub async fn refresh_chatgpt_tokens(account: &StoredAccount) -> Result<StoredAcc
     Ok(updated)
 }
 
+fn latest_account_for_refresh(account: &StoredAccount) -> Result<StoredAccount> {
+    let store = store::load_accounts()?;
+    Ok(store
+        .accounts
+        .into_iter()
+        .find(|stored| stored.id == account.id)
+        .unwrap_or_else(|| account.clone()))
+}
+
+fn chatgpt_auth_changed(left: &StoredAccount, right: &StoredAccount) -> bool {
+    match (&left.auth_data, &right.auth_data) {
+        (
+            AuthData::ChatGPT {
+                id_token: left_id_token,
+                access_token: left_access_token,
+                refresh_token: left_refresh_token,
+                account_id: left_account_id,
+            },
+            AuthData::ChatGPT {
+                id_token: right_id_token,
+                access_token: right_access_token,
+                refresh_token: right_refresh_token,
+                account_id: right_account_id,
+            },
+        ) => {
+            left_id_token != right_id_token
+                || left_access_token != right_access_token
+                || left_refresh_token != right_refresh_token
+                || left_account_id != right_account_id
+                || left.token_last_refresh_at != right.token_last_refresh_at
+        }
+        _ => false,
+    }
+}
+
+fn chatgpt_account_needs_refresh(account: &StoredAccount) -> bool {
+    match &account.auth_data {
+        AuthData::ApiKey { .. } => false,
+        AuthData::ChatGPT { access_token, .. } => {
+            auth_expired_or_needs_refresh(account, access_token)
+        }
+    }
+}
+
+async fn acquire_token_refresh_file_lock() -> Result<TokenRefreshFileLock> {
+    let path = token_refresh_lock_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
+    }
+
+    let deadline = tokio::time::Instant::now() + TOKEN_REFRESH_LOCK_WAIT_TIMEOUT;
+    loop {
+        match create_token_refresh_lock_file(&path) {
+            Ok(()) => return Ok(TokenRefreshFileLock { path }),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                if tokio::time::Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "Timed out waiting for token refresh lock: {}. Another codex-switch process may be refreshing tokens, or a stale lock file may need to be removed manually.",
+                        path.display()
+                    );
+                }
+                sleep(TOKEN_REFRESH_LOCK_RETRY_DELAY).await;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("Failed to create token refresh lock: {}", path.display())
+                });
+            }
+        }
+    }
+}
+
+fn token_refresh_lock_path() -> Result<PathBuf> {
+    Ok(store::config_dir()?
+        .join("runtime")
+        .join("token-refresh.lock"))
+}
+
+fn create_token_refresh_lock_file(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        write_token_refresh_lock_metadata(path, &mut file)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        write_token_refresh_lock_metadata(path, &mut file)
+    }
+}
+
+fn write_token_refresh_lock_metadata(path: &Path, file: &mut fs::File) -> io::Result<()> {
+    let result = (|| {
+        writeln!(
+            file,
+            "pid={}\ncreated_at={}",
+            std::process::id(),
+            Utc::now().to_rfc3339()
+        )?;
+        file.sync_all()
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(path);
+    }
+
+    result
+}
+
 fn auth_expired_or_needs_refresh(account: &StoredAccount, access_token: &str) -> bool {
     if let Some(expires_at) = parse_jwt_expiration(access_token) {
-        return expires_at <= Utc::now();
+        return expires_at <= Utc::now() + ACCESS_TOKEN_REFRESH_SKEW;
     }
 
     match account.token_last_refresh_at {
@@ -124,7 +283,10 @@ fn parse_jwt_expiration(token: &str) -> Option<DateTime<Utc>> {
 }
 
 async fn refresh_tokens_with_refresh_token(refresh_token: &str) -> Result<RefreshTokenResponse> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(TOKEN_REFRESH_REQUEST_TIMEOUT)
+        .build()
+        .context("Failed to build token refresh HTTP client")?;
     let endpoint = refresh_token_endpoint();
     let headers = codex_http::codex_default_headers()?;
     let body = RefreshTokenRequest {
@@ -221,10 +383,18 @@ mod tests {
 
     #[test]
     fn auth_does_not_refresh_before_access_token_expiry() {
-        let token = test_jwt_with_exp((Utc::now() + Duration::minutes(4)).timestamp());
+        let token = test_jwt_with_exp((Utc::now() + Duration::minutes(10)).timestamp());
         let account = test_chatgpt_account(token.clone());
 
         assert!(!auth_expired_or_needs_refresh(&account, &token));
+    }
+
+    #[test]
+    fn auth_refreshes_when_access_token_is_near_expiry() {
+        let token = test_jwt_with_exp((Utc::now() + Duration::minutes(4)).timestamp());
+        let account = test_chatgpt_account(token.clone());
+
+        assert!(auth_expired_or_needs_refresh(&account, &token));
     }
 
     #[test]

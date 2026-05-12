@@ -7,10 +7,13 @@ use std::process::ExitStatus;
 use anyhow::{Context, Result};
 use futures_util::stream::SplitSink;
 use futures_util::{Sink, SinkExt, StreamExt};
+use rand::Rng as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant, sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -28,10 +31,19 @@ use crate::types::{AuthData, StoredAccount};
 const REMOTE_TOKEN_ENV: &str = "CODEX_SWITCH_REMOTE_TOKEN";
 const APP_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const APP_SERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const USAGE_MAINTENANCE_INITIAL_MIN_DELAY: Duration = Duration::from_secs(5 * 60);
+const USAGE_MAINTENANCE_INITIAL_MAX_DELAY: Duration = Duration::from_secs(15 * 60);
+const USAGE_MAINTENANCE_MIN_INTERVAL: Duration = Duration::from_secs(45 * 60);
+const USAGE_MAINTENANCE_MAX_INTERVAL: Duration = Duration::from_secs(75 * 60);
+const RUNTIME_COMMAND_BUFFER: usize = 4;
 const INTERNAL_REQUEST_ID_PREFIX: &str = "codex-switch/";
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type ProxyClientStream = WebSocketStream<TcpStream>;
+
+enum RuntimeCommand {
+    SyncActiveAccount,
+}
 
 pub async fn run_codex(
     threshold: f64,
@@ -78,11 +90,19 @@ pub async fn run_codex(
             return Err(err);
         }
     };
+    let (runtime_command_tx, runtime_command_rx) = mpsc::channel(RUNTIME_COMMAND_BUFFER);
+    let (maintenance_shutdown_tx, maintenance_shutdown_rx) = watch::channel(false);
+    let maintenance_task = tokio::spawn(run_usage_maintenance(
+        threshold,
+        runtime_command_tx,
+        maintenance_shutdown_rx,
+    ));
     let mut proxy_task = tokio::spawn(run_websocket_proxy(
         proxy_listener,
         app_server_url.clone(),
         token.clone(),
         threshold,
+        runtime_command_rx,
     ));
 
     let mut codex_child = match spawn_remote_codex(&codex_bin, &codex_args, &proxy_url, &token)
@@ -90,6 +110,7 @@ pub async fn run_codex(
     {
         Ok(child) => child,
         Err(err) => {
+            stop_usage_maintenance(maintenance_shutdown_tx, maintenance_task).await;
             proxy_task.abort();
             let _ = proxy_task.await;
             shutdown_child(&mut app_server).await;
@@ -121,6 +142,7 @@ pub async fn run_codex(
         proxy_task.abort();
         let _ = proxy_task.await;
     }
+    stop_usage_maintenance(maintenance_shutdown_tx, maintenance_task).await;
     shutdown_child(&mut app_server).await;
     let _ = std::fs::remove_file(&token_path);
 
@@ -301,6 +323,7 @@ async fn run_websocket_proxy(
     app_server_url: String,
     token: String,
     threshold: f64,
+    mut runtime_commands: mpsc::Receiver<RuntimeCommand>,
 ) -> Result<()> {
     let mut state = ProxyState::new(threshold);
 
@@ -312,9 +335,96 @@ async fn run_websocket_proxy(
         let client_websocket = accept_proxy_client(client_stream, &token).await?;
         let app_server_websocket = connect_app_server_websocket(&app_server_url, &token).await?;
 
-        proxy_websockets(client_websocket, app_server_websocket, &mut state).await?;
+        proxy_websockets(
+            client_websocket,
+            app_server_websocket,
+            &mut state,
+            &mut runtime_commands,
+        )
+        .await?;
         state.clear_connection_pending();
     }
+}
+
+async fn stop_usage_maintenance(shutdown: watch::Sender<bool>, task: JoinHandle<()>) {
+    let _ = shutdown.send(true);
+    let _ = task.await;
+}
+
+async fn run_usage_maintenance(
+    threshold: f64,
+    runtime_commands: mpsc::Sender<RuntimeCommand>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    if sleep_until_usage_maintenance_or_shutdown(
+        random_usage_maintenance_initial_delay(),
+        &mut shutdown,
+    )
+    .await
+    {
+        return;
+    }
+
+    loop {
+        if usage_maintenance_requires_active_sync(threshold).await {
+            match runtime_commands.try_send(RuntimeCommand::SyncActiveAccount) {
+                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => return,
+            }
+        }
+
+        if sleep_until_usage_maintenance_or_shutdown(
+            random_usage_maintenance_interval(),
+            &mut shutdown,
+        )
+        .await
+        {
+            return;
+        }
+    }
+}
+
+async fn sleep_until_usage_maintenance_or_shutdown(
+    duration: Duration,
+    shutdown: &mut watch::Receiver<bool>,
+) -> bool {
+    tokio::select! {
+        _ = sleep(duration) => false,
+        changed = shutdown.changed() => changed.is_ok() && *shutdown.borrow(),
+    }
+}
+
+async fn usage_maintenance_requires_active_sync(threshold: f64) -> bool {
+    matches!(
+        auto_switch::auto_switch_allow_running(threshold).await,
+        Ok(AutoSwitchResult::Switched { .. })
+    )
+}
+
+fn random_usage_maintenance_initial_delay() -> Duration {
+    random_duration_between(
+        USAGE_MAINTENANCE_INITIAL_MIN_DELAY,
+        USAGE_MAINTENANCE_INITIAL_MAX_DELAY,
+    )
+}
+
+fn random_usage_maintenance_interval() -> Duration {
+    random_duration_between(
+        USAGE_MAINTENANCE_MIN_INTERVAL,
+        USAGE_MAINTENANCE_MAX_INTERVAL,
+    )
+}
+
+fn random_duration_between(min: Duration, max: Duration) -> Duration {
+    debug_assert!(min <= max);
+
+    let min_secs = min.as_secs();
+    let max_secs = max.as_secs();
+    if min_secs == max_secs {
+        return min;
+    }
+
+    Duration::from_secs(rand::rng().random_range(min_secs..=max_secs))
 }
 
 #[allow(clippy::result_large_err)]
@@ -347,12 +457,24 @@ async fn proxy_websockets(
     client_websocket: ProxyClientStream,
     app_server_websocket: WsStream,
     state: &mut ProxyState,
+    runtime_commands: &mut mpsc::Receiver<RuntimeCommand>,
 ) -> Result<()> {
     let (mut client_write, mut client_read) = client_websocket.split();
     let (mut app_server_write, mut app_server_read) = app_server_websocket.split();
+    let mut runtime_commands_open = true;
 
     loop {
         tokio::select! {
+            command = runtime_commands.recv(), if runtime_commands_open => {
+                match command {
+                    Some(RuntimeCommand::SyncActiveAccount) => {
+                        state.login_active_chatgpt_account(&mut app_server_write).await?;
+                    }
+                    None => {
+                        runtime_commands_open = false;
+                    }
+                }
+            }
             message = client_read.next() => {
                 let Some(message) = message else {
                     return Ok(());
@@ -436,6 +558,20 @@ impl ProxyState {
             }
             AutoSwitchResult::ActiveUnsupported { .. } => Ok(()),
         }
+    }
+
+    async fn login_active_chatgpt_account(
+        &mut self,
+        app_server_write: &mut SplitSink<WsStream, Message>,
+    ) -> Result<()> {
+        let Some(account) = store::get_active_account()? else {
+            return Ok(());
+        };
+        if matches!(account.auth_data, AuthData::ChatGPT { .. }) {
+            self.login_chatgpt_account(app_server_write, account)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn login_chatgpt_account(
@@ -756,8 +892,7 @@ where
 
 async fn refresh_external_auth(previous_account_id: Option<String>) -> Result<ExternalAuthPayload> {
     let account = find_refresh_account(previous_account_id.as_deref())?;
-    let refreshed = token::refresh_chatgpt_tokens(&account).await?;
-    external_auth_payload(&refreshed).await
+    external_auth_payload(&account).await
 }
 
 fn find_refresh_account(previous_account_id: Option<&str>) -> Result<StoredAccount> {
@@ -882,13 +1017,14 @@ fn is_jsonrpc_request(value: &Value) -> bool {
 mod tests {
     use std::ffi::OsString;
     use std::path::Path;
+    use std::time::Duration;
 
     use serde_json::json;
 
     use super::{
         codex_args_with_default_cwd, has_cwd_arg, initialize_app_server_request,
-        rate_limit_notification_requires_switch, usage_limit_error_requires_switch,
-        validate_remote_capable_codex_args,
+        random_duration_between, rate_limit_notification_requires_switch,
+        usage_limit_error_requires_switch, validate_remote_capable_codex_args,
     };
 
     #[test]
@@ -1013,6 +1149,21 @@ mod tests {
                 "turnId": "turn"
             }
         })));
+    }
+
+    #[test]
+    fn random_duration_between_stays_within_bounds() {
+        for _ in 0..100 {
+            let duration =
+                random_duration_between(Duration::from_secs(10), Duration::from_secs(20));
+            assert!(duration >= Duration::from_secs(10));
+            assert!(duration <= Duration::from_secs(20));
+        }
+
+        assert_eq!(
+            random_duration_between(Duration::from_secs(30), Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
     }
 
     #[test]
