@@ -6,6 +6,8 @@ use crate::switcher;
 use crate::types::{StoredAccount, UsageInfo, UsageLimitInfo};
 use crate::usage;
 
+const HARD_USAGE_LIMIT_PERCENT: f64 = 100.0;
+
 #[derive(Debug)]
 pub enum AutoSwitchResult {
     ActiveKept {
@@ -31,22 +33,20 @@ enum UsageDecision {
     Error(String),
 }
 
-pub async fn auto_switch(threshold: f64) -> Result<AutoSwitchResult> {
-    validate_threshold(threshold)?;
+pub async fn auto_switch() -> Result<AutoSwitchResult> {
     process::ensure_can_switch()?;
-    auto_switch_inner(threshold, false).await
+    auto_switch_inner(false).await
 }
 
-pub async fn auto_switch_allow_running(threshold: f64) -> Result<AutoSwitchResult> {
-    validate_threshold(threshold)?;
-    auto_switch_inner(threshold, true).await
+pub async fn auto_switch_allow_running() -> Result<AutoSwitchResult> {
+    auto_switch_inner(true).await
 }
 
-pub fn usage_requires_switch(info: &UsageInfo, threshold: f64) -> bool {
-    matches!(assess_usage(info, threshold), UsageDecision::Unavailable(_))
+pub fn usage_requires_switch(info: &UsageInfo) -> bool {
+    matches!(assess_usage(info), UsageDecision::Unavailable(_))
 }
 
-async fn auto_switch_inner(threshold: f64, allow_running: bool) -> Result<AutoSwitchResult> {
+async fn auto_switch_inner(allow_running: bool) -> Result<AutoSwitchResult> {
     let store = store::load_accounts()?;
     if store.accounts.is_empty() {
         anyhow::bail!("No accounts stored.");
@@ -68,7 +68,7 @@ async fn auto_switch_inner(threshold: f64, allow_running: bool) -> Result<AutoSw
             let info = usage::get_account_usage(account)
                 .await
                 .with_context(|| format!("Failed to get usage for {}", account.name))?;
-            match assess_usage(&info, threshold) {
+            match assess_usage(&info) {
                 UsageDecision::Usable(reason) => {
                     return Ok(AutoSwitchResult::ActiveKept {
                         account: Box::new(account.clone()),
@@ -109,7 +109,7 @@ async fn auto_switch_inner(threshold: f64, allow_running: bool) -> Result<AutoSw
             }
         };
 
-        match assess_usage(&info, threshold) {
+        match assess_usage(&info) {
             UsageDecision::Usable(_) => {
                 let switched = if allow_running {
                     switcher::switch_to_account_unchecked(&account.id).await?
@@ -139,14 +139,7 @@ async fn auto_switch_inner(threshold: f64, allow_running: bool) -> Result<AutoSw
     anyhow::bail!("{switch_reason}");
 }
 
-fn validate_threshold(threshold: f64) -> Result<()> {
-    if !threshold.is_finite() || !(0.0..=100.0).contains(&threshold) {
-        anyhow::bail!("threshold must be between 0 and 100");
-    }
-    Ok(())
-}
-
-fn assess_usage(info: &UsageInfo, threshold: f64) -> UsageDecision {
+fn assess_usage(info: &UsageInfo) -> UsageDecision {
     if matches!(info.error.as_deref(), Some("usage unsupported")) {
         return UsageDecision::Unsupported("usage unsupported".to_string());
     }
@@ -163,11 +156,11 @@ fn assess_usage(info: &UsageInfo, threshold: f64) -> UsageDecision {
         return UsageDecision::Unavailable("credits balance is 0".to_string());
     }
 
-    if let Some(reason) = limit_threshold_reason(info, threshold) {
+    if let Some(reason) = hard_limit_reason(info) {
         return UsageDecision::Unavailable(reason);
     }
 
-    UsageDecision::Usable("usage is below threshold".to_string())
+    UsageDecision::Usable("usage is available".to_string())
 }
 
 fn rate_limit_reason(kind: &str) -> String {
@@ -196,7 +189,7 @@ fn credits_depleted(info: &UsageInfo) -> bool {
         .is_some_and(|balance| balance <= 0.0)
 }
 
-fn limit_threshold_reason(info: &UsageInfo, threshold: f64) -> Option<String> {
+fn hard_limit_reason(info: &UsageInfo) -> Option<String> {
     [
         ("5-hour".to_string(), info.primary_used_percent),
         ("weekly".to_string(), info.secondary_used_percent),
@@ -205,7 +198,7 @@ fn limit_threshold_reason(info: &UsageInfo, threshold: f64) -> Option<String> {
     .chain(info.additional_limits.iter().flat_map(additional_windows))
     .find_map(|(label, value)| {
         value.and_then(|used| {
-            if used >= threshold {
+            if used >= HARD_USAGE_LIMIT_PERCENT {
                 Some(format!("{label} usage is {used:.1}%"))
             } else {
                 None
@@ -242,7 +235,7 @@ mod tests {
         };
 
         assert_eq!(
-            assess_usage(&info, 100.0),
+            assess_usage(&info),
             UsageDecision::Unavailable("credits balance is 0".to_string())
         );
     }
@@ -255,26 +248,26 @@ mod tests {
         };
 
         assert_eq!(
-            assess_usage(&info, 100.0),
+            assess_usage(&info),
             UsageDecision::Unavailable("usage limit reached".to_string())
         );
     }
 
     #[test]
-    fn usage_is_unavailable_when_threshold_is_reached() {
+    fn usage_is_unavailable_when_hard_limit_is_reached() {
         let info = UsageInfo {
-            primary_used_percent: Some(95.0),
+            primary_used_percent: Some(100.0),
             ..usage_info()
         };
 
         assert_eq!(
-            assess_usage(&info, 90.0),
-            UsageDecision::Unavailable("5-hour usage is 95.0%".to_string())
+            assess_usage(&info),
+            UsageDecision::Unavailable("5-hour usage is 100.0%".to_string())
         );
     }
 
     #[test]
-    fn usage_is_usable_when_below_threshold() {
+    fn usage_is_usable_below_hard_limit() {
         let info = UsageInfo {
             primary_used_percent: Some(50.0),
             secondary_used_percent: Some(80.0),
@@ -282,8 +275,8 @@ mod tests {
         };
 
         assert_eq!(
-            assess_usage(&info, 90.0),
-            UsageDecision::Usable("usage is below threshold".to_string())
+            assess_usage(&info),
+            UsageDecision::Usable("usage is available".to_string())
         );
     }
 

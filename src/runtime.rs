@@ -55,18 +55,14 @@ enum ActiveAccountWatchStatus {
     Closed,
 }
 
-pub async fn run_codex(
-    threshold: f64,
-    codex_bin: String,
-    codex_args: Vec<String>,
-) -> Result<ExitStatus> {
+pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<ExitStatus> {
     codex_http::set_codex_bin_for_user_agent(codex_bin.clone());
     validate_remote_capable_codex_args(&codex_args)?;
     reject_remote_args(&codex_args)?;
     let current_dir = std::env::current_dir().context("Failed to read current directory")?;
     let codex_args = codex_args_with_default_cwd(&codex_args, &current_dir);
 
-    let initial = auto_switch::auto_switch_allow_running(threshold)
+    let initial = auto_switch::auto_switch_allow_running()
         .await
         .context("Initial account auto-switch failed")?;
     if let AutoSwitchResult::ActiveUnsupported { reason, .. } = initial {
@@ -103,7 +99,6 @@ pub async fn run_codex(
     let (runtime_command_tx, runtime_command_rx) = mpsc::channel(RUNTIME_COMMAND_BUFFER);
     let (maintenance_shutdown_tx, maintenance_shutdown_rx) = watch::channel(false);
     let maintenance_task = tokio::spawn(run_usage_maintenance(
-        threshold,
         runtime_command_tx.clone(),
         maintenance_shutdown_rx.clone(),
     ));
@@ -115,7 +110,6 @@ pub async fn run_codex(
         proxy_listener,
         app_server_url.clone(),
         token.clone(),
-        threshold,
         runtime_command_rx,
     ));
 
@@ -346,10 +340,9 @@ async fn run_websocket_proxy(
     listener: TcpListener,
     app_server_url: String,
     token: String,
-    threshold: f64,
     mut runtime_commands: mpsc::Receiver<RuntimeCommand>,
 ) -> Result<()> {
-    let mut state = ProxyState::new(threshold);
+    let mut state = ProxyState::new();
 
     loop {
         let (client_stream, _) = listener
@@ -381,7 +374,6 @@ async fn stop_runtime_background_tasks(
 }
 
 async fn run_usage_maintenance(
-    threshold: f64,
     runtime_commands: mpsc::Sender<RuntimeCommand>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -395,7 +387,7 @@ async fn run_usage_maintenance(
     }
 
     loop {
-        if usage_maintenance_requires_active_sync(threshold).await {
+        if usage_maintenance_requires_active_sync().await {
             match runtime_commands.try_send(RuntimeCommand::SyncActiveAccount) {
                 Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
                 Err(mpsc::error::TrySendError::Closed(_)) => return,
@@ -423,9 +415,9 @@ async fn sleep_until_usage_maintenance_or_shutdown(
     }
 }
 
-async fn usage_maintenance_requires_active_sync(threshold: f64) -> bool {
+async fn usage_maintenance_requires_active_sync() -> bool {
     matches!(
-        auto_switch::auto_switch_allow_running(threshold).await,
+        auto_switch::auto_switch_allow_running().await,
         Ok(AutoSwitchResult::Switched { .. })
     )
 }
@@ -626,7 +618,6 @@ async fn proxy_websockets(
 }
 
 struct ProxyState {
-    threshold: f64,
     request_prefix: String,
     next_request_id: u64,
     pending_internal: HashMap<String, PendingInternalRequest>,
@@ -639,9 +630,8 @@ enum PendingInternalRequest {
 }
 
 impl ProxyState {
-    fn new(threshold: f64) -> Self {
+    fn new() -> Self {
         Self {
-            threshold,
             request_prefix: format!("{INTERNAL_REQUEST_ID_PREFIX}{}", Uuid::new_v4()),
             next_request_id: 1,
             pending_internal: HashMap::new(),
@@ -665,7 +655,7 @@ impl ProxyState {
         &mut self,
         app_server_write: &mut SplitSink<WsStream, Message>,
     ) -> Result<()> {
-        let result = auto_switch::auto_switch_allow_running(self.threshold).await?;
+        let result = auto_switch::auto_switch_allow_running().await?;
         match result {
             AutoSwitchResult::Switched { to, .. } => {
                 self.login_chatgpt_account(app_server_write, *to).await
@@ -771,7 +761,7 @@ async fn handle_app_server_proxy_message(
         {
             handle_server_request(app_server_write, value).await?;
             should_forward = false;
-        } else if rate_limit_notification_requires_switch(&value, state.threshold)
+        } else if rate_limit_notification_requires_switch(&value)
             || usage_limit_error_requires_switch(&value)
         {
             rate_limits_require_switch = true;
@@ -792,7 +782,7 @@ async fn handle_app_server_proxy_message(
     Ok(should_continue)
 }
 
-fn rate_limit_notification_requires_switch(value: &Value, threshold: f64) -> bool {
+fn rate_limit_notification_requires_switch(value: &Value) -> bool {
     if value.get("method").and_then(Value::as_str) != Some("account/rateLimits/updated") {
         return false;
     }
@@ -804,7 +794,7 @@ fn rate_limit_notification_requires_switch(value: &Value, threshold: f64) -> boo
         return false;
     };
     let info = params.rate_limits.into_usage_info();
-    auto_switch::usage_requires_switch(&info, threshold)
+    auto_switch::usage_requires_switch(&info)
 }
 
 fn usage_limit_error_requires_switch(value: &Value) -> bool {
@@ -1182,8 +1172,29 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_notification_triggers_when_threshold_is_reached() {
+    fn rate_limit_notification_triggers_when_hard_limit_is_reached() {
         let notification = json!({
+            "method": "account/rateLimits/updated",
+            "params": {
+                "rateLimits": {
+                    "limitId": "codex",
+                    "limitName": null,
+                    "primary": {
+                        "usedPercent": 100,
+                        "windowDurationMins": 300,
+                        "resetsAt": 1_800_000_000
+                    },
+                    "secondary": null,
+                    "credits": null,
+                    "planType": "plus",
+                    "rateLimitReachedType": null
+                }
+            }
+        });
+
+        assert!(rate_limit_notification_requires_switch(&notification));
+
+        let available_notification = json!({
             "method": "account/rateLimits/updated",
             "params": {
                 "rateLimits": {
@@ -1201,11 +1212,8 @@ mod tests {
                 }
             }
         });
-
-        assert!(rate_limit_notification_requires_switch(&notification, 95.0));
         assert!(!rate_limit_notification_requires_switch(
-            &notification,
-            97.0
+            &available_notification
         ));
     }
 
@@ -1226,10 +1234,7 @@ mod tests {
             }
         });
 
-        assert!(rate_limit_notification_requires_switch(
-            &notification,
-            100.0
-        ));
+        assert!(rate_limit_notification_requires_switch(&notification));
     }
 
     #[test]
