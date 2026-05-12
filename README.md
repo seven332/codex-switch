@@ -46,7 +46,7 @@ On Unix, both files are written with `0600` permissions.
 
 `auto-switch` also refuses to switch while Codex is running. When Codex is not running, it checks the active ChatGPT OAuth account. If the account is out of credits, rate-limited, usage-limited, or at the configured usage threshold, it switches to the first stored ChatGPT OAuth account that is still usable. API key accounts are not usage-checkable and are skipped as replacement candidates.
 
-`run` is the runtime auto-switching entrypoint. It checks the active account before startup, starts `codex app-server`, launches Codex as a remote TUI through a local websocket proxy, and passes arguments after `--` to `codex`. During the managed session, the proxy watches Codex app-server `account/rateLimits/updated` notifications and usage-limit errors. When the active account reaches the usage threshold or Codex reports `usageLimitExceeded`, `codex-switch` switches to the first usable ChatGPT OAuth account and sends the new auth tokens to the running Codex app-server.
+`run` is the runtime auto-switching entrypoint. It checks the active account before startup, starts `codex app-server`, launches Codex as a remote TUI through a local websocket proxy, and passes arguments after `--` to `codex`. During the managed session, the proxy watches Codex app-server `account/rateLimits/updated` notifications and usage-limit errors. It also performs best-effort background usage checks after a random initial delay of 5-15 minutes, then every 45-75 minutes. When the active account reaches the usage threshold or Codex reports `usageLimitExceeded`, `codex-switch` switches to the first usable ChatGPT OAuth account and sends the new auth tokens to the running Codex app-server.
 
 ```sh
 codex-switch run
@@ -92,7 +92,7 @@ codex-switch-aarch64-apple-darwin
 
 ```sh
 cargo fmt --check
-cargo check --locked
-cargo test --locked
-cargo clippy --locked -- -D warnings
+cargo check --locked --all-targets --all-features
+cargo test --locked --all-targets --all-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
 ```

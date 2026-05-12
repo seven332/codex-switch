@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
@@ -10,6 +12,7 @@ use crate::types::{
 };
 
 const CHATGPT_BACKEND_API: &str = "https://chatgpt.com/backend-api";
+const USAGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub async fn get_account_usage(account: &StoredAccount) -> Result<UsageInfo> {
     match &account.auth_data {
@@ -69,7 +72,10 @@ async fn send_chatgpt_usage_request(
     chatgpt_account_id: Option<&str>,
     chatgpt_account_is_fedramp: bool,
 ) -> Result<reqwest::Response> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(USAGE_REQUEST_TIMEOUT)
+        .build()
+        .context("Failed to build usage HTTP client")?;
     let headers =
         build_chatgpt_headers(access_token, chatgpt_account_id, chatgpt_account_is_fedramp)?;
 
