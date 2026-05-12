@@ -1,3 +1,5 @@
+#[cfg_attr(not(test), allow(dead_code))]
+mod account_selector;
 mod auth_json;
 mod auto_switch;
 mod cli;
