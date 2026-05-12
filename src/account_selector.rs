@@ -91,12 +91,14 @@ impl AccountSelectionPolicy for DeadlineAwarePolicy {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Default)]
 pub struct DrainFirstPolicy {
     pub config: SelectionConfig,
     current_account_id: Option<String>,
 }
 
+#[cfg(test)]
 impl DrainFirstPolicy {
     pub fn new(config: SelectionConfig) -> Self {
         Self {
@@ -110,6 +112,7 @@ impl DrainFirstPolicy {
     }
 }
 
+#[cfg(test)]
 impl AccountSelectionPolicy for DrainFirstPolicy {
     fn select_account<'a>(
         &mut self,
