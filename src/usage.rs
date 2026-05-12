@@ -5,6 +5,7 @@ use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 
 use crate::codex_http;
+use crate::store;
 use crate::token;
 use crate::types::{
     AdditionalRateLimitDetails, AuthData, CreditStatusDetails, RateLimitStatusDetails,
@@ -46,10 +47,10 @@ async fn get_usage_with_chatgpt_auth(account: &StoredAccount) -> Result<UsageInf
             extract_chatgpt_auth(&refreshed_account)?;
         let retry_response =
             send_chatgpt_usage_request(retry_token, retry_account_id, retry_is_fedramp).await?;
-        return parse_usage_response(&refreshed_account.id, retry_response).await;
+        return parse_usage_response_and_sync_metadata(&refreshed_account.id, retry_response).await;
     }
 
-    parse_usage_response(&fresh_account.id, response).await
+    parse_usage_response_and_sync_metadata(&fresh_account.id, response).await
 }
 
 fn extract_chatgpt_auth(account: &StoredAccount) -> Result<(&str, Option<&str>, bool)> {
@@ -135,6 +136,18 @@ async fn parse_usage_response(account_id: &str, response: reqwest::Response) -> 
         serde_json::from_str(&body).context("Failed to parse usage response")?;
 
     Ok(convert_payload_to_usage_info(account_id, payload))
+}
+
+async fn parse_usage_response_and_sync_metadata(
+    account_id: &str,
+    response: reqwest::Response,
+) -> Result<UsageInfo> {
+    let info = parse_usage_response(account_id, response).await?;
+    if info.error.is_none() {
+        store::update_account_usage_metadata(account_id, info.plan_type.clone())
+            .context("Failed to save account usage metadata")?;
+    }
+    Ok(info)
 }
 
 fn convert_payload_to_usage_info(account_id: &str, payload: RateLimitStatusPayload) -> UsageInfo {

@@ -373,13 +373,51 @@ pub fn update_account_chatgpt_tokens(
     Ok(updated)
 }
 
+pub fn update_account_usage_metadata(
+    account_id: &str,
+    plan_type: Option<String>,
+) -> Result<Option<StoredAccount>> {
+    let mut store = load_accounts()?;
+    let Some(account) = store
+        .accounts
+        .iter_mut()
+        .find(|account| account.id == account_id)
+    else {
+        return Ok(None);
+    };
+
+    if !apply_usage_metadata(account, plan_type) {
+        return Ok(Some(account.clone()));
+    }
+
+    let updated = account.clone();
+    save_accounts(&store)?;
+    Ok(Some(updated))
+}
+
+fn apply_usage_metadata(account: &mut StoredAccount, plan_type: Option<String>) -> bool {
+    let Some(plan_type) = plan_type
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+
+    if account.plan_type.as_deref() == Some(plan_type.as_str()) {
+        return false;
+    }
+
+    account.plan_type = Some(plan_type);
+    true
+}
+
 pub fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::has_same_auth_identity;
+    use super::{apply_usage_metadata, has_same_auth_identity};
     use crate::types::{NewChatGptAccount, StoredAccount};
     use chrono::Utc;
 
@@ -413,6 +451,21 @@ mod tests {
         let right = chatgpt_account("right", Some("right-account"), "right-refresh", "right-id");
 
         assert!(!has_same_auth_identity(&left, &right));
+    }
+
+    #[test]
+    fn usage_metadata_updates_plan_type() {
+        let mut account = chatgpt_account("account", Some("account-id"), "refresh", "id");
+        account.plan_type = Some("free".to_string());
+
+        assert!(apply_usage_metadata(
+            &mut account,
+            Some(" pro ".to_string())
+        ));
+        assert_eq!(account.plan_type.as_deref(), Some("pro"));
+        assert!(!apply_usage_metadata(&mut account, Some("pro".to_string())));
+        assert!(!apply_usage_metadata(&mut account, Some("".to_string())));
+        assert_eq!(account.plan_type.as_deref(), Some("pro"));
     }
 
     fn chatgpt_account(
