@@ -31,10 +31,10 @@ use crate::types::{AuthData, StoredAccount};
 const REMOTE_TOKEN_ENV: &str = "CODEX_SWITCH_REMOTE_TOKEN";
 const APP_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const APP_SERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-const USAGE_MAINTENANCE_INITIAL_MIN_DELAY: Duration = Duration::from_secs(5 * 60);
-const USAGE_MAINTENANCE_INITIAL_MAX_DELAY: Duration = Duration::from_secs(15 * 60);
-const USAGE_MAINTENANCE_MIN_INTERVAL: Duration = Duration::from_secs(45 * 60);
-const USAGE_MAINTENANCE_MAX_INTERVAL: Duration = Duration::from_secs(75 * 60);
+const AUTO_SWITCH_MAINTENANCE_INITIAL_MIN_DELAY: Duration = Duration::from_secs(5 * 60);
+const AUTO_SWITCH_MAINTENANCE_INITIAL_MAX_DELAY: Duration = Duration::from_secs(15 * 60);
+const AUTO_SWITCH_MAINTENANCE_MIN_INTERVAL: Duration = Duration::from_secs(45 * 60);
+const AUTO_SWITCH_MAINTENANCE_MAX_INTERVAL: Duration = Duration::from_secs(75 * 60);
 const ACTIVE_ACCOUNT_WATCH_INTERVAL: Duration = Duration::from_secs(1);
 const RUNTIME_COMMAND_BUFFER: usize = 4;
 const INTERNAL_REQUEST_ID_PREFIX: &str = "codex-switch/";
@@ -98,7 +98,7 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
     };
     let (runtime_command_tx, runtime_command_rx) = mpsc::channel(RUNTIME_COMMAND_BUFFER);
     let (maintenance_shutdown_tx, maintenance_shutdown_rx) = watch::channel(false);
-    let maintenance_task = tokio::spawn(run_usage_maintenance(
+    let maintenance_task = tokio::spawn(run_auto_switch_maintenance(
         runtime_command_tx.clone(),
         maintenance_shutdown_rx.clone(),
     ));
@@ -373,12 +373,12 @@ async fn stop_runtime_background_tasks(
     let _ = active_account_watch_task.await;
 }
 
-async fn run_usage_maintenance(
+async fn run_auto_switch_maintenance(
     runtime_commands: mpsc::Sender<RuntimeCommand>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    if sleep_until_usage_maintenance_or_shutdown(
-        random_usage_maintenance_initial_delay(),
+    if sleep_until_shutdown(
+        random_auto_switch_maintenance_initial_delay(),
         &mut shutdown,
     )
     .await
@@ -387,35 +387,27 @@ async fn run_usage_maintenance(
     }
 
     loop {
-        if usage_maintenance_requires_active_sync().await {
+        if auto_switch_maintenance_switched_account().await {
             match runtime_commands.try_send(RuntimeCommand::SyncActiveAccount) {
                 Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
                 Err(mpsc::error::TrySendError::Closed(_)) => return,
             }
         }
 
-        if sleep_until_usage_maintenance_or_shutdown(
-            random_usage_maintenance_interval(),
-            &mut shutdown,
-        )
-        .await
-        {
+        if sleep_until_shutdown(random_auto_switch_maintenance_interval(), &mut shutdown).await {
             return;
         }
     }
 }
 
-async fn sleep_until_usage_maintenance_or_shutdown(
-    duration: Duration,
-    shutdown: &mut watch::Receiver<bool>,
-) -> bool {
+async fn sleep_until_shutdown(duration: Duration, shutdown: &mut watch::Receiver<bool>) -> bool {
     tokio::select! {
         _ = sleep(duration) => false,
         changed = shutdown.changed() => changed.is_ok() && *shutdown.borrow(),
     }
 }
 
-async fn usage_maintenance_requires_active_sync() -> bool {
+async fn auto_switch_maintenance_switched_account() -> bool {
     matches!(
         auto_switch::auto_switch_allow_running().await,
         Ok(AutoSwitchResult::Switched { .. })
@@ -429,9 +421,7 @@ async fn run_active_account_watcher(
     let mut last_snapshot = active_account_snapshot().ok();
 
     loop {
-        if sleep_until_usage_maintenance_or_shutdown(ACTIVE_ACCOUNT_WATCH_INTERVAL, &mut shutdown)
-            .await
-        {
+        if sleep_until_shutdown(ACTIVE_ACCOUNT_WATCH_INTERVAL, &mut shutdown).await {
             return;
         }
 
@@ -514,17 +504,17 @@ fn active_account_auth_marker(account: &StoredAccount) -> String {
     }
 }
 
-fn random_usage_maintenance_initial_delay() -> Duration {
+fn random_auto_switch_maintenance_initial_delay() -> Duration {
     random_duration_between(
-        USAGE_MAINTENANCE_INITIAL_MIN_DELAY,
-        USAGE_MAINTENANCE_INITIAL_MAX_DELAY,
+        AUTO_SWITCH_MAINTENANCE_INITIAL_MIN_DELAY,
+        AUTO_SWITCH_MAINTENANCE_INITIAL_MAX_DELAY,
     )
 }
 
-fn random_usage_maintenance_interval() -> Duration {
+fn random_auto_switch_maintenance_interval() -> Duration {
     random_duration_between(
-        USAGE_MAINTENANCE_MIN_INTERVAL,
-        USAGE_MAINTENANCE_MAX_INTERVAL,
+        AUTO_SWITCH_MAINTENANCE_MIN_INTERVAL,
+        AUTO_SWITCH_MAINTENANCE_MAX_INTERVAL,
     )
 }
 
