@@ -1,5 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 
+use crate::account_selector::{self, AccountUsageCandidate, SelectionConfig};
 use crate::process;
 use crate::store;
 use crate::switcher;
@@ -63,22 +64,32 @@ async fn auto_switch_inner(allow_running: bool) -> Result<AutoSwitchResult> {
         })
         .cloned();
 
-    let mut switch_reason = match &active {
-        Some(account) => {
-            let info = usage::get_account_usage(account)
-                .await
-                .with_context(|| format!("Failed to get usage for {}", account.name))?;
-            match assess_usage(&info) {
-                UsageDecision::Usable(reason) => {
-                    return Ok(AutoSwitchResult::ActiveKept {
-                        account: Box::new(account.clone()),
-                        reason,
-                    });
+    let active_id = active.as_ref().map(|account| account.id.as_str());
+    let mut evaluations = Vec::with_capacity(store.accounts.len());
+    let mut active_decision = None;
+    let mut skipped = Vec::new();
+
+    for account in &store.accounts {
+        let is_active = Some(account.id.as_str()) == active_id;
+        let info = match usage::get_account_usage(account).await {
+            Ok(info) => info,
+            Err(err) => {
+                if is_active {
+                    anyhow::bail!("Failed to get usage for {}: {err}", account.name);
                 }
+                skipped.push(format!("{}: {err}", account.name));
+                continue;
+            }
+        };
+
+        let decision = assess_usage(&info);
+        if is_active {
+            active_decision = Some(decision.clone());
+            match &decision {
                 UsageDecision::Unsupported(reason) => {
                     return Ok(AutoSwitchResult::ActiveUnsupported {
                         account: Box::new(account.clone()),
-                        reason,
+                        reason: reason.clone(),
                     });
                 }
                 UsageDecision::Error(reason) => {
@@ -87,48 +98,72 @@ async fn auto_switch_inner(allow_running: bool) -> Result<AutoSwitchResult> {
                         account.name
                     );
                 }
-                UsageDecision::Unavailable(reason) => reason,
+                UsageDecision::Usable(_) | UsageDecision::Unavailable(_) => {}
             }
+        } else if let UsageDecision::Unavailable(reason)
+        | UsageDecision::Unsupported(reason)
+        | UsageDecision::Error(reason) = &decision
+        {
+            skipped.push(format!("{}: {reason}", account.name));
         }
+
+        evaluations.push(AccountUsageEvaluation {
+            account: account.clone(),
+            usage: info,
+            decision,
+        });
+    }
+
+    if let Some(selection) = select_usable_account_by_policy(&evaluations) {
+        let selected_account = selection.account;
+        if Some(selected_account.id.as_str()) == active_id {
+            let reason = match active_decision {
+                Some(UsageDecision::Usable(reason)) => reason,
+                _ => "usage policy kept active account".to_string(),
+            };
+            return Ok(AutoSwitchResult::ActiveKept {
+                account: Box::new(selected_account.clone()),
+                reason,
+            });
+        }
+
+        let switch_reason = match active_decision {
+            Some(UsageDecision::Unavailable(reason)) => reason,
+            Some(UsageDecision::Usable(_)) => format!(
+                "usage policy selected an account with better quota headroom ({:.1} bottleneck score)",
+                selection.metrics.bottleneck_headroom
+            ),
+            None => "no active account".to_string(),
+            Some(UsageDecision::Unsupported(reason) | UsageDecision::Error(reason)) => reason,
+        };
+        let switched = if allow_running {
+            switcher::switch_to_account_unchecked(&selected_account.id).await?
+        } else {
+            switcher::switch_to_account(&selected_account.id).await?
+        };
+        return Ok(AutoSwitchResult::Switched {
+            from: active.map(Box::new),
+            to: Box::new(switched),
+            reason: switch_reason,
+        });
+    }
+
+    if let (Some(account), Some(UsageDecision::Usable(reason))) = (&active, active_decision.clone())
+    {
+        return Ok(AutoSwitchResult::ActiveKept {
+            account: Box::new(account.clone()),
+            reason,
+        });
+    }
+
+    let mut switch_reason = match active_decision {
+        Some(UsageDecision::Unavailable(reason)) => reason,
+        Some(UsageDecision::Usable(_)) => {
+            "active account is usable, but usage policy found no selectable account".to_string()
+        }
+        Some(UsageDecision::Unsupported(reason) | UsageDecision::Error(reason)) => reason,
         None => "no active account".to_string(),
     };
-
-    let active_id = active.as_ref().map(|account| account.id.as_str());
-    let mut skipped = Vec::new();
-
-    for account in store
-        .accounts
-        .iter()
-        .filter(|account| Some(account.id.as_str()) != active_id)
-    {
-        let info = match usage::get_account_usage(account).await {
-            Ok(info) => info,
-            Err(err) => {
-                skipped.push(format!("{}: {err}", account.name));
-                continue;
-            }
-        };
-
-        match assess_usage(&info) {
-            UsageDecision::Usable(_) => {
-                let switched = if allow_running {
-                    switcher::switch_to_account_unchecked(&account.id).await?
-                } else {
-                    switcher::switch_to_account(&account.id).await?
-                };
-                return Ok(AutoSwitchResult::Switched {
-                    from: active.map(Box::new),
-                    to: Box::new(switched),
-                    reason: switch_reason,
-                });
-            }
-            UsageDecision::Unavailable(reason)
-            | UsageDecision::Unsupported(reason)
-            | UsageDecision::Error(reason) => {
-                skipped.push(format!("{}: {reason}", account.name));
-            }
-        }
-    }
 
     if let Some(detail) = skipped.first() {
         switch_reason.push_str(&format!("; no usable replacement found ({detail})"));
@@ -137,6 +172,32 @@ async fn auto_switch_inner(allow_running: bool) -> Result<AutoSwitchResult> {
     }
 
     anyhow::bail!("{switch_reason}");
+}
+
+fn select_usable_account_by_policy(
+    evaluations: &[AccountUsageEvaluation],
+) -> Option<account_selector::AccountSelection<'_>> {
+    let candidates = evaluations
+        .iter()
+        .filter_map(|evaluation| {
+            if matches!(evaluation.decision, UsageDecision::Usable(_)) {
+                Some(AccountUsageCandidate {
+                    account: &evaluation.account,
+                    usage: &evaluation.usage,
+                })
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    account_selector::select_account(&candidates, SelectionConfig::default())
+}
+
+struct AccountUsageEvaluation {
+    account: StoredAccount,
+    usage: UsageInfo,
+    decision: UsageDecision,
 }
 
 fn assess_usage(info: &UsageInfo) -> UsageDecision {
@@ -222,8 +283,12 @@ fn additional_windows(limit: &UsageLimitInfo) -> [(String, Option<f64>); 2] {
 
 #[cfg(test)]
 mod tests {
-    use super::{UsageDecision, assess_usage};
-    use crate::types::UsageInfo;
+    use chrono::Utc;
+
+    use super::{
+        AccountUsageEvaluation, UsageDecision, assess_usage, select_usable_account_by_policy,
+    };
+    use crate::types::{AuthData, AuthMode, StoredAccount, UsageInfo};
 
     #[test]
     fn usage_is_unavailable_when_credits_are_depleted() {
@@ -280,6 +345,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn policy_selection_prefers_deadline_aware_candidate_over_active_order() {
+        let active = chatgpt_account("active");
+        let soon_reset = chatgpt_account("soon-reset");
+        let evaluations = vec![
+            AccountUsageEvaluation {
+                account: active,
+                usage: usage_info_with_limits("active", 20.0, 20.0, 500, 1_000),
+                decision: UsageDecision::Usable("usage is available".to_string()),
+            },
+            AccountUsageEvaluation {
+                account: soon_reset,
+                usage: usage_info_with_limits("soon-reset", 95.0, 20.0, 10, 1_000),
+                decision: UsageDecision::Usable("usage is available".to_string()),
+            },
+        ];
+
+        let selected = select_usable_account_by_policy(&evaluations)
+            .expect("policy should select a usable account");
+
+        assert_eq!(selected.account.id, "soon-reset");
+    }
+
+    #[test]
+    fn policy_selection_ignores_hard_unavailable_candidates() {
+        let active = chatgpt_account("active");
+        let over_limit = chatgpt_account("over-limit");
+        let evaluations = vec![
+            AccountUsageEvaluation {
+                account: active,
+                usage: usage_info_with_limits("active", 20.0, 20.0, 500, 1_000),
+                decision: UsageDecision::Usable("usage is available".to_string()),
+            },
+            AccountUsageEvaluation {
+                account: over_limit,
+                usage: usage_info_with_limits("over-limit", 100.0, 20.0, 10, 1_000),
+                decision: UsageDecision::Unavailable("5-hour usage is 100.0%".to_string()),
+            },
+        ];
+
+        let selected = select_usable_account_by_policy(&evaluations)
+            .expect("policy should select the remaining usable account");
+
+        assert_eq!(selected.account.id, "active");
+    }
+
     fn usage_info() -> UsageInfo {
         UsageInfo {
             account_id: "account-id".to_string(),
@@ -298,6 +409,45 @@ mod tests {
             rate_limit_reached_type: None,
             additional_limits: Vec::new(),
             error: None,
+        }
+    }
+
+    fn usage_info_with_limits(
+        account_id: &str,
+        five_hour_used_percent: f64,
+        weekly_used_percent: f64,
+        five_hour_resets_at: i64,
+        weekly_resets_at: i64,
+    ) -> UsageInfo {
+        UsageInfo {
+            account_id: account_id.to_string(),
+            primary_used_percent: Some(five_hour_used_percent),
+            secondary_used_percent: Some(weekly_used_percent),
+            primary_resets_at: Some(five_hour_resets_at),
+            secondary_resets_at: Some(weekly_resets_at),
+            ..usage_info()
+        }
+    }
+
+    fn chatgpt_account(id: &str) -> StoredAccount {
+        StoredAccount {
+            id: id.to_string(),
+            name: id.to_string(),
+            email: None,
+            plan_type: Some("pro".to_string()),
+            chatgpt_user_id: None,
+            chatgpt_account_is_fedramp: false,
+            token_last_refresh_at: None,
+            subscription_expires_at: None,
+            auth_mode: AuthMode::ChatGPT,
+            auth_data: AuthData::ChatGPT {
+                id_token: "id-token".to_string(),
+                access_token: "access-token".to_string(),
+                refresh_token: "refresh-token".to_string(),
+                account_id: Some(id.to_string()),
+            },
+            created_at: Utc::now(),
+            last_used_at: None,
         }
     }
 }
