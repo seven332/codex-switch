@@ -42,11 +42,11 @@ On Unix, both files are written with `0600` permissions.
 
 ## Switching
 
-`switch` refuses to write Codex auth data while active Codex processes are detected. Close Codex before switching accounts.
+`switch` refuses to write Codex auth data while unmanaged active Codex processes are detected. Close regular Codex sessions before switching accounts. Sessions launched through `codex-switch run` are managed by the local proxy, so `switch` is allowed while those sessions are running.
 
 `auto-switch` also refuses to switch while Codex is running. When Codex is not running, it checks the active ChatGPT OAuth account. If the account is out of credits, rate-limited, usage-limited, or at the configured usage threshold, it switches to the first stored ChatGPT OAuth account that is still usable. API key accounts are not usage-checkable and are skipped as replacement candidates.
 
-`run` is the runtime auto-switching entrypoint. It checks the active account before startup, starts `codex app-server`, launches Codex as a remote TUI through a local websocket proxy, and passes arguments after `--` to `codex`. During the managed session, the proxy watches Codex app-server `account/rateLimits/updated` notifications and usage-limit errors. It also performs best-effort background usage checks after a random initial delay of 5-15 minutes, then every 45-75 minutes. When the active account reaches the usage threshold or Codex reports `usageLimitExceeded`, `codex-switch` switches to the first usable ChatGPT OAuth account and sends the new auth tokens to the running Codex app-server.
+`run` is the runtime auto-switching entrypoint. It checks the active account before startup, starts `codex app-server`, launches Codex as a remote TUI through a local websocket proxy, and passes arguments after `--` to `codex`. During the managed session, the proxy watches Codex app-server `account/rateLimits/updated` notifications and usage-limit errors. It also performs best-effort background usage checks after a random initial delay of 5-15 minutes, then every 45-75 minutes. When the active account reaches the usage threshold or Codex reports `usageLimitExceeded`, `codex-switch` switches to the first usable ChatGPT OAuth account and sends the new auth tokens to the running Codex app-server. If another shell runs `codex-switch switch <name-or-id>`, managed `run` sessions detect the active account change and hot-load it when the selected account is ChatGPT OAuth.
 
 ```sh
 codex-switch run
@@ -56,7 +56,7 @@ codex-switch run -- resume --last
 codex-switch run -- resume <session-id>
 ```
 
-`run` supports Codex interactive commands that accept `--remote`: the default TUI, `resume`, and `fork`. ChatGPT OAuth accounts are required for runtime switching. API key accounts are not usage-checkable and cannot be applied to the running app-server. The switch applies through Codex's app-server auth API; an in-flight request may continue with the auth it already started with, so the request that first reports a usage-limit error may still fail before the next turn uses the replacement account.
+`run` supports Codex interactive commands that accept `--remote`: the default TUI, `resume`, and `fork`. ChatGPT OAuth accounts are required for runtime switching. API key accounts are not usage-checkable and cannot be applied to the running app-server. Switching to an API key account still updates `auth.json` for the next Codex start, but existing managed `run` sessions keep their current runtime auth. The runtime switch applies through Codex's app-server auth API; an in-flight request may continue with the auth it already started with, so the request that first reports a usage-limit error may still fail before the next turn uses the replacement account.
 
 ## Login
 
