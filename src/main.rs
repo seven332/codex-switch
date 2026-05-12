@@ -92,16 +92,15 @@ async fn run() -> Result<()> {
                 store::short_id(&active.id)
             );
         }
-        Command::AutoSwitch { threshold } => {
-            let result = auto_switch::auto_switch(threshold).await?;
+        Command::AutoSwitch => {
+            let result = auto_switch::auto_switch().await?;
             print_auto_switch_result(result);
         }
         Command::Run {
-            threshold,
             codex_bin,
             codex_args,
         } => {
-            let status = runtime::run_codex(threshold, codex_bin, codex_args).await?;
+            let status = runtime::run_codex(codex_bin, codex_args).await?;
             if !status.success() {
                 std::process::exit(status.code().unwrap_or(1));
             }

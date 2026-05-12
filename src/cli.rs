@@ -37,16 +37,9 @@ pub enum Command {
         account: String,
     },
     /// Switch to a usable account when the active account is out of usage.
-    AutoSwitch {
-        /// Usage percent threshold that marks an account unavailable.
-        #[arg(long, default_value_t = 100.0)]
-        threshold: f64,
-    },
+    AutoSwitch,
     /// Run Codex with runtime account auto-switching.
     Run {
-        /// Usage percent threshold that marks an account unavailable.
-        #[arg(long, default_value_t = 100.0)]
-        threshold: f64,
         /// Codex executable to launch.
         #[arg(long, default_value = "codex")]
         codex_bin: String,
