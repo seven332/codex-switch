@@ -31,17 +31,19 @@ struct WindowsCodexProcess {
 pub struct CodexProcessInfo {
     pub count: usize,
     pub background_count: usize,
+    pub managed_run_count: usize,
     pub can_switch: bool,
     pub pids: Vec<u32>,
 }
 
 pub fn check_codex_processes() -> Result<CodexProcessInfo> {
-    let (pids, background_count) = find_codex_processes()?;
+    let (pids, background_count, managed_run_count) = find_codex_processes()?;
     let count = pids.len();
 
     Ok(CodexProcessInfo {
         count,
         background_count,
+        managed_run_count,
         can_switch: count == 0,
         pids,
     })
@@ -49,6 +51,10 @@ pub fn check_codex_processes() -> Result<CodexProcessInfo> {
 
 pub fn ensure_can_switch() -> Result<()> {
     let info = check_codex_processes()?;
+    ensure_can_switch_info(&info)
+}
+
+pub fn ensure_can_switch_info(info: &CodexProcessInfo) -> Result<()> {
     if !info.can_switch {
         let pids = info
             .pids
@@ -56,20 +62,30 @@ pub fn ensure_can_switch() -> Result<()> {
             .map(u32::to_string)
             .collect::<Vec<_>>()
             .join(", ");
+        let managed_detail = if info.managed_run_count > 0 {
+            format!(
+                " Ignored {} codex-switch run process(es).",
+                info.managed_run_count
+            )
+        } else {
+            String::new()
+        };
         anyhow::bail!(
-            "Detected {} active Codex process(es) (pid: {pids}). Close Codex before switching accounts. Ignored {} background process(es).",
+            "Detected {} active Codex process(es) (pid: {pids}). Close Codex before switching accounts. Ignored {} background process(es).{}",
             info.count,
-            info.background_count
+            info.background_count,
+            managed_detail
         );
     }
     Ok(())
 }
 
-fn find_codex_processes() -> Result<(Vec<u32>, usize)> {
+fn find_codex_processes() -> Result<(Vec<u32>, usize, usize)> {
     #[cfg(unix)]
     {
         let mut pids = Vec::new();
         let mut background_count = 0;
+        let mut managed_run_count = 0;
 
         let output = Command::new("ps")
             .args(["-axo", "pid=,tty=,command="])
@@ -124,6 +140,11 @@ fn find_codex_processes() -> Result<(Vec<u32>, usize)> {
                 let is_app_server = lowercase_command.contains("codex app-server");
                 let has_tty = tty != "??" && tty != "?";
 
+                if is_codex_switch_run_process(&lowercase_command) {
+                    managed_run_count += 1;
+                    continue;
+                }
+
                 if is_ide_plugin || is_app_server {
                     background_count += 1;
                     continue;
@@ -140,7 +161,7 @@ fn find_codex_processes() -> Result<(Vec<u32>, usize)> {
         pids.sort_unstable();
         pids.dedup();
 
-        return Ok((pids, background_count));
+        return Ok((pids, background_count, managed_run_count));
     }
 
     #[cfg(windows)]
@@ -149,11 +170,11 @@ fn find_codex_processes() -> Result<(Vec<u32>, usize)> {
     }
 
     #[allow(unreachable_code)]
-    Ok((Vec::new(), 0))
+    Ok((Vec::new(), 0, 0))
 }
 
 #[cfg(windows)]
-fn find_windows_codex_processes() -> Result<(Vec<u32>, usize)> {
+fn find_windows_codex_processes() -> Result<(Vec<u32>, usize, usize)> {
     const POWERSHELL_SCRIPT: &str = r#"
 $windowTitles = @{}
 Get-Process -Name Codex -ErrorAction SilentlyContinue | ForEach-Object {
@@ -199,6 +220,7 @@ Get-CimInstance Win32_Process |
 
     let mut active_pids = Vec::new();
     let mut ignored_count = 0;
+    let mut managed_run_count = 0;
 
     for process in processes
         .iter()
@@ -207,6 +229,10 @@ Get-CimInstance Win32_Process |
         let command = process.command_line.to_ascii_lowercase();
         if is_ide_plugin_process(&command) {
             ignored_count += 1;
+            continue;
+        }
+        if is_codex_switch_run_process(&command) {
+            managed_run_count += 1;
             continue;
         }
 
@@ -234,7 +260,7 @@ Get-CimInstance Win32_Process |
     active_pids.sort_unstable();
     active_pids.dedup();
 
-    Ok((active_pids, ignored_count))
+    Ok((active_pids, ignored_count, managed_run_count))
 }
 
 #[cfg(windows)]
@@ -282,6 +308,12 @@ fn is_ide_plugin_process(command: &str) -> bool {
         || command.contains(".vscode")
 }
 
+#[cfg(any(unix, windows))]
+fn is_codex_switch_run_process(command: &str) -> bool {
+    command.contains("--remote-auth-token-env codex_switch_remote_token")
+        || command.contains("--remote-auth-token-env=codex_switch_remote_token")
+}
+
 #[cfg(windows)]
 fn windows_has_descendant_matching<F>(
     root_pid: u32,
@@ -312,4 +344,35 @@ where
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CodexProcessInfo, ensure_can_switch_info, is_codex_switch_run_process};
+
+    #[test]
+    fn managed_run_process_is_detected_by_remote_token_env() {
+        assert!(is_codex_switch_run_process(
+            "codex resume --remote ws://127.0.0.1:1234 --remote-auth-token-env codex_switch_remote_token"
+        ));
+        assert!(is_codex_switch_run_process(
+            "codex --remote=ws://127.0.0.1:1234 --remote-auth-token-env=codex_switch_remote_token"
+        ));
+        assert!(!is_codex_switch_run_process(
+            "codex resume --remote ws://127.0.0.1:1234 --remote-auth-token-env other_token"
+        ));
+    }
+
+    #[test]
+    fn managed_run_processes_do_not_block_switching_by_themselves() {
+        let info = CodexProcessInfo {
+            count: 0,
+            background_count: 1,
+            managed_run_count: 2,
+            can_switch: true,
+            pids: Vec::new(),
+        };
+
+        assert!(ensure_can_switch_info(&info).is_ok());
+    }
 }

@@ -7,8 +7,11 @@ use crate::token;
 use crate::types::StoredAccount;
 
 pub async fn switch_to_account(selector: &str) -> Result<StoredAccount> {
-    process::ensure_can_switch()?;
-    switch_to_account_unchecked(selector).await
+    let store_snapshot = store::load_accounts()?;
+    let account_id = store::resolve_account_id(&store_snapshot, selector)?;
+    let process_info = process::check_codex_processes()?;
+    process::ensure_can_switch_info(&process_info)?;
+    switch_to_account_unchecked(&account_id).await
 }
 
 pub async fn switch_to_account_unchecked(selector: &str) -> Result<StoredAccount> {

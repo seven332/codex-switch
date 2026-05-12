@@ -35,14 +35,24 @@ const USAGE_MAINTENANCE_INITIAL_MIN_DELAY: Duration = Duration::from_secs(5 * 60
 const USAGE_MAINTENANCE_INITIAL_MAX_DELAY: Duration = Duration::from_secs(15 * 60);
 const USAGE_MAINTENANCE_MIN_INTERVAL: Duration = Duration::from_secs(45 * 60);
 const USAGE_MAINTENANCE_MAX_INTERVAL: Duration = Duration::from_secs(75 * 60);
+const ACTIVE_ACCOUNT_WATCH_INTERVAL: Duration = Duration::from_secs(1);
 const RUNTIME_COMMAND_BUFFER: usize = 4;
 const INTERNAL_REQUEST_ID_PREFIX: &str = "codex-switch/";
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type ProxyClientStream = WebSocketStream<TcpStream>;
 
+#[derive(Debug)]
 enum RuntimeCommand {
     SyncActiveAccount,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ActiveAccountWatchStatus {
+    Unchanged,
+    Queued,
+    Full,
+    Closed,
 }
 
 pub async fn run_codex(
@@ -94,6 +104,10 @@ pub async fn run_codex(
     let (maintenance_shutdown_tx, maintenance_shutdown_rx) = watch::channel(false);
     let maintenance_task = tokio::spawn(run_usage_maintenance(
         threshold,
+        runtime_command_tx.clone(),
+        maintenance_shutdown_rx.clone(),
+    ));
+    let active_account_watch_task = tokio::spawn(run_active_account_watcher(
         runtime_command_tx,
         maintenance_shutdown_rx,
     ));
@@ -110,7 +124,12 @@ pub async fn run_codex(
     {
         Ok(child) => child,
         Err(err) => {
-            stop_usage_maintenance(maintenance_shutdown_tx, maintenance_task).await;
+            stop_runtime_background_tasks(
+                maintenance_shutdown_tx,
+                maintenance_task,
+                active_account_watch_task,
+            )
+            .await;
             proxy_task.abort();
             let _ = proxy_task.await;
             shutdown_child(&mut app_server).await;
@@ -142,7 +161,12 @@ pub async fn run_codex(
         proxy_task.abort();
         let _ = proxy_task.await;
     }
-    stop_usage_maintenance(maintenance_shutdown_tx, maintenance_task).await;
+    stop_runtime_background_tasks(
+        maintenance_shutdown_tx,
+        maintenance_task,
+        active_account_watch_task,
+    )
+    .await;
     shutdown_child(&mut app_server).await;
     let _ = std::fs::remove_file(&token_path);
 
@@ -346,9 +370,14 @@ async fn run_websocket_proxy(
     }
 }
 
-async fn stop_usage_maintenance(shutdown: watch::Sender<bool>, task: JoinHandle<()>) {
+async fn stop_runtime_background_tasks(
+    shutdown: watch::Sender<bool>,
+    maintenance_task: JoinHandle<()>,
+    active_account_watch_task: JoinHandle<()>,
+) {
     let _ = shutdown.send(true);
-    let _ = task.await;
+    let _ = maintenance_task.await;
+    let _ = active_account_watch_task.await;
 }
 
 async fn run_usage_maintenance(
@@ -399,6 +428,98 @@ async fn usage_maintenance_requires_active_sync(threshold: f64) -> bool {
         auto_switch::auto_switch_allow_running(threshold).await,
         Ok(AutoSwitchResult::Switched { .. })
     )
+}
+
+async fn run_active_account_watcher(
+    runtime_commands: mpsc::Sender<RuntimeCommand>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut last_snapshot = active_account_snapshot().ok();
+
+    loop {
+        if sleep_until_usage_maintenance_or_shutdown(ACTIVE_ACCOUNT_WATCH_INTERVAL, &mut shutdown)
+            .await
+        {
+            return;
+        }
+
+        let Ok(current_snapshot) = active_account_snapshot() else {
+            continue;
+        };
+        match handle_active_account_snapshot_change(
+            &runtime_commands,
+            &mut last_snapshot,
+            current_snapshot,
+        ) {
+            ActiveAccountWatchStatus::Unchanged
+            | ActiveAccountWatchStatus::Queued
+            | ActiveAccountWatchStatus::Full => {}
+            ActiveAccountWatchStatus::Closed => return,
+        }
+    }
+}
+
+fn handle_active_account_snapshot_change(
+    runtime_commands: &mpsc::Sender<RuntimeCommand>,
+    last_snapshot: &mut Option<ActiveAccountSnapshot>,
+    current_snapshot: ActiveAccountSnapshot,
+) -> ActiveAccountWatchStatus {
+    if Some(current_snapshot.clone()) == *last_snapshot {
+        return ActiveAccountWatchStatus::Unchanged;
+    }
+
+    match runtime_commands.try_send(RuntimeCommand::SyncActiveAccount) {
+        Ok(()) => {
+            *last_snapshot = Some(current_snapshot);
+            ActiveAccountWatchStatus::Queued
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => ActiveAccountWatchStatus::Full,
+        Err(mpsc::error::TrySendError::Closed(_)) => ActiveAccountWatchStatus::Closed,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ActiveAccountSnapshot {
+    active_account_id: Option<String>,
+    auth_marker: Option<String>,
+}
+
+fn active_account_snapshot() -> Result<ActiveAccountSnapshot> {
+    let store = store::load_accounts()?;
+    let active_account_id = store.active_account_id.clone();
+    let auth_marker = active_account_id
+        .as_deref()
+        .and_then(|active_id| {
+            store
+                .accounts
+                .iter()
+                .find(|account| account.id == active_id)
+        })
+        .map(active_account_auth_marker);
+
+    Ok(ActiveAccountSnapshot {
+        active_account_id,
+        auth_marker,
+    })
+}
+
+fn active_account_auth_marker(account: &StoredAccount) -> String {
+    let last_used_at = account
+        .last_used_at
+        .map(|value| value.timestamp_millis())
+        .unwrap_or_default();
+    match &account.auth_data {
+        AuthData::ChatGPT { account_id, .. } => format!(
+            "chatgpt:{}:{}:{}",
+            account_id.as_deref().unwrap_or_default(),
+            account
+                .token_last_refresh_at
+                .map(|value| value.timestamp_millis())
+                .unwrap_or_default(),
+            last_used_at
+        ),
+        AuthData::ApiKey { .. } => format!("api_key:{last_used_at}"),
+    }
 }
 
 fn random_usage_maintenance_initial_delay() -> Duration {
@@ -1020,11 +1141,14 @@ mod tests {
     use std::time::Duration;
 
     use serde_json::json;
+    use tokio::sync::mpsc;
 
     use super::{
-        codex_args_with_default_cwd, has_cwd_arg, initialize_app_server_request,
-        random_duration_between, rate_limit_notification_requires_switch,
-        usage_limit_error_requires_switch, validate_remote_capable_codex_args,
+        ActiveAccountSnapshot, ActiveAccountWatchStatus, RuntimeCommand,
+        codex_args_with_default_cwd, handle_active_account_snapshot_change, has_cwd_arg,
+        initialize_app_server_request, random_duration_between,
+        rate_limit_notification_requires_switch, usage_limit_error_requires_switch,
+        validate_remote_capable_codex_args,
     };
 
     #[test]
@@ -1167,6 +1291,45 @@ mod tests {
     }
 
     #[test]
+    fn active_account_watcher_advances_snapshot_only_after_queueing_sync() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let current_snapshot = active_snapshot("account-a");
+        let mut last_snapshot = None;
+
+        let status = handle_active_account_snapshot_change(
+            &sender,
+            &mut last_snapshot,
+            current_snapshot.clone(),
+        );
+
+        assert_eq!(status, ActiveAccountWatchStatus::Queued);
+        assert_eq!(last_snapshot, Some(current_snapshot));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(RuntimeCommand::SyncActiveAccount)
+        ));
+    }
+
+    #[test]
+    fn active_account_watcher_retries_when_sync_queue_is_full() {
+        let (sender, _receiver) = mpsc::channel(1);
+        sender
+            .try_send(RuntimeCommand::SyncActiveAccount)
+            .expect("test queue has capacity for first command");
+        let current_snapshot = active_snapshot("account-a");
+        let mut last_snapshot = None;
+
+        let status = handle_active_account_snapshot_change(
+            &sender,
+            &mut last_snapshot,
+            current_snapshot.clone(),
+        );
+
+        assert_eq!(status, ActiveAccountWatchStatus::Full);
+        assert_eq!(last_snapshot, None);
+    }
+
+    #[test]
     fn run_rejects_non_remote_codex_subcommands() {
         assert!(validate_remote_capable_codex_args(&[]).is_ok());
         assert!(validate_remote_capable_codex_args(&["resume".to_string()]).is_ok());
@@ -1220,5 +1383,12 @@ mod tests {
             ),
             vec![OsString::from("resume"), OsString::from("--cd=/other")]
         );
+    }
+
+    fn active_snapshot(account_id: &str) -> ActiveAccountSnapshot {
+        ActiveAccountSnapshot {
+            active_account_id: Some(account_id.to_string()),
+            auth_marker: Some(format!("chatgpt:{account_id}:1:1")),
+        }
     }
 }
