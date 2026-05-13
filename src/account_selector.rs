@@ -137,6 +137,86 @@ impl AccountSelectionPolicy for DrainFirstPolicy {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MaxHeadroomPolicy {
+    pub config: SelectionConfig,
+}
+
+#[cfg(test)]
+impl MaxHeadroomPolicy {
+    pub fn new(config: SelectionConfig) -> Self {
+        Self { config }
+    }
+}
+
+#[cfg(test)]
+impl AccountSelectionPolicy for MaxHeadroomPolicy {
+    fn select_account<'a>(
+        &mut self,
+        candidates: &[AccountUsageCandidate<'a>],
+    ) -> Option<AccountSelection<'a>> {
+        evaluated_candidates(candidates, self.config)
+            .into_iter()
+            .min_by(|left, right| {
+                compare_headroom_desc(left, right)
+                    .then_with(|| {
+                        compare_optional_reset(
+                            left.metrics.bottleneck_resets_at,
+                            right.metrics.bottleneck_resets_at,
+                        )
+                    })
+                    .then_with(|| {
+                        compare_last_used(left.account.last_used_at, right.account.last_used_at)
+                    })
+                    .then_with(|| left.order.cmp(&right.order))
+            })
+            .map(|candidate| AccountSelection {
+                account: candidate.account,
+                metrics: candidate.metrics,
+            })
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ResetFirstPolicy {
+    pub config: SelectionConfig,
+}
+
+#[cfg(test)]
+impl ResetFirstPolicy {
+    pub fn new(config: SelectionConfig) -> Self {
+        Self { config }
+    }
+}
+
+#[cfg(test)]
+impl AccountSelectionPolicy for ResetFirstPolicy {
+    fn select_account<'a>(
+        &mut self,
+        candidates: &[AccountUsageCandidate<'a>],
+    ) -> Option<AccountSelection<'a>> {
+        evaluated_candidates(candidates, self.config)
+            .into_iter()
+            .min_by(|left, right| {
+                compare_optional_reset(
+                    left.metrics.bottleneck_resets_at,
+                    right.metrics.bottleneck_resets_at,
+                )
+                .then_with(|| compare_headroom_desc(left, right))
+                .then_with(|| {
+                    compare_last_used(left.account.last_used_at, right.account.last_used_at)
+                })
+                .then_with(|| left.order.cmp(&right.order))
+            })
+            .map(|candidate| AccountSelection {
+                account: candidate.account,
+                metrics: candidate.metrics,
+            })
+    }
+}
+
 pub fn select_account<'a>(
     candidates: &[AccountUsageCandidate<'a>],
     config: SelectionConfig,
@@ -328,7 +408,7 @@ mod tests {
 
     use super::{
         AccountSelectionPolicy, AccountUsageCandidate, DeadlineAwarePolicy, DrainFirstPolicy,
-        SelectionConfig, UsageWindow, select_account,
+        MaxHeadroomPolicy, ResetFirstPolicy, SelectionConfig, UsageWindow, select_account,
     };
     use crate::types::{AuthData, AuthMode, StoredAccount, UsageInfo};
 
@@ -605,6 +685,79 @@ mod tests {
     }
 
     #[test]
+    fn simulator_compares_baseline_policies_across_demand_scenarios() {
+        for scenario in evaluation_scenarios() {
+            let policy_stats = policy_stats_for_scenario(scenario);
+            let deadline_aware = policy_stats
+                .iter()
+                .find(|stats| stats.policy_name == "deadline-aware")
+                .expect("deadline-aware stats should be present");
+            let drain_first = policy_stats
+                .iter()
+                .find(|stats| stats.policy_name == "drain-first")
+                .expect("drain-first stats should be present");
+
+            for stats in &policy_stats {
+                assert!(
+                    stats.stats.total_demand_credits() > 0.0,
+                    "{} should generate demand for {}",
+                    scenario.name,
+                    stats.policy_name
+                );
+                assert!(
+                    stats.stats.min_five_hour_remaining.is_finite(),
+                    "{} should track 5-hour remaining for {}",
+                    scenario.name,
+                    stats.policy_name
+                );
+                assert!(
+                    stats.stats.min_weekly_remaining.is_finite(),
+                    "{} should track weekly remaining for {}",
+                    scenario.name,
+                    stats.policy_name
+                );
+            }
+
+            assert!(
+                deadline_aware.stats.user_unavailable_minutes()
+                    <= drain_first.stats.user_unavailable_minutes(),
+                "deadline-aware should not increase unavailable time vs drain-first in {}: {policy_stats:?}",
+                scenario.name
+            );
+        }
+    }
+
+    #[test]
+    fn simulator_includes_bursty_and_weekly_skewed_scenarios() {
+        let bursty = SimScenario::new(
+            "bursty-short-sessions",
+            2,
+            SimDemand::SessionBursts {
+                base_credits_per_minute: 1.5,
+                burst_credits_per_minute: 8.0,
+                burst_minutes: 20,
+            },
+            InitialUsage::Empty,
+        );
+        let weekly_skewed = SimScenario::new(
+            "weekly-near-exhaustion-mixed",
+            2,
+            SimDemand::Constant(2.0),
+            InitialUsage::WeeklyNearExhaustionMixed,
+        );
+
+        let mut bursty_policy = DeadlineAwarePolicy::default();
+        let bursty_stats = simulate_policy_scenario(&mut bursty_policy, bursty);
+        let mut weekly_policy = DeadlineAwarePolicy::default();
+        let weekly_stats = simulate_policy_scenario(&mut weekly_policy, weekly_skewed);
+
+        assert!(bursty_stats.account_switches > 0);
+        assert!(bursty_stats.served_credits > 0.0);
+        assert!(weekly_stats.min_weekly_remaining < PRO_200_WEEKLY_LIMIT_CREDITS * 0.1);
+        assert_eq!(weekly_stats.user_unavailable_minutes(), 0);
+    }
+
+    #[test]
     fn simulator_staggers_initial_reset_times_across_five_hour_and_weekly_windows() {
         let first = SimAccount::new("account-0", 0, 2);
         let second = SimAccount::new("account-1", 1, 2);
@@ -632,6 +785,90 @@ mod tests {
     const ACTIVE_MINUTES_PER_ROLLING_WEEK: i32 = 2_250;
 
     #[derive(Debug, Clone, Copy)]
+    struct SimScenario {
+        name: &'static str,
+        account_count: usize,
+        demand: SimDemand,
+        initial_usage: InitialUsage,
+    }
+
+    impl SimScenario {
+        fn new(
+            name: &'static str,
+            account_count: usize,
+            demand: SimDemand,
+            initial_usage: InitialUsage,
+        ) -> Self {
+            Self {
+                name,
+                account_count,
+                demand,
+                initial_usage,
+            }
+        }
+
+        fn steady(name: &'static str, account_count: usize, credits_per_minute: f64) -> Self {
+            Self::new(
+                name,
+                account_count,
+                SimDemand::Constant(credits_per_minute),
+                InitialUsage::Empty,
+            )
+        }
+
+        fn demand_at(self, minute: i64) -> Option<f64> {
+            if !is_work_minute(minute) {
+                return None;
+            }
+
+            Some(match self.demand {
+                SimDemand::Constant(credits_per_minute) => credits_per_minute,
+                SimDemand::SessionBursts {
+                    base_credits_per_minute,
+                    burst_credits_per_minute,
+                    burst_minutes,
+                } => {
+                    if is_session_burst_minute(minute, burst_minutes) {
+                        burst_credits_per_minute
+                    } else {
+                        base_credits_per_minute
+                    }
+                }
+                SimDemand::HeavyFirstWorkday {
+                    normal_credits_per_minute,
+                    heavy_credits_per_minute,
+                } => {
+                    if minute / 1_440 == 0 {
+                        heavy_credits_per_minute
+                    } else {
+                        normal_credits_per_minute
+                    }
+                }
+            })
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum SimDemand {
+        Constant(f64),
+        SessionBursts {
+            base_credits_per_minute: f64,
+            burst_credits_per_minute: f64,
+            burst_minutes: i64,
+        },
+        HeavyFirstWorkday {
+            normal_credits_per_minute: f64,
+            heavy_credits_per_minute: f64,
+        },
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum InitialUsage {
+        Empty,
+        WeeklyNearExhaustionMixed,
+    }
+
+    #[derive(Debug, Clone, Copy)]
     struct UsageEvent {
         at_minute: i64,
         credits: f64,
@@ -649,7 +886,7 @@ mod tests {
         weekly_events: VecDeque<UsageEvent>,
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Copy)]
     struct SimStats {
         served_credits: f64,
         failed_credits: f64,
@@ -665,6 +902,16 @@ mod tests {
         fn user_unavailable_minutes(&self) -> u32 {
             self.unavailable_minutes
         }
+
+        fn total_demand_credits(&self) -> f64 {
+            self.served_credits + self.failed_credits
+        }
+    }
+
+    #[derive(Debug)]
+    struct PolicyStats {
+        policy_name: &'static str,
+        stats: SimStats,
     }
 
     fn max_sustainable_burn_for_policy<P, F>(account_count: usize, mut policy_factory: F) -> f64
@@ -694,9 +941,22 @@ mod tests {
         account_count: usize,
         credits_per_minute: f64,
     ) -> SimStats {
-        let mut accounts = (0..account_count)
-            .map(|index| SimAccount::new(&format!("account-{index}"), index, account_count))
+        simulate_policy_scenario(
+            policy,
+            SimScenario::steady("steady-work-week", account_count, credits_per_minute),
+        )
+    }
+
+    fn simulate_policy_scenario<P: AccountSelectionPolicy>(
+        policy: &mut P,
+        scenario: SimScenario,
+    ) -> SimStats {
+        let mut accounts = (0..scenario.account_count)
+            .map(|index| {
+                SimAccount::new(&format!("account-{index}"), index, scenario.account_count)
+            })
             .collect::<Vec<_>>();
+        apply_initial_usage(&mut accounts, scenario.initial_usage);
         let mut stats = SimStats {
             served_credits: 0.0,
             failed_credits: 0.0,
@@ -715,24 +975,91 @@ mod tests {
                 account.expire(minute);
             }
 
-            if !is_work_minute(minute) {
-                continue;
+            if let Some(credits) = scenario.demand_at(minute) {
+                serve_demand(
+                    policy,
+                    &mut accounts,
+                    Demand { minute, credits },
+                    &mut stats,
+                    &mut last_account_index,
+                    &mut contiguous_unavailable_minutes,
+                );
             }
-
-            serve_demand(
-                policy,
-                &mut accounts,
-                Demand {
-                    minute,
-                    credits: credits_per_minute,
-                },
-                &mut stats,
-                &mut last_account_index,
-                &mut contiguous_unavailable_minutes,
-            );
         }
 
         stats
+    }
+
+    fn evaluation_scenarios() -> [SimScenario; 5] {
+        [
+            SimScenario::steady("light-steady", 2, 1.0),
+            SimScenario::steady("near-capacity-steady", 2, 4.35),
+            SimScenario::new(
+                "bursty-short-sessions",
+                2,
+                SimDemand::SessionBursts {
+                    base_credits_per_minute: 1.5,
+                    burst_credits_per_minute: 8.0,
+                    burst_minutes: 20,
+                },
+                InitialUsage::Empty,
+            ),
+            SimScenario::new(
+                "one-heavy-day-then-normal",
+                2,
+                SimDemand::HeavyFirstWorkday {
+                    normal_credits_per_minute: 2.0,
+                    heavy_credits_per_minute: 6.0,
+                },
+                InitialUsage::Empty,
+            ),
+            SimScenario::new(
+                "weekly-near-exhaustion-mixed",
+                2,
+                SimDemand::Constant(2.0),
+                InitialUsage::WeeklyNearExhaustionMixed,
+            ),
+        ]
+    }
+
+    fn policy_stats_for_scenario(scenario: SimScenario) -> [PolicyStats; 4] {
+        let mut deadline_aware = DeadlineAwarePolicy::default();
+        let mut drain_first = DrainFirstPolicy::new(SelectionConfig::default());
+        let mut max_headroom = MaxHeadroomPolicy::new(SelectionConfig::default());
+        let mut reset_first = ResetFirstPolicy::new(SelectionConfig::default());
+
+        [
+            PolicyStats {
+                policy_name: "deadline-aware",
+                stats: simulate_policy_scenario(&mut deadline_aware, scenario),
+            },
+            PolicyStats {
+                policy_name: "drain-first",
+                stats: simulate_policy_scenario(&mut drain_first, scenario),
+            },
+            PolicyStats {
+                policy_name: "max-headroom",
+                stats: simulate_policy_scenario(&mut max_headroom, scenario),
+            },
+            PolicyStats {
+                policy_name: "reset-first",
+                stats: simulate_policy_scenario(&mut reset_first, scenario),
+            },
+        ]
+    }
+
+    fn apply_initial_usage(accounts: &mut [SimAccount], initial_usage: InitialUsage) {
+        match initial_usage {
+            InitialUsage::Empty => {}
+            InitialUsage::WeeklyNearExhaustionMixed => {
+                if let Some(account) = accounts.get_mut(0) {
+                    account.seed_initial_usage(25.0, 4_600.0, 200, 2 * 1_440);
+                }
+                if let Some(account) = accounts.get_mut(1) {
+                    account.seed_initial_usage(75.0, 300.0, 150, 5 * 1_440);
+                }
+            }
+        }
     }
 
     fn serve_demand<P: AccountSelectionPolicy>(
@@ -820,6 +1147,13 @@ mod tests {
         (570..720).contains(&minute_of_day) || (810..1_110).contains(&minute_of_day)
     }
 
+    fn is_session_burst_minute(minute: i64, burst_minutes: i64) -> bool {
+        let burst_minutes = burst_minutes.max(0);
+        let minute_of_day = minute % 1_440;
+        (570..570 + burst_minutes).contains(&minute_of_day)
+            || (810..810 + burst_minutes).contains(&minute_of_day)
+    }
+
     impl SimAccount {
         fn new(id: &str, index: usize, account_count: usize) -> Self {
             let five_hour_seed =
@@ -830,6 +1164,31 @@ mod tests {
                 account: chatgpt_account(id, None),
                 five_hour_events: VecDeque::from([five_hour_seed]),
                 weekly_events: VecDeque::from([weekly_seed]),
+            }
+        }
+
+        fn seed_initial_usage(
+            &mut self,
+            five_hour_credits: f64,
+            weekly_credits: f64,
+            five_hour_resets_at: i64,
+            weekly_resets_at: i64,
+        ) {
+            if five_hour_credits > 0.0 {
+                self.five_hour_events.push_back(seed_usage_event(
+                    five_hour_resets_at,
+                    FIVE_HOUR_WINDOW_MINUTES,
+                    five_hour_credits,
+                ));
+                sort_events(&mut self.five_hour_events);
+            }
+            if weekly_credits > 0.0 {
+                self.weekly_events.push_back(seed_usage_event(
+                    weekly_resets_at,
+                    WEEKLY_WINDOW_MINUTES,
+                    weekly_credits,
+                ));
+                sort_events(&mut self.weekly_events);
             }
         }
 
@@ -896,6 +1255,19 @@ mod tests {
             at_minute: offset - window_minutes,
             credits: 0.0,
         }
+    }
+
+    fn seed_usage_event(reset_at: i64, window_minutes: i64, credits: f64) -> UsageEvent {
+        UsageEvent {
+            at_minute: reset_at - window_minutes,
+            credits,
+        }
+    }
+
+    fn sort_events(events: &mut VecDeque<UsageEvent>) {
+        let mut sorted = events.drain(..).collect::<Vec<_>>();
+        sorted.sort_by_key(|event| event.at_minute);
+        *events = VecDeque::from(sorted);
     }
 
     fn staggered_reset_offset(index: usize, account_count: usize, window_minutes: i64) -> i64 {
