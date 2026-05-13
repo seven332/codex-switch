@@ -22,6 +22,7 @@ const DEFAULT_BROWSER_CALLBACK_PORT: u16 = 1455;
 const FALLBACK_BROWSER_CALLBACK_PORT: u16 = 1457;
 const DEVICE_AUTH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const OAUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_DEVICE_AUTH_POLL_INTERVAL_SECS: u64 = 5;
 const OAUTH_SCOPE: &str =
     "openid profile email offline_access api.connectors.read api.connectors.invoke";
@@ -90,7 +91,7 @@ pub async fn login(account_name: String, flow: LoginFlow) -> Result<StoredAccoun
 }
 
 async fn browser_login() -> Result<TokenResponse> {
-    let client = reqwest::Client::new();
+    let client = oauth_http_client()?;
     let issuer = DEFAULT_ISSUER.trim_end_matches('/');
     let pkce = generate_pkce();
     let state = generate_state();
@@ -111,7 +112,7 @@ async fn browser_login() -> Result<TokenResponse> {
 }
 
 async fn device_auth_login() -> Result<TokenResponse> {
-    let client = reqwest::Client::new();
+    let client = oauth_http_client()?;
     let issuer = DEFAULT_ISSUER.trim_end_matches('/');
     let device_code = request_device_code(&client, issuer).await?;
 
@@ -127,6 +128,13 @@ async fn device_auth_login() -> Result<TokenResponse> {
         &code.code_verifier,
     )
     .await
+}
+
+fn oauth_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(OAUTH_REQUEST_TIMEOUT)
+        .build()
+        .context("Failed to build OAuth HTTP client")
 }
 
 fn stored_account_from_tokens(account_name: String, tokens: TokenResponse) -> StoredAccount {
