@@ -144,6 +144,17 @@ pub fn select_account<'a>(
     DeadlineAwarePolicy::new(config).select_account(candidates)
 }
 
+pub fn usage_selection_metrics(
+    usage: &UsageInfo,
+    config: SelectionConfig,
+) -> Option<UsageSelectionMetrics> {
+    evaluate_usage(
+        usage,
+        normalized_min_safe_headroom(config.min_safe_headroom),
+        normalized_weekly_to_five_hour_ratio(config.weekly_to_five_hour_ratio),
+    )
+}
+
 fn evaluated_candidates<'a>(
     candidates: &[AccountUsageCandidate<'a>],
     config: SelectionConfig,
@@ -180,6 +191,14 @@ fn evaluate_candidate(
     if !matches!(account.auth_data, AuthData::ChatGPT { .. }) {
         return None;
     }
+    evaluate_usage(usage, min_safe_headroom, weekly_to_five_hour_ratio)
+}
+
+fn evaluate_usage(
+    usage: &UsageInfo,
+    min_safe_headroom: f64,
+    weekly_to_five_hour_ratio: f64,
+) -> Option<UsageSelectionMetrics> {
     if usage.error.is_some() || usage.rate_limit_reached_type.is_some() {
         return None;
     }

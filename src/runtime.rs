@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use futures_util::stream::SplitSink;
@@ -22,6 +23,7 @@ use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, accept_hdr_async, connect_async};
 use uuid::Uuid;
 
+use crate::account_selector::{self, SelectionConfig};
 use crate::auto_switch::{self, AutoSwitchResult};
 use crate::codex_http;
 use crate::store;
@@ -33,16 +35,24 @@ const APP_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const APP_SERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const AUTO_SWITCH_MAINTENANCE_MIN_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const AUTO_SWITCH_MAINTENANCE_MAX_INTERVAL: Duration = Duration::from_secs(45 * 60);
+const AUTO_SWITCH_SOFT_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 const ACTIVE_ACCOUNT_WATCH_INTERVAL: Duration = Duration::from_secs(1);
+const RUNTIME_BACKGROUND_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const RUNTIME_COMMAND_BUFFER: usize = 4;
+const BACKGROUND_RUNTIME_REQUEST_BUFFER: usize = 4;
 const INTERNAL_REQUEST_ID_PREFIX: &str = "codex-switch/";
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type ProxyClientStream = WebSocketStream<TcpStream>;
 
-#[derive(Debug)]
 enum RuntimeCommand {
-    SyncActiveAccount,
+    LoginPreparedAccount(PreparedAccountLogin),
+}
+
+#[derive(Debug)]
+enum BackgroundRuntimeRequest {
+    AutoSwitch,
+    PrepareActiveAccountLogin,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -95,19 +105,31 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
         }
     };
     let (runtime_command_tx, runtime_command_rx) = mpsc::channel(RUNTIME_COMMAND_BUFFER);
+    let (background_runtime_tx, background_runtime_rx) =
+        mpsc::channel(BACKGROUND_RUNTIME_REQUEST_BUFFER);
+    let background_auto_switch_scheduler = shared_background_auto_switch_scheduler();
     let (maintenance_shutdown_tx, maintenance_shutdown_rx) = watch::channel(false);
-    let maintenance_task = tokio::spawn(run_auto_switch_maintenance(
+    let background_runtime_task = tokio::spawn(run_background_runtime_worker(
+        background_runtime_rx,
         runtime_command_tx.clone(),
+        background_auto_switch_scheduler.clone(),
+        maintenance_shutdown_rx.clone(),
+    ));
+    let maintenance_task = tokio::spawn(run_auto_switch_maintenance(
+        background_runtime_tx.clone(),
+        background_auto_switch_scheduler.clone(),
         maintenance_shutdown_rx.clone(),
     ));
     let active_account_watch_task = tokio::spawn(run_active_account_watcher(
-        runtime_command_tx,
+        background_runtime_tx.clone(),
         maintenance_shutdown_rx,
     ));
     let mut proxy_task = tokio::spawn(run_websocket_proxy(
         proxy_listener,
         app_server_url.clone(),
         token.clone(),
+        background_runtime_tx,
+        background_auto_switch_scheduler,
         runtime_command_rx,
     ));
 
@@ -116,14 +138,15 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
     {
         Ok(child) => child,
         Err(err) => {
+            proxy_task.abort();
+            let _ = proxy_task.await;
             stop_runtime_background_tasks(
                 maintenance_shutdown_tx,
+                background_runtime_task,
                 maintenance_task,
                 active_account_watch_task,
             )
             .await;
-            proxy_task.abort();
-            let _ = proxy_task.await;
             shutdown_child(&mut app_server).await;
             let _ = std::fs::remove_file(&token_path);
             return Err(err);
@@ -155,6 +178,7 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
     }
     stop_runtime_background_tasks(
         maintenance_shutdown_tx,
+        background_runtime_task,
         maintenance_task,
         active_account_watch_task,
     )
@@ -338,9 +362,11 @@ async fn run_websocket_proxy(
     listener: TcpListener,
     app_server_url: String,
     token: String,
+    background_requests: mpsc::Sender<BackgroundRuntimeRequest>,
+    background_auto_switch_scheduler: SharedBackgroundAutoSwitchScheduler,
     mut runtime_commands: mpsc::Receiver<RuntimeCommand>,
 ) -> Result<()> {
-    let mut state = ProxyState::new();
+    let mut state = ProxyState::new(background_requests, background_auto_switch_scheduler);
 
     loop {
         let (client_stream, _) = listener
@@ -363,16 +389,183 @@ async fn run_websocket_proxy(
 
 async fn stop_runtime_background_tasks(
     shutdown: watch::Sender<bool>,
+    background_runtime_task: JoinHandle<()>,
     maintenance_task: JoinHandle<()>,
     active_account_watch_task: JoinHandle<()>,
 ) {
     let _ = shutdown.send(true);
-    let _ = maintenance_task.await;
-    let _ = active_account_watch_task.await;
+    stop_task_with_timeout(background_runtime_task).await;
+    stop_task_with_timeout(maintenance_task).await;
+    stop_task_with_timeout(active_account_watch_task).await;
+}
+
+async fn stop_task_with_timeout(mut task: JoinHandle<()>) {
+    tokio::select! {
+        _ = &mut task => {}
+        _ = sleep(RUNTIME_BACKGROUND_TASK_STOP_TIMEOUT) => {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+type SharedBackgroundAutoSwitchScheduler = Arc<Mutex<BackgroundAutoSwitchScheduler>>;
+
+fn shared_background_auto_switch_scheduler() -> SharedBackgroundAutoSwitchScheduler {
+    Arc::new(Mutex::new(BackgroundAutoSwitchScheduler::new(
+        AUTO_SWITCH_SOFT_COOLDOWN,
+    )))
+}
+
+#[derive(Debug)]
+struct BackgroundAutoSwitchScheduler {
+    cooldown: Duration,
+    last_attempt: Option<Instant>,
+    in_flight: bool,
+}
+
+impl BackgroundAutoSwitchScheduler {
+    fn new(cooldown: Duration) -> Self {
+        Self {
+            cooldown,
+            last_attempt: None,
+            in_flight: false,
+        }
+    }
+
+    fn try_start(&mut self, now: Instant) -> BackgroundAutoSwitchQueueStatus {
+        if self.in_flight {
+            return BackgroundAutoSwitchQueueStatus::InFlight;
+        }
+        if let Some(last_attempt) = self.last_attempt
+            && now < last_attempt + self.cooldown
+        {
+            return BackgroundAutoSwitchQueueStatus::Cooldown;
+        }
+
+        self.last_attempt = Some(now);
+        self.in_flight = true;
+        BackgroundAutoSwitchQueueStatus::Queued
+    }
+
+    fn finish(&mut self) {
+        self.in_flight = false;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum BackgroundAutoSwitchQueueStatus {
+    Queued,
+    Cooldown,
+    InFlight,
+    Full,
+    Closed,
+}
+
+fn queue_background_auto_switch(
+    requests: &mpsc::Sender<BackgroundRuntimeRequest>,
+    scheduler: &SharedBackgroundAutoSwitchScheduler,
+    now: Instant,
+) -> BackgroundAutoSwitchQueueStatus {
+    let Ok(mut scheduler) = scheduler.lock() else {
+        return BackgroundAutoSwitchQueueStatus::Closed;
+    };
+
+    let previous_last_attempt = scheduler.last_attempt;
+    let status = scheduler.try_start(now);
+    if status != BackgroundAutoSwitchQueueStatus::Queued {
+        return status;
+    }
+
+    match requests.try_send(BackgroundRuntimeRequest::AutoSwitch) {
+        Ok(()) => BackgroundAutoSwitchQueueStatus::Queued,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            scheduler.last_attempt = previous_last_attempt;
+            scheduler.finish();
+            BackgroundAutoSwitchQueueStatus::Full
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            scheduler.last_attempt = previous_last_attempt;
+            scheduler.finish();
+            BackgroundAutoSwitchQueueStatus::Closed
+        }
+    }
+}
+
+fn finish_background_auto_switch(scheduler: &SharedBackgroundAutoSwitchScheduler) {
+    if let Ok(mut scheduler) = scheduler.lock() {
+        scheduler.finish();
+    }
+}
+
+async fn run_background_runtime_worker(
+    mut requests: mpsc::Receiver<BackgroundRuntimeRequest>,
+    runtime_commands: mpsc::Sender<RuntimeCommand>,
+    scheduler: SharedBackgroundAutoSwitchScheduler,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_ok() && *shutdown.borrow() {
+                    return;
+                }
+            }
+            request = requests.recv() => {
+                let Some(request) = request else {
+                    return;
+                };
+
+                let command = match request {
+                    BackgroundRuntimeRequest::AutoSwitch => {
+                        let command = background_auto_switch_login_command().await;
+                        finish_background_auto_switch(&scheduler);
+                        command
+                    }
+                    BackgroundRuntimeRequest::PrepareActiveAccountLogin => {
+                        prepare_active_account_login_command().await
+                    }
+                };
+                if let Some(command) = command
+                    && runtime_commands.send(command).await.is_err()
+                {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn background_auto_switch_login_command() -> Option<RuntimeCommand> {
+    match auto_switch::auto_switch_allow_running().await {
+        Ok(AutoSwitchResult::Switched { to, .. }) => prepare_login_command(*to).await.ok(),
+        Ok(AutoSwitchResult::ActiveKept { .. } | AutoSwitchResult::ActiveUnsupported { .. }) => {
+            None
+        }
+        Err(_) => None,
+    }
+}
+
+async fn prepare_login_command(account: StoredAccount) -> Result<RuntimeCommand> {
+    let account_id = account.id.clone();
+    let payload = external_auth_payload(&account).await?;
+    Ok(RuntimeCommand::LoginPreparedAccount(PreparedAccountLogin {
+        account_id,
+        payload,
+    }))
+}
+
+async fn prepare_active_account_login_command() -> Option<RuntimeCommand> {
+    let account = store::get_active_account().ok().flatten()?;
+    if !matches!(account.auth_data, AuthData::ChatGPT { .. }) {
+        return None;
+    }
+    prepare_login_command(account).await.ok()
 }
 
 async fn run_auto_switch_maintenance(
-    runtime_commands: mpsc::Sender<RuntimeCommand>,
+    background_requests: mpsc::Sender<BackgroundRuntimeRequest>,
+    background_auto_switch_scheduler: SharedBackgroundAutoSwitchScheduler,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
@@ -380,11 +573,13 @@ async fn run_auto_switch_maintenance(
             return;
         }
 
-        if auto_switch_maintenance_switched_account().await {
-            match runtime_commands.try_send(RuntimeCommand::SyncActiveAccount) {
-                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
-                Err(mpsc::error::TrySendError::Closed(_)) => return,
-            }
+        if queue_background_auto_switch(
+            &background_requests,
+            &background_auto_switch_scheduler,
+            Instant::now(),
+        ) == BackgroundAutoSwitchQueueStatus::Closed
+        {
+            return;
         }
     }
 }
@@ -396,15 +591,8 @@ async fn sleep_until_shutdown(duration: Duration, shutdown: &mut watch::Receiver
     }
 }
 
-async fn auto_switch_maintenance_switched_account() -> bool {
-    matches!(
-        auto_switch::auto_switch_allow_running().await,
-        Ok(AutoSwitchResult::Switched { .. })
-    )
-}
-
 async fn run_active_account_watcher(
-    runtime_commands: mpsc::Sender<RuntimeCommand>,
+    background_requests: mpsc::Sender<BackgroundRuntimeRequest>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut last_snapshot = active_account_snapshot().ok();
@@ -418,7 +606,7 @@ async fn run_active_account_watcher(
             continue;
         };
         match handle_active_account_snapshot_change(
-            &runtime_commands,
+            &background_requests,
             &mut last_snapshot,
             current_snapshot,
         ) {
@@ -431,7 +619,7 @@ async fn run_active_account_watcher(
 }
 
 fn handle_active_account_snapshot_change(
-    runtime_commands: &mpsc::Sender<RuntimeCommand>,
+    background_requests: &mpsc::Sender<BackgroundRuntimeRequest>,
     last_snapshot: &mut Option<ActiveAccountSnapshot>,
     current_snapshot: ActiveAccountSnapshot,
 ) -> ActiveAccountWatchStatus {
@@ -439,7 +627,7 @@ fn handle_active_account_snapshot_change(
         return ActiveAccountWatchStatus::Unchanged;
     }
 
-    match runtime_commands.try_send(RuntimeCommand::SyncActiveAccount) {
+    match background_requests.try_send(BackgroundRuntimeRequest::PrepareActiveAccountLogin) {
         Ok(()) => {
             *last_snapshot = Some(current_snapshot);
             ActiveAccountWatchStatus::Queued
@@ -552,8 +740,10 @@ async fn proxy_websockets(
         tokio::select! {
             command = runtime_commands.recv(), if runtime_commands_open => {
                 match command {
-                    Some(RuntimeCommand::SyncActiveAccount) => {
-                        state.login_active_chatgpt_account(&mut app_server_write).await?;
+                    Some(RuntimeCommand::LoginPreparedAccount(prepared)) => {
+                        state
+                            .login_prepared_chatgpt_account(&mut app_server_write, prepared)
+                            .await?;
                     }
                     None => {
                         runtime_commands_open = false;
@@ -595,6 +785,8 @@ struct ProxyState {
     pending_internal: HashMap<String, PendingInternalRequest>,
     app_server_account_id: Option<String>,
     pending_login_account_id: Option<String>,
+    background_requests: mpsc::Sender<BackgroundRuntimeRequest>,
+    background_auto_switch_scheduler: SharedBackgroundAutoSwitchScheduler,
 }
 
 enum PendingInternalRequest {
@@ -602,13 +794,18 @@ enum PendingInternalRequest {
 }
 
 impl ProxyState {
-    fn new() -> Self {
+    fn new(
+        background_requests: mpsc::Sender<BackgroundRuntimeRequest>,
+        background_auto_switch_scheduler: SharedBackgroundAutoSwitchScheduler,
+    ) -> Self {
         Self {
             request_prefix: format!("{INTERNAL_REQUEST_ID_PREFIX}{}", Uuid::new_v4()),
             next_request_id: 1,
             pending_internal: HashMap::new(),
             app_server_account_id: None,
             pending_login_account_id: None,
+            background_requests,
+            background_auto_switch_scheduler,
         }
     }
 
@@ -643,20 +840,6 @@ impl ProxyState {
         }
     }
 
-    async fn login_active_chatgpt_account(
-        &mut self,
-        app_server_write: &mut SplitSink<WsStream, Message>,
-    ) -> Result<()> {
-        let Some(account) = store::get_active_account()? else {
-            return Ok(());
-        };
-        if matches!(account.auth_data, AuthData::ChatGPT { .. }) {
-            self.login_chatgpt_account(app_server_write, account)
-                .await?;
-        }
-        Ok(())
-    }
-
     async fn login_chatgpt_account(
         &mut self,
         app_server_write: &mut SplitSink<WsStream, Message>,
@@ -679,6 +862,42 @@ impl ProxyState {
         );
         self.pending_login_account_id = Some(account.id);
         Ok(())
+    }
+
+    async fn login_prepared_chatgpt_account(
+        &mut self,
+        app_server_write: &mut SplitSink<WsStream, Message>,
+        prepared: PreparedAccountLogin,
+    ) -> Result<()> {
+        if !active_account_id_matches(&prepared.account_id)? {
+            return Ok(());
+        }
+        if self.app_server_account_id.as_deref() == Some(prepared.account_id.as_str())
+            || self.pending_login_account_id.as_deref() == Some(prepared.account_id.as_str())
+        {
+            return Ok(());
+        }
+
+        let request_id = self.next_internal_request_id();
+        let request =
+            login_request_from_payload(Value::String(request_id.clone()), &prepared.payload);
+        send_json(app_server_write, request).await?;
+        self.pending_internal.insert(
+            request_id,
+            PendingInternalRequest::Login {
+                account_id: prepared.account_id.clone(),
+            },
+        );
+        self.pending_login_account_id = Some(prepared.account_id);
+        Ok(())
+    }
+
+    fn queue_background_auto_switch(&self) -> BackgroundAutoSwitchQueueStatus {
+        queue_background_auto_switch(
+            &self.background_requests,
+            &self.background_auto_switch_scheduler,
+            Instant::now(),
+        )
     }
 
     fn handle_internal_response(&mut self, value: &Value) -> bool {
@@ -721,7 +940,7 @@ async fn handle_app_server_proxy_message(
     app_server_write: &mut SplitSink<WsStream, Message>,
     state: &mut ProxyState,
 ) -> Result<bool> {
-    let mut rate_limits_require_switch = false;
+    let mut auto_switch_trigger = RateLimitAutoSwitchTrigger::None;
     let mut should_forward = true;
 
     if let Some(value) = message_json(&message)? {
@@ -733,10 +952,10 @@ async fn handle_app_server_proxy_message(
         {
             handle_server_request(app_server_write, value).await?;
             should_forward = false;
-        } else if rate_limit_notification_requires_switch(&value)
-            || usage_limit_error_requires_switch(&value)
-        {
-            rate_limits_require_switch = true;
+        } else if usage_limit_error_requires_switch(&value) {
+            auto_switch_trigger = RateLimitAutoSwitchTrigger::Hard;
+        } else {
+            auto_switch_trigger = classify_rate_limit_notification(&value);
         }
     }
 
@@ -747,26 +966,79 @@ async fn handle_app_server_proxy_message(
             .await
             .context("Failed to forward Codex app-server message to client")?;
     }
-    if rate_limits_require_switch {
-        let _ = state.auto_switch_and_login(app_server_write).await;
+    match auto_switch_trigger {
+        RateLimitAutoSwitchTrigger::Hard => {
+            let _ = state.auto_switch_and_login(app_server_write).await;
+        }
+        RateLimitAutoSwitchTrigger::Soft => {
+            let _ = state.queue_background_auto_switch();
+        }
+        RateLimitAutoSwitchTrigger::None => {}
     }
 
     Ok(should_continue)
 }
 
-fn rate_limit_notification_requires_switch(value: &Value) -> bool {
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum RateLimitAutoSwitchTrigger {
+    None,
+    Soft,
+    Hard,
+}
+
+fn classify_rate_limit_notification(value: &Value) -> RateLimitAutoSwitchTrigger {
     if value.get("method").and_then(Value::as_str) != Some("account/rateLimits/updated") {
-        return false;
+        return RateLimitAutoSwitchTrigger::None;
     }
     let Some(params) = value.get("params") else {
-        return false;
+        return RateLimitAutoSwitchTrigger::None;
     };
     let Ok(params) = serde_json::from_value::<AccountRateLimitsUpdatedParams>(params.clone())
     else {
-        return false;
+        return RateLimitAutoSwitchTrigger::None;
     };
     let info = params.rate_limits.into_usage_info();
-    auto_switch::usage_requires_switch(&info)
+    if auto_switch::usage_requires_switch(&info) {
+        return RateLimitAutoSwitchTrigger::Hard;
+    }
+    if usage_needs_soft_switch(&info) {
+        return RateLimitAutoSwitchTrigger::Soft;
+    }
+    RateLimitAutoSwitchTrigger::None
+}
+
+fn usage_needs_soft_switch(info: &crate::types::UsageInfo) -> bool {
+    let config = SelectionConfig::default();
+    if let Some(metrics) = account_selector::usage_selection_metrics(info, config) {
+        return metrics.bottleneck_headroom <= account_selector::DEFAULT_MIN_SAFE_HEADROOM;
+    }
+
+    soft_headroom_units(info, config)
+        .into_iter()
+        .flatten()
+        .any(|headroom| headroom <= account_selector::DEFAULT_MIN_SAFE_HEADROOM)
+}
+
+fn soft_headroom_units(
+    info: &crate::types::UsageInfo,
+    config: SelectionConfig,
+) -> [Option<f64>; 2] {
+    [
+        info.primary_used_percent
+            .and_then(headroom_from_used_percent),
+        info.secondary_used_percent.and_then(|used| {
+            headroom_from_used_percent(used)
+                .map(|headroom| headroom * config.weekly_to_five_hour_ratio)
+        }),
+    ]
+}
+
+fn headroom_from_used_percent(used_percent: f64) -> Option<f64> {
+    if used_percent.is_finite() {
+        Some((100.0 - used_percent).clamp(0.0, 100.0))
+    } else {
+        None
+    }
 }
 
 fn usage_limit_error_requires_switch(value: &Value) -> bool {
@@ -925,16 +1197,20 @@ fn initialize_app_server_request(request_id: Value) -> Value {
 
 async fn login_request(request_id: Value, account: &StoredAccount) -> Result<Value> {
     let payload = external_auth_payload(account).await?;
-    Ok(json!({
+    Ok(login_request_from_payload(request_id, &payload))
+}
+
+fn login_request_from_payload(request_id: Value, payload: &ExternalAuthPayload) -> Value {
+    json!({
         "id": request_id,
         "method": "account/login/start",
         "params": {
             "type": "chatgptAuthTokens",
-            "accessToken": payload.access_token,
-            "chatgptAccountId": payload.chatgpt_account_id,
-            "chatgptPlanType": payload.chatgpt_plan_type
+            "accessToken": &payload.access_token,
+            "chatgptAccountId": &payload.chatgpt_account_id,
+            "chatgptPlanType": &payload.chatgpt_plan_type
         }
-    }))
+    })
 }
 
 async fn handle_server_request<S>(websocket: &mut S, request: Value) -> Result<()>
@@ -1006,6 +1282,15 @@ fn chatgpt_account_id(account: &StoredAccount) -> Option<String> {
         AuthData::ChatGPT { account_id, .. } => account_id.clone(),
         AuthData::ApiKey { .. } => None,
     }
+}
+
+fn active_account_id_matches(account_id: &str) -> Result<bool> {
+    Ok(store::load_accounts()?.active_account_id.as_deref() == Some(account_id))
+}
+
+struct PreparedAccountLogin {
+    account_id: String,
+    payload: ExternalAuthPayload,
 }
 
 struct ExternalAuthPayload {
@@ -1104,12 +1389,15 @@ mod tests {
 
     use serde_json::json;
     use tokio::sync::mpsc;
+    use tokio::time::Instant;
 
     use super::{
-        ActiveAccountSnapshot, ActiveAccountWatchStatus, RuntimeCommand,
-        codex_args_with_default_cwd, handle_active_account_snapshot_change, has_cwd_arg,
-        initialize_app_server_request, random_duration_between,
-        rate_limit_notification_requires_switch, usage_limit_error_requires_switch,
+        ActiveAccountSnapshot, ActiveAccountWatchStatus, BackgroundAutoSwitchQueueStatus,
+        BackgroundRuntimeRequest, RateLimitAutoSwitchTrigger, classify_rate_limit_notification,
+        codex_args_with_default_cwd, finish_background_auto_switch,
+        handle_active_account_snapshot_change, has_cwd_arg, initialize_app_server_request,
+        queue_background_auto_switch, random_duration_between,
+        shared_background_auto_switch_scheduler, usage_limit_error_requires_switch,
         validate_remote_capable_codex_args,
     };
 
@@ -1144,69 +1432,80 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_notification_triggers_when_hard_limit_is_reached() {
-        let notification = json!({
-            "method": "account/rateLimits/updated",
-            "params": {
-                "rateLimits": {
-                    "limitId": "codex",
-                    "limitName": null,
-                    "primary": {
-                        "usedPercent": 100,
-                        "windowDurationMins": 300,
-                        "resetsAt": 1_800_000_000
-                    },
-                    "secondary": null,
-                    "credits": null,
-                    "planType": "plus",
-                    "rateLimitReachedType": null
-                }
-            }
-        });
+    fn rate_limit_notification_classifies_hard_limit() {
+        let notification = rate_limit_notification(Some(100.0), None, None);
 
-        assert!(rate_limit_notification_requires_switch(&notification));
+        assert_eq!(
+            classify_rate_limit_notification(&notification),
+            RateLimitAutoSwitchTrigger::Hard
+        );
 
-        let available_notification = json!({
-            "method": "account/rateLimits/updated",
-            "params": {
-                "rateLimits": {
-                    "limitId": "codex",
-                    "limitName": null,
-                    "primary": {
-                        "usedPercent": 96,
-                        "windowDurationMins": 300,
-                        "resetsAt": 1_800_000_000
-                    },
-                    "secondary": null,
-                    "credits": null,
-                    "planType": "plus",
-                    "rateLimitReachedType": null
-                }
-            }
-        });
-        assert!(!rate_limit_notification_requires_switch(
-            &available_notification
-        ));
+        let available_notification = rate_limit_notification(Some(94.0), None, None);
+        assert_eq!(
+            classify_rate_limit_notification(&available_notification),
+            RateLimitAutoSwitchTrigger::None
+        );
     }
 
     #[test]
-    fn rate_limit_notification_triggers_when_limit_type_is_set() {
-        let notification = json!({
-            "method": "account/rateLimits/updated",
-            "params": {
-                "rateLimits": {
-                    "limitId": "codex",
-                    "limitName": null,
-                    "primary": null,
-                    "secondary": null,
-                    "credits": null,
-                    "planType": "plus",
-                    "rateLimitReachedType": "workspace_owner_usage_limit_reached"
-                }
-            }
-        });
+    fn rate_limit_notification_classifies_limit_type_as_hard() {
+        let notification =
+            rate_limit_notification(None, None, Some("workspace_owner_usage_limit_reached"));
 
-        assert!(rate_limit_notification_requires_switch(&notification));
+        assert_eq!(
+            classify_rate_limit_notification(&notification),
+            RateLimitAutoSwitchTrigger::Hard
+        );
+    }
+
+    #[test]
+    fn rate_limit_notification_classifies_near_five_hour_bottleneck_as_soft() {
+        let notification = rate_limit_notification(Some(95.0), Some(20.0), None);
+
+        assert_eq!(
+            classify_rate_limit_notification(&notification),
+            RateLimitAutoSwitchTrigger::Soft
+        );
+    }
+
+    #[test]
+    fn rate_limit_notification_classifies_near_weekly_bottleneck_as_soft() {
+        let notification = rate_limit_notification(Some(50.0), Some(99.0), None);
+
+        assert_eq!(
+            classify_rate_limit_notification(&notification),
+            RateLimitAutoSwitchTrigger::Soft
+        );
+    }
+
+    #[test]
+    fn rate_limit_notification_soft_triggers_with_only_near_primary_window() {
+        let notification = rate_limit_notification(Some(95.0), None, None);
+
+        assert_eq!(
+            classify_rate_limit_notification(&notification),
+            RateLimitAutoSwitchTrigger::Soft
+        );
+    }
+
+    #[test]
+    fn rate_limit_notification_soft_triggers_with_only_near_secondary_window() {
+        let notification = rate_limit_notification(None, Some(99.0), None);
+
+        assert_eq!(
+            classify_rate_limit_notification(&notification),
+            RateLimitAutoSwitchTrigger::Soft
+        );
+    }
+
+    #[test]
+    fn rate_limit_notification_does_not_soft_trigger_with_safe_headroom() {
+        let notification = rate_limit_notification(Some(94.0), Some(90.0), None);
+
+        assert_eq!(
+            classify_rate_limit_notification(&notification),
+            RateLimitAutoSwitchTrigger::None
+        );
     }
 
     #[test]
@@ -1253,6 +1552,67 @@ mod tests {
     }
 
     #[test]
+    fn background_auto_switch_queue_allows_after_cooldown() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let scheduler = shared_background_auto_switch_scheduler();
+        let now = Instant::now();
+
+        assert_eq!(
+            queue_background_auto_switch(&sender, &scheduler, now),
+            BackgroundAutoSwitchQueueStatus::Queued
+        );
+        assert!(receiver.try_recv().is_ok());
+        finish_background_auto_switch(&scheduler);
+
+        assert_eq!(
+            queue_background_auto_switch(&sender, &scheduler, now + Duration::from_secs(14 * 60)),
+            BackgroundAutoSwitchQueueStatus::Cooldown
+        );
+        assert_eq!(
+            queue_background_auto_switch(&sender, &scheduler, now + Duration::from_secs(15 * 60)),
+            BackgroundAutoSwitchQueueStatus::Queued
+        );
+    }
+
+    #[test]
+    fn background_auto_switch_queue_rejects_while_in_flight() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let scheduler = shared_background_auto_switch_scheduler();
+        let now = Instant::now();
+
+        assert_eq!(
+            queue_background_auto_switch(&sender, &scheduler, now),
+            BackgroundAutoSwitchQueueStatus::Queued
+        );
+        assert!(receiver.try_recv().is_ok());
+
+        assert_eq!(
+            queue_background_auto_switch(&sender, &scheduler, now + Duration::from_secs(15 * 60)),
+            BackgroundAutoSwitchQueueStatus::InFlight
+        );
+    }
+
+    #[test]
+    fn background_auto_switch_queue_reports_full_without_blocking() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let scheduler = shared_background_auto_switch_scheduler();
+        let now = Instant::now();
+        sender
+            .try_send(BackgroundRuntimeRequest::PrepareActiveAccountLogin)
+            .expect("test queue has room for the first request");
+
+        assert_eq!(
+            queue_background_auto_switch(&sender, &scheduler, now),
+            BackgroundAutoSwitchQueueStatus::Full
+        );
+        assert!(receiver.try_recv().is_ok());
+        assert_eq!(
+            queue_background_auto_switch(&sender, &scheduler, now),
+            BackgroundAutoSwitchQueueStatus::Queued
+        );
+    }
+
+    #[test]
     fn random_duration_between_stays_within_bounds() {
         for _ in 0..100 {
             let duration =
@@ -1283,7 +1643,7 @@ mod tests {
         assert_eq!(last_snapshot, Some(current_snapshot));
         assert!(matches!(
             receiver.try_recv(),
-            Ok(RuntimeCommand::SyncActiveAccount)
+            Ok(BackgroundRuntimeRequest::PrepareActiveAccountLogin)
         ));
     }
 
@@ -1291,7 +1651,7 @@ mod tests {
     fn active_account_watcher_retries_when_sync_queue_is_full() {
         let (sender, _receiver) = mpsc::channel(1);
         sender
-            .try_send(RuntimeCommand::SyncActiveAccount)
+            .try_send(BackgroundRuntimeRequest::PrepareActiveAccountLogin)
             .expect("test queue has capacity for first command");
         let current_snapshot = active_snapshot("account-a");
         let mut last_snapshot = None;
@@ -1367,5 +1727,38 @@ mod tests {
             active_account_id: Some(account_id.to_string()),
             auth_marker: Some(format!("chatgpt:{account_id}:1:1")),
         }
+    }
+
+    fn rate_limit_notification(
+        primary_used_percent: Option<f64>,
+        secondary_used_percent: Option<f64>,
+        rate_limit_reached_type: Option<&str>,
+    ) -> serde_json::Value {
+        json!({
+            "method": "account/rateLimits/updated",
+            "params": {
+                "rateLimits": {
+                    "limitId": "codex",
+                    "limitName": null,
+                    "primary": primary_used_percent.map(|used_percent| {
+                        json!({
+                            "usedPercent": used_percent,
+                            "windowDurationMins": 300,
+                            "resetsAt": 1_800_000_000
+                        })
+                    }),
+                    "secondary": secondary_used_percent.map(|used_percent| {
+                        json!({
+                            "usedPercent": used_percent,
+                            "windowDurationMins": 10080,
+                            "resetsAt": 1_800_500_000
+                        })
+                    }),
+                    "credits": null,
+                    "planType": "plus",
+                    "rateLimitReachedType": rate_limit_reached_type
+                }
+            }
+        })
     }
 }
