@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::future::Future;
 use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{Context, Result};
 use futures_util::stream::SplitSink;
@@ -13,7 +14,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant, sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
@@ -107,17 +108,17 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
     let (runtime_command_tx, runtime_command_rx) = mpsc::channel(RUNTIME_COMMAND_BUFFER);
     let (background_runtime_tx, background_runtime_rx) =
         mpsc::channel(BACKGROUND_RUNTIME_REQUEST_BUFFER);
-    let background_auto_switch_scheduler = shared_background_auto_switch_scheduler();
+    let runtime_auto_switch_coordinator = shared_runtime_auto_switch_coordinator();
     let (maintenance_shutdown_tx, maintenance_shutdown_rx) = watch::channel(false);
     let background_runtime_task = tokio::spawn(run_background_runtime_worker(
         background_runtime_rx,
         runtime_command_tx.clone(),
-        background_auto_switch_scheduler.clone(),
+        runtime_auto_switch_coordinator.clone(),
         maintenance_shutdown_rx.clone(),
     ));
     let maintenance_task = tokio::spawn(run_auto_switch_maintenance(
         background_runtime_tx.clone(),
-        background_auto_switch_scheduler.clone(),
+        runtime_auto_switch_coordinator.clone(),
         maintenance_shutdown_rx.clone(),
     ));
     let active_account_watch_task = tokio::spawn(run_active_account_watcher(
@@ -129,7 +130,7 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
         app_server_url.clone(),
         token.clone(),
         background_runtime_tx,
-        background_auto_switch_scheduler,
+        runtime_auto_switch_coordinator,
         runtime_command_rx,
     ));
 
@@ -363,10 +364,10 @@ async fn run_websocket_proxy(
     app_server_url: String,
     token: String,
     background_requests: mpsc::Sender<BackgroundRuntimeRequest>,
-    background_auto_switch_scheduler: SharedBackgroundAutoSwitchScheduler,
+    runtime_auto_switch_coordinator: SharedRuntimeAutoSwitchCoordinator,
     mut runtime_commands: mpsc::Receiver<RuntimeCommand>,
 ) -> Result<()> {
-    let mut state = ProxyState::new(background_requests, background_auto_switch_scheduler);
+    let mut state = ProxyState::new(background_requests, runtime_auto_switch_coordinator);
 
     loop {
         let (client_stream, _) = listener
@@ -409,22 +410,34 @@ async fn stop_task_with_timeout(mut task: JoinHandle<()>) {
     }
 }
 
-type SharedBackgroundAutoSwitchScheduler = Arc<Mutex<BackgroundAutoSwitchScheduler>>;
+type SharedRuntimeAutoSwitchCoordinator = Arc<RuntimeAutoSwitchCoordinator>;
 
-fn shared_background_auto_switch_scheduler() -> SharedBackgroundAutoSwitchScheduler {
-    Arc::new(Mutex::new(BackgroundAutoSwitchScheduler::new(
-        AUTO_SWITCH_SOFT_COOLDOWN,
-    )))
+fn shared_runtime_auto_switch_coordinator() -> SharedRuntimeAutoSwitchCoordinator {
+    Arc::new(RuntimeAutoSwitchCoordinator::new(AUTO_SWITCH_SOFT_COOLDOWN))
+}
+
+struct RuntimeAutoSwitchCoordinator {
+    schedule: StdMutex<RuntimeAutoSwitchSchedule>,
+    execution: AsyncMutex<()>,
+}
+
+impl RuntimeAutoSwitchCoordinator {
+    fn new(cooldown: Duration) -> Self {
+        Self {
+            schedule: StdMutex::new(RuntimeAutoSwitchSchedule::new(cooldown)),
+            execution: AsyncMutex::new(()),
+        }
+    }
 }
 
 #[derive(Debug)]
-struct BackgroundAutoSwitchScheduler {
+struct RuntimeAutoSwitchSchedule {
     cooldown: Duration,
     last_attempt: Option<Instant>,
     in_flight: bool,
 }
 
-impl BackgroundAutoSwitchScheduler {
+impl RuntimeAutoSwitchSchedule {
     fn new(cooldown: Duration) -> Self {
         Self {
             cooldown,
@@ -433,7 +446,7 @@ impl BackgroundAutoSwitchScheduler {
         }
     }
 
-    fn try_start(&mut self, now: Instant) -> BackgroundAutoSwitchQueueStatus {
+    fn try_start_background(&mut self, now: Instant) -> BackgroundAutoSwitchQueueStatus {
         if self.in_flight {
             return BackgroundAutoSwitchQueueStatus::InFlight;
         }
@@ -464,15 +477,15 @@ enum BackgroundAutoSwitchQueueStatus {
 
 fn queue_background_auto_switch(
     requests: &mpsc::Sender<BackgroundRuntimeRequest>,
-    scheduler: &SharedBackgroundAutoSwitchScheduler,
+    coordinator: &SharedRuntimeAutoSwitchCoordinator,
     now: Instant,
 ) -> BackgroundAutoSwitchQueueStatus {
-    let Ok(mut scheduler) = scheduler.lock() else {
+    let Ok(mut schedule) = coordinator.schedule.lock() else {
         return BackgroundAutoSwitchQueueStatus::Closed;
     };
 
-    let previous_last_attempt = scheduler.last_attempt;
-    let status = scheduler.try_start(now);
+    let previous_last_attempt = schedule.last_attempt;
+    let status = schedule.try_start_background(now);
     if status != BackgroundAutoSwitchQueueStatus::Queued {
         return status;
     }
@@ -480,28 +493,40 @@ fn queue_background_auto_switch(
     match requests.try_send(BackgroundRuntimeRequest::AutoSwitch) {
         Ok(()) => BackgroundAutoSwitchQueueStatus::Queued,
         Err(mpsc::error::TrySendError::Full(_)) => {
-            scheduler.last_attempt = previous_last_attempt;
-            scheduler.finish();
+            schedule.last_attempt = previous_last_attempt;
+            schedule.finish();
             BackgroundAutoSwitchQueueStatus::Full
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {
-            scheduler.last_attempt = previous_last_attempt;
-            scheduler.finish();
+            schedule.last_attempt = previous_last_attempt;
+            schedule.finish();
             BackgroundAutoSwitchQueueStatus::Closed
         }
     }
 }
 
-fn finish_background_auto_switch(scheduler: &SharedBackgroundAutoSwitchScheduler) {
-    if let Ok(mut scheduler) = scheduler.lock() {
-        scheduler.finish();
+fn finish_background_auto_switch(coordinator: &SharedRuntimeAutoSwitchCoordinator) {
+    if let Ok(mut schedule) = coordinator.schedule.lock() {
+        schedule.finish();
     }
+}
+
+async fn run_serialized_auto_switch_operation<T, F, Fut>(
+    coordinator: &SharedRuntimeAutoSwitchCoordinator,
+    operation: F,
+) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = T>,
+{
+    let _guard = coordinator.execution.lock().await;
+    operation().await
 }
 
 async fn run_background_runtime_worker(
     mut requests: mpsc::Receiver<BackgroundRuntimeRequest>,
     runtime_commands: mpsc::Sender<RuntimeCommand>,
-    scheduler: SharedBackgroundAutoSwitchScheduler,
+    coordinator: SharedRuntimeAutoSwitchCoordinator,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
@@ -518,8 +543,8 @@ async fn run_background_runtime_worker(
 
                 let command = match request {
                     BackgroundRuntimeRequest::AutoSwitch => {
-                        let command = background_auto_switch_login_command().await;
-                        finish_background_auto_switch(&scheduler);
+                        let command = background_auto_switch_login_command(&coordinator).await;
+                        finish_background_auto_switch(&coordinator);
                         command
                     }
                     BackgroundRuntimeRequest::PrepareActiveAccountLogin => {
@@ -536,23 +561,67 @@ async fn run_background_runtime_worker(
     }
 }
 
-async fn background_auto_switch_login_command() -> Option<RuntimeCommand> {
-    match auto_switch::auto_switch_allow_running().await {
-        Ok(AutoSwitchResult::Switched { to, .. }) => prepare_login_command(*to).await.ok(),
-        Ok(AutoSwitchResult::ActiveKept { .. } | AutoSwitchResult::ActiveUnsupported { .. }) => {
-            None
-        }
+async fn background_auto_switch_login_command(
+    coordinator: &SharedRuntimeAutoSwitchCoordinator,
+) -> Option<RuntimeCommand> {
+    match serialized_auto_switch_prepared_login(coordinator, AutoSwitchLoginMode::SwitchedOnly)
+        .await
+    {
+        Ok(Some(prepared)) => Some(RuntimeCommand::LoginPreparedAccount(prepared)),
+        Ok(None) => None,
         Err(_) => None,
     }
 }
 
 async fn prepare_login_command(account: StoredAccount) -> Result<RuntimeCommand> {
-    let account_id = account.id.clone();
-    let payload = external_auth_payload(&account).await?;
-    Ok(RuntimeCommand::LoginPreparedAccount(PreparedAccountLogin {
-        account_id,
-        payload,
-    }))
+    Ok(RuntimeCommand::LoginPreparedAccount(
+        prepare_login(account).await?,
+    ))
+}
+
+#[derive(Debug, Clone)]
+enum AutoSwitchLoginMode {
+    SwitchedOnly,
+    EnsureActiveLogged {
+        app_server_account_id: Option<String>,
+    },
+}
+
+async fn serialized_auto_switch_prepared_login(
+    coordinator: &SharedRuntimeAutoSwitchCoordinator,
+    mode: AutoSwitchLoginMode,
+) -> Result<Option<PreparedAccountLogin>> {
+    run_serialized_auto_switch_operation(coordinator, || async move {
+        let result = auto_switch::auto_switch_allow_running().await?;
+        let account = auto_switch_login_account(result, &mode);
+        match account {
+            Some(account) => prepare_login(account).await.map(Some),
+            None => Ok(None),
+        }
+    })
+    .await
+}
+
+fn auto_switch_login_account(
+    result: AutoSwitchResult,
+    mode: &AutoSwitchLoginMode,
+) -> Option<StoredAccount> {
+    match result {
+        AutoSwitchResult::Switched { to, .. } => Some(*to),
+        AutoSwitchResult::ActiveKept { account, .. } => match mode {
+            AutoSwitchLoginMode::SwitchedOnly => None,
+            AutoSwitchLoginMode::EnsureActiveLogged {
+                app_server_account_id,
+            } => {
+                if app_server_account_id.as_deref() == Some(account.id.as_str()) {
+                    None
+                } else {
+                    Some(*account)
+                }
+            }
+        },
+        AutoSwitchResult::ActiveUnsupported { .. } => None,
+    }
 }
 
 async fn prepare_active_account_login_command() -> Option<RuntimeCommand> {
@@ -565,7 +634,7 @@ async fn prepare_active_account_login_command() -> Option<RuntimeCommand> {
 
 async fn run_auto_switch_maintenance(
     background_requests: mpsc::Sender<BackgroundRuntimeRequest>,
-    background_auto_switch_scheduler: SharedBackgroundAutoSwitchScheduler,
+    runtime_auto_switch_coordinator: SharedRuntimeAutoSwitchCoordinator,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
@@ -575,7 +644,7 @@ async fn run_auto_switch_maintenance(
 
         if queue_background_auto_switch(
             &background_requests,
-            &background_auto_switch_scheduler,
+            &runtime_auto_switch_coordinator,
             Instant::now(),
         ) == BackgroundAutoSwitchQueueStatus::Closed
         {
@@ -786,7 +855,7 @@ struct ProxyState {
     app_server_account_id: Option<String>,
     pending_login_account_id: Option<String>,
     background_requests: mpsc::Sender<BackgroundRuntimeRequest>,
-    background_auto_switch_scheduler: SharedBackgroundAutoSwitchScheduler,
+    runtime_auto_switch_coordinator: SharedRuntimeAutoSwitchCoordinator,
 }
 
 enum PendingInternalRequest {
@@ -796,7 +865,7 @@ enum PendingInternalRequest {
 impl ProxyState {
     fn new(
         background_requests: mpsc::Sender<BackgroundRuntimeRequest>,
-        background_auto_switch_scheduler: SharedBackgroundAutoSwitchScheduler,
+        runtime_auto_switch_coordinator: SharedRuntimeAutoSwitchCoordinator,
     ) -> Self {
         Self {
             request_prefix: format!("{INTERNAL_REQUEST_ID_PREFIX}{}", Uuid::new_v4()),
@@ -805,7 +874,7 @@ impl ProxyState {
             app_server_account_id: None,
             pending_login_account_id: None,
             background_requests,
-            background_auto_switch_scheduler,
+            runtime_auto_switch_coordinator,
         }
     }
 
@@ -824,43 +893,17 @@ impl ProxyState {
         &mut self,
         app_server_write: &mut SplitSink<WsStream, Message>,
     ) -> Result<()> {
-        let result = auto_switch::auto_switch_allow_running().await?;
-        match result {
-            AutoSwitchResult::Switched { to, .. } => {
-                self.login_chatgpt_account(app_server_write, *to).await
-            }
-            AutoSwitchResult::ActiveKept { account, .. } => {
-                if self.app_server_account_id.as_deref() != Some(account.id.as_str()) {
-                    self.login_chatgpt_account(app_server_write, *account)
-                        .await?;
-                }
-                Ok(())
-            }
-            AutoSwitchResult::ActiveUnsupported { .. } => Ok(()),
-        }
-    }
-
-    async fn login_chatgpt_account(
-        &mut self,
-        app_server_write: &mut SplitSink<WsStream, Message>,
-        account: StoredAccount,
-    ) -> Result<()> {
-        if self.app_server_account_id.as_deref() == Some(account.id.as_str())
-            || self.pending_login_account_id.as_deref() == Some(account.id.as_str())
-        {
-            return Ok(());
-        }
-
-        let request_id = self.next_internal_request_id();
-        let request = login_request(Value::String(request_id.clone()), &account).await?;
-        send_json(app_server_write, request).await?;
-        self.pending_internal.insert(
-            request_id,
-            PendingInternalRequest::Login {
-                account_id: account.id.clone(),
+        if let Some(prepared) = serialized_auto_switch_prepared_login(
+            &self.runtime_auto_switch_coordinator,
+            AutoSwitchLoginMode::EnsureActiveLogged {
+                app_server_account_id: self.app_server_account_id.clone(),
             },
-        );
-        self.pending_login_account_id = Some(account.id);
+        )
+        .await?
+        {
+            self.login_prepared_chatgpt_account(app_server_write, prepared)
+                .await?;
+        }
         Ok(())
     }
 
@@ -895,7 +938,7 @@ impl ProxyState {
     fn queue_background_auto_switch(&self) -> BackgroundAutoSwitchQueueStatus {
         queue_background_auto_switch(
             &self.background_requests,
-            &self.background_auto_switch_scheduler,
+            &self.runtime_auto_switch_coordinator,
             Instant::now(),
         )
     }
@@ -1195,11 +1238,6 @@ fn initialize_app_server_request(request_id: Value) -> Value {
     })
 }
 
-async fn login_request(request_id: Value, account: &StoredAccount) -> Result<Value> {
-    let payload = external_auth_payload(account).await?;
-    Ok(login_request_from_payload(request_id, &payload))
-}
-
 fn login_request_from_payload(request_id: Value, payload: &ExternalAuthPayload) -> Value {
     json!({
         "id": request_id,
@@ -1291,6 +1329,15 @@ fn active_account_id_matches(account_id: &str) -> Result<bool> {
 struct PreparedAccountLogin {
     account_id: String,
     payload: ExternalAuthPayload,
+}
+
+async fn prepare_login(account: StoredAccount) -> Result<PreparedAccountLogin> {
+    let account_id = account.id.clone();
+    let payload = external_auth_payload(&account).await?;
+    Ok(PreparedAccountLogin {
+        account_id,
+        payload,
+    })
 }
 
 struct ExternalAuthPayload {
@@ -1388,8 +1435,8 @@ mod tests {
     use std::time::Duration;
 
     use serde_json::json;
-    use tokio::sync::mpsc;
-    use tokio::time::Instant;
+    use tokio::sync::{mpsc, oneshot};
+    use tokio::time::{Instant, timeout};
 
     use super::{
         ActiveAccountSnapshot, ActiveAccountWatchStatus, BackgroundAutoSwitchQueueStatus,
@@ -1397,8 +1444,8 @@ mod tests {
         codex_args_with_default_cwd, finish_background_auto_switch,
         handle_active_account_snapshot_change, has_cwd_arg, initialize_app_server_request,
         queue_background_auto_switch, random_duration_between,
-        shared_background_auto_switch_scheduler, usage_limit_error_requires_switch,
-        validate_remote_capable_codex_args,
+        run_serialized_auto_switch_operation, shared_runtime_auto_switch_coordinator,
+        usage_limit_error_requires_switch, validate_remote_capable_codex_args,
     };
 
     #[test]
@@ -1551,25 +1598,77 @@ mod tests {
         })));
     }
 
+    #[tokio::test]
+    async fn runtime_auto_switch_operations_are_serialized() {
+        let coordinator = shared_runtime_auto_switch_coordinator();
+        let (background_entered_tx, mut background_entered_rx) = mpsc::channel(1);
+        let (release_background_tx, release_background_rx) = oneshot::channel();
+        let (hard_entered_tx, mut hard_entered_rx) = mpsc::channel(1);
+
+        let background_coordinator = coordinator.clone();
+        let background_task = tokio::spawn(async move {
+            run_serialized_auto_switch_operation(&background_coordinator, || async move {
+                background_entered_tx
+                    .send(())
+                    .await
+                    .expect("background entered signal should be received");
+                let _ = release_background_rx.await;
+            })
+            .await;
+        });
+
+        assert!(background_entered_rx.recv().await.is_some());
+
+        let hard_coordinator = coordinator.clone();
+        let hard_task = tokio::spawn(async move {
+            run_serialized_auto_switch_operation(&hard_coordinator, || async move {
+                hard_entered_tx
+                    .send(())
+                    .await
+                    .expect("hard entered signal should be received");
+            })
+            .await;
+        });
+
+        assert!(matches!(
+            hard_entered_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        release_background_tx
+            .send(())
+            .expect("background task should still be waiting");
+        assert!(
+            timeout(Duration::from_secs(1), hard_entered_rx.recv())
+                .await
+                .expect("hard operation should enter after background releases")
+                .is_some()
+        );
+
+        background_task
+            .await
+            .expect("background task should finish");
+        hard_task.await.expect("hard task should finish");
+    }
+
     #[test]
     fn background_auto_switch_queue_allows_after_cooldown() {
         let (sender, mut receiver) = mpsc::channel(1);
-        let scheduler = shared_background_auto_switch_scheduler();
+        let coordinator = shared_runtime_auto_switch_coordinator();
         let now = Instant::now();
 
         assert_eq!(
-            queue_background_auto_switch(&sender, &scheduler, now),
+            queue_background_auto_switch(&sender, &coordinator, now),
             BackgroundAutoSwitchQueueStatus::Queued
         );
         assert!(receiver.try_recv().is_ok());
-        finish_background_auto_switch(&scheduler);
+        finish_background_auto_switch(&coordinator);
 
         assert_eq!(
-            queue_background_auto_switch(&sender, &scheduler, now + Duration::from_secs(14 * 60)),
+            queue_background_auto_switch(&sender, &coordinator, now + Duration::from_secs(14 * 60)),
             BackgroundAutoSwitchQueueStatus::Cooldown
         );
         assert_eq!(
-            queue_background_auto_switch(&sender, &scheduler, now + Duration::from_secs(15 * 60)),
+            queue_background_auto_switch(&sender, &coordinator, now + Duration::from_secs(15 * 60)),
             BackgroundAutoSwitchQueueStatus::Queued
         );
     }
@@ -1577,17 +1676,17 @@ mod tests {
     #[test]
     fn background_auto_switch_queue_rejects_while_in_flight() {
         let (sender, mut receiver) = mpsc::channel(1);
-        let scheduler = shared_background_auto_switch_scheduler();
+        let coordinator = shared_runtime_auto_switch_coordinator();
         let now = Instant::now();
 
         assert_eq!(
-            queue_background_auto_switch(&sender, &scheduler, now),
+            queue_background_auto_switch(&sender, &coordinator, now),
             BackgroundAutoSwitchQueueStatus::Queued
         );
         assert!(receiver.try_recv().is_ok());
 
         assert_eq!(
-            queue_background_auto_switch(&sender, &scheduler, now + Duration::from_secs(15 * 60)),
+            queue_background_auto_switch(&sender, &coordinator, now + Duration::from_secs(15 * 60)),
             BackgroundAutoSwitchQueueStatus::InFlight
         );
     }
@@ -1595,19 +1694,19 @@ mod tests {
     #[test]
     fn background_auto_switch_queue_reports_full_without_blocking() {
         let (sender, mut receiver) = mpsc::channel(1);
-        let scheduler = shared_background_auto_switch_scheduler();
+        let coordinator = shared_runtime_auto_switch_coordinator();
         let now = Instant::now();
         sender
             .try_send(BackgroundRuntimeRequest::PrepareActiveAccountLogin)
             .expect("test queue has room for the first request");
 
         assert_eq!(
-            queue_background_auto_switch(&sender, &scheduler, now),
+            queue_background_auto_switch(&sender, &coordinator, now),
             BackgroundAutoSwitchQueueStatus::Full
         );
         assert!(receiver.try_recv().is_ok());
         assert_eq!(
-            queue_background_auto_switch(&sender, &scheduler, now),
+            queue_background_auto_switch(&sender, &coordinator, now),
             BackgroundAutoSwitchQueueStatus::Queued
         );
     }
