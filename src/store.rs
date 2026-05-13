@@ -41,27 +41,53 @@ pub fn save_accounts(store: &AccountsStore) -> Result<()> {
 }
 
 pub fn write_private_file(path: &Path, content: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
+    write_private_file_with_mode(path, content, PrivateFileWriteMode::Replace)
+}
+
+pub fn write_new_private_file(path: &Path, content: &str) -> Result<()> {
+    write_private_file_with_mode(path, content, PrivateFileWriteMode::CreateNew)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PrivateFileWriteMode {
+    Replace,
+    CreateNew,
+}
+
+fn write_private_file_with_mode(
+    path: &Path,
+    content: &str,
+    mode: PrivateFileWriteMode,
+) -> Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
     }
 
+    let temp_path = temp_file_path(path);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
 
-        let temp_path = temp_file_path(path);
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp_path)
-            .with_context(|| format!("Failed to open private file: {}", temp_path.display()))?;
-        file.write_all(content.as_bytes())
-            .with_context(|| format!("Failed to write private file: {}", temp_path.display()))?;
-        file.sync_all()
-            .with_context(|| format!("Failed to sync private file: {}", temp_path.display()))?;
-        drop(file);
+    let mut file = options
+        .open(&temp_path)
+        .with_context(|| format!("Failed to open private file: {}", temp_path.display()))?;
+    file.write_all(content.as_bytes())
+        .with_context(|| format!("Failed to write private file: {}", temp_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("Failed to sync private file: {}", temp_path.display()))?;
+    drop(file);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
 
         fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o600)).with_context(|| {
             format!(
@@ -69,21 +95,41 @@ pub fn write_private_file(path: &Path, content: &str) -> Result<()> {
                 temp_path.display()
             )
         })?;
-        fs::rename(&temp_path, path).with_context(|| {
-            format!(
-                "Failed to replace private file {} with {}",
-                path.display(),
-                temp_path.display()
-            )
-        })?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("Failed to set file permissions: {}", path.display()))?;
     }
 
-    #[cfg(not(unix))]
+    match mode {
+        PrivateFileWriteMode::Replace => {
+            fs::rename(&temp_path, path).with_context(|| {
+                format!(
+                    "Failed to replace private file {} with {}",
+                    path.display(),
+                    temp_path.display()
+                )
+            })?;
+        }
+        PrivateFileWriteMode::CreateNew => {
+            // Link the fully written temp file into place so create-new export never overwrites.
+            if let Err(err) = fs::hard_link(&temp_path, path) {
+                let _ = fs::remove_file(&temp_path);
+                if err.kind() == std::io::ErrorKind::AlreadyExists {
+                    anyhow::bail!(
+                        "Refusing to overwrite existing file: {} (pass --force to overwrite)",
+                        path.display()
+                    );
+                }
+                return Err(err)
+                    .with_context(|| format!("Failed to create private file: {}", path.display()));
+            }
+            let _ = fs::remove_file(&temp_path);
+        }
+    }
+
+    #[cfg(unix)]
     {
-        fs::write(path, content)
-            .with_context(|| format!("Failed to write private file: {}", path.display()))?;
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("Failed to set file permissions: {}", path.display()))?;
     }
 
     Ok(())

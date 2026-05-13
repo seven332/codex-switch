@@ -83,6 +83,27 @@ async fn run() -> Result<()> {
                 file.display()
             );
         }
+        Command::Export {
+            account,
+            file,
+            force,
+        } => {
+            let account = store::get_account_by_selector(&account)?;
+            match file {
+                Some(file) => {
+                    auth_json::export_account_auth(&account, &file, force)?;
+                    println!(
+                        "Exported {} ({}) to {}",
+                        account.name,
+                        store::short_id(&account.id),
+                        file.display()
+                    );
+                }
+                None => {
+                    print!("{}", auth_json::account_auth_json_content(&account)?);
+                }
+            }
+        }
         Command::Switch { account } => {
             let active = switcher::switch_to_account(&account).await?;
             println!(
