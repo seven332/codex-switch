@@ -402,7 +402,10 @@ fn compare_last_used(left: Option<DateTime<Utc>>, right: Option<DateTime<Utc>>) 
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::{
+        cmp::Ordering,
+        collections::{HashMap, VecDeque},
+    };
 
     use chrono::{TimeZone, Utc};
 
@@ -776,6 +779,113 @@ mod tests {
         );
     }
 
+    #[test]
+    fn offline_oracle_does_not_drop_serviceable_demand_for_future_capacity() {
+        let limits = TraceLimits {
+            account_count: 1,
+            five_hour_limit: 10,
+            weekly_limit: 100,
+            five_hour_window: 5,
+            weekly_window: 100,
+        };
+        let trace = [
+            TraceDemand {
+                minute: 0,
+                credits: 7,
+            },
+            TraceDemand {
+                minute: 1,
+                credits: 4,
+            },
+            TraceDemand {
+                minute: 6,
+                credits: 7,
+            },
+        ];
+
+        let outcome = offline_oracle(&trace, limits);
+
+        assert_eq!(outcome.user_unavailable_minutes(), 1);
+        assert_eq!(outcome.served_credits, 14);
+        assert_eq!(outcome.failed_credits, 4);
+    }
+
+    #[test]
+    fn offline_oracle_bounds_existing_online_policies_on_small_trace() {
+        let limits = TraceLimits {
+            account_count: 2,
+            five_hour_limit: 10,
+            weekly_limit: 100,
+            five_hour_window: 5,
+            weekly_window: 100,
+        };
+        let trace = [
+            TraceDemand {
+                minute: 0,
+                credits: 7,
+            },
+            TraceDemand {
+                minute: 1,
+                credits: 4,
+            },
+            TraceDemand {
+                minute: 2,
+                credits: 7,
+            },
+            TraceDemand {
+                minute: 6,
+                credits: 7,
+            },
+            TraceDemand {
+                minute: 7,
+                credits: 4,
+            },
+            TraceDemand {
+                minute: 8,
+                credits: 7,
+            },
+        ];
+
+        let oracle = offline_oracle(&trace, limits);
+        let policy_outcomes = [
+            (
+                "deadline-aware",
+                simulate_policy_trace(&mut DeadlineAwarePolicy::default(), &trace, limits),
+            ),
+            (
+                "drain-first",
+                simulate_policy_trace(
+                    &mut DrainFirstPolicy::new(SelectionConfig::default()),
+                    &trace,
+                    limits,
+                ),
+            ),
+            (
+                "max-headroom",
+                simulate_policy_trace(
+                    &mut MaxHeadroomPolicy::new(SelectionConfig::default()),
+                    &trace,
+                    limits,
+                ),
+            ),
+            (
+                "reset-first",
+                simulate_policy_trace(
+                    &mut ResetFirstPolicy::new(SelectionConfig::default()),
+                    &trace,
+                    limits,
+                ),
+            ),
+        ];
+
+        for (policy_name, outcome) in policy_outcomes {
+            assert!(
+                oracle.is_at_least_as_good_as(outcome),
+                "{policy_name} exceeded the offline oracle: {outcome:?} vs {oracle:?}",
+            );
+        }
+    }
+
     const FIVE_HOUR_WINDOW_MINUTES: i64 = 300;
     const WEEKLY_WINDOW_MINUTES: i64 = 10_080;
     const SIMULATION_WEEKS: i64 = 2;
@@ -878,6 +988,46 @@ mod tests {
     struct Demand {
         minute: i64,
         credits: f64,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct TraceLimits {
+        account_count: usize,
+        five_hour_limit: u16,
+        weekly_limit: u16,
+        five_hour_window: i32,
+        weekly_window: i32,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct TraceDemand {
+        minute: i32,
+        credits: u16,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    struct TraceEvent {
+        minute: i32,
+        credits: u16,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+    struct TraceAccountState {
+        five_hour_events: Vec<TraceEvent>,
+        weekly_events: Vec<TraceEvent>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    struct OracleMemoKey {
+        demand_index: usize,
+        accounts: Vec<TraceAccountState>,
+    }
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    struct TraceOutcome {
+        served_credits: u32,
+        failed_credits: u32,
+        unavailable_minutes: u32,
     }
 
     struct SimAccount {
@@ -1046,6 +1196,150 @@ mod tests {
                 stats: simulate_policy_scenario(&mut reset_first, scenario),
             },
         ]
+    }
+
+    // Offline upper bound for small deterministic traces. This is a test oracle,
+    // not a runtime strategy: it knows the full future demand trace, but it still
+    // must serve the current demand whenever any account has capacity.
+    fn offline_oracle(trace: &[TraceDemand], limits: TraceLimits) -> TraceOutcome {
+        validate_trace_inputs(trace, limits);
+        let accounts = vec![TraceAccountState::default(); limits.account_count];
+        let mut memo = HashMap::new();
+        offline_oracle_from(0, accounts, trace, limits, &mut memo)
+    }
+
+    fn offline_oracle_from(
+        demand_index: usize,
+        accounts: Vec<TraceAccountState>,
+        trace: &[TraceDemand],
+        limits: TraceLimits,
+        memo: &mut HashMap<OracleMemoKey, TraceOutcome>,
+    ) -> TraceOutcome {
+        let Some(demand) = trace.get(demand_index).copied() else {
+            return TraceOutcome::default();
+        };
+
+        let accounts = accounts
+            .into_iter()
+            .map(|mut account| {
+                account.expire(demand.minute, limits);
+                account
+            })
+            .collect::<Vec<_>>();
+        let key = OracleMemoKey {
+            demand_index,
+            accounts: accounts.clone(),
+        };
+        if let Some(outcome) = memo.get(&key) {
+            return *outcome;
+        }
+
+        let serving_indices = accounts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, account)| {
+                account.can_serve(demand.credits, limits).then_some(index)
+            })
+            .collect::<Vec<_>>();
+
+        let outcome = if serving_indices.is_empty() {
+            offline_oracle_from(demand_index + 1, accounts, trace, limits, memo)
+                .with_unavailable(demand.credits)
+        } else {
+            serving_indices
+                .into_iter()
+                .map(|index| {
+                    let mut next_accounts = accounts.clone();
+                    next_accounts[index].consume(demand);
+                    offline_oracle_from(demand_index + 1, next_accounts, trace, limits, memo)
+                        .with_served(demand.credits)
+                })
+                .max_by(TraceOutcome::compare_for_oracle)
+                .expect("serving indices should not be empty")
+        };
+
+        memo.insert(key, outcome);
+        outcome
+    }
+
+    fn simulate_policy_trace<P: AccountSelectionPolicy>(
+        policy: &mut P,
+        trace: &[TraceDemand],
+        limits: TraceLimits,
+    ) -> TraceOutcome {
+        validate_trace_inputs(trace, limits);
+        let accounts = (0..limits.account_count)
+            .map(|index| chatgpt_account(&format!("trace-account-{index}"), None))
+            .collect::<Vec<_>>();
+        let mut states = vec![TraceAccountState::default(); limits.account_count];
+        let mut outcome = TraceOutcome::default();
+
+        for demand in trace {
+            for state in &mut states {
+                state.expire(demand.minute, limits);
+            }
+
+            let usages = states
+                .iter()
+                .zip(accounts.iter())
+                .map(|(state, account)| trace_usage_info(&account.id, state, demand.minute, limits))
+                .collect::<Vec<_>>();
+            let candidates = accounts
+                .iter()
+                .zip(usages.iter())
+                .map(|(account, usage)| candidate(account, usage))
+                .collect::<Vec<_>>();
+            let selected_index = policy.select_account(&candidates).and_then(|selection| {
+                accounts
+                    .iter()
+                    .position(|account| account.id == selection.account.id)
+            });
+            let serving_index = selected_index
+                .filter(|index| states[*index].can_serve(demand.credits, limits))
+                .or_else(|| {
+                    states
+                        .iter()
+                        .position(|state| state.can_serve(demand.credits, limits))
+                });
+
+            if let Some(index) = serving_index {
+                states[index].consume(*demand);
+                outcome = outcome.with_served(demand.credits);
+            } else {
+                outcome = outcome.with_unavailable(demand.credits);
+            }
+        }
+
+        outcome
+    }
+
+    fn validate_trace_inputs(trace: &[TraceDemand], limits: TraceLimits) {
+        assert!(
+            limits.account_count > 0,
+            "trace fixtures must include at least one account",
+        );
+        assert!(
+            limits.five_hour_limit > 0,
+            "trace fixtures must use a positive 5-hour limit",
+        );
+        assert!(
+            limits.weekly_limit > 0,
+            "trace fixtures must use a positive weekly limit",
+        );
+        assert!(
+            limits.five_hour_window > 0,
+            "trace fixtures must use a positive 5-hour window",
+        );
+        assert!(
+            limits.weekly_window > 0,
+            "trace fixtures must use a positive weekly window",
+        );
+        assert!(
+            trace
+                .windows(2)
+                .all(|pair| pair[0].minute <= pair[1].minute),
+            "trace demand must be sorted by minute",
+        );
     }
 
     fn apply_initial_usage(accounts: &mut [SimAccount], initial_usage: InitialUsage) {
@@ -1240,6 +1534,75 @@ mod tests {
         }
     }
 
+    impl TraceAccountState {
+        fn expire(&mut self, minute: i32, limits: TraceLimits) {
+            self.five_hour_events
+                .retain(|event| event.minute + limits.five_hour_window > minute);
+            self.weekly_events
+                .retain(|event| event.minute + limits.weekly_window > minute);
+        }
+
+        fn consume(&mut self, demand: TraceDemand) {
+            let event = TraceEvent {
+                minute: demand.minute,
+                credits: demand.credits,
+            };
+            self.five_hour_events.push(event);
+            self.weekly_events.push(event);
+        }
+
+        fn can_serve(&self, credits: u16, limits: TraceLimits) -> bool {
+            self.five_hour_remaining(limits) >= u32::from(credits)
+                && self.weekly_remaining(limits) >= u32::from(credits)
+        }
+
+        fn five_hour_remaining(&self, limits: TraceLimits) -> u32 {
+            u32::from(limits.five_hour_limit)
+                .saturating_sub(total_trace_credits(&self.five_hour_events))
+        }
+
+        fn weekly_remaining(&self, limits: TraceLimits) -> u32 {
+            u32::from(limits.weekly_limit).saturating_sub(total_trace_credits(&self.weekly_events))
+        }
+
+        fn five_hour_used(&self) -> u32 {
+            total_trace_credits(&self.five_hour_events)
+        }
+
+        fn weekly_used(&self) -> u32 {
+            total_trace_credits(&self.weekly_events)
+        }
+    }
+
+    impl TraceOutcome {
+        fn user_unavailable_minutes(self) -> u32 {
+            self.unavailable_minutes
+        }
+
+        fn with_served(mut self, credits: u16) -> Self {
+            self.served_credits += u32::from(credits);
+            self
+        }
+
+        fn with_unavailable(mut self, credits: u16) -> Self {
+            self.unavailable_minutes += 1;
+            self.failed_credits += u32::from(credits);
+            self
+        }
+
+        fn is_at_least_as_good_as(self, other: Self) -> bool {
+            Self::compare_for_oracle(&self, &other) != Ordering::Less
+        }
+
+        fn compare_for_oracle(left: &Self, right: &Self) -> Ordering {
+            right
+                .unavailable_minutes
+                .cmp(&left.unavailable_minutes)
+                .then_with(|| left.served_credits.cmp(&right.served_credits))
+                .then_with(|| right.failed_credits.cmp(&left.failed_credits))
+        }
+    }
+
     fn expire_events(events: &mut VecDeque<UsageEvent>, minute: i64, window_minutes: i64) {
         while events
             .front()
@@ -1287,6 +1650,37 @@ mod tests {
 
     fn total_credits(events: &VecDeque<UsageEvent>) -> f64 {
         events.iter().map(|event| event.credits).sum()
+    }
+
+    fn total_trace_credits(events: &[TraceEvent]) -> u32 {
+        events.iter().map(|event| u32::from(event.credits)).sum()
+    }
+
+    fn trace_usage_info(
+        account_id: &str,
+        state: &TraceAccountState,
+        minute: i32,
+        limits: TraceLimits,
+    ) -> UsageInfo {
+        usage_info(
+            account_id,
+            used_percent(
+                f64::from(state.five_hour_used()),
+                f64::from(limits.five_hour_limit),
+            ),
+            used_percent(
+                f64::from(state.weekly_used()),
+                f64::from(limits.weekly_limit),
+            ),
+            trace_reset_at(&state.five_hour_events, minute, limits.five_hour_window),
+            trace_reset_at(&state.weekly_events, minute, limits.weekly_window),
+        )
+    }
+
+    fn trace_reset_at(events: &[TraceEvent], minute: i32, window_minutes: i32) -> i64 {
+        events.first().map_or(i64::from(minute), |event| {
+            i64::from(event.minute + window_minutes)
+        })
     }
 
     fn used_percent(used: f64, limit: f64) -> f64 {
