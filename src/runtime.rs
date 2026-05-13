@@ -31,10 +31,8 @@ use crate::types::{AuthData, StoredAccount};
 const REMOTE_TOKEN_ENV: &str = "CODEX_SWITCH_REMOTE_TOKEN";
 const APP_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const APP_SERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-const AUTO_SWITCH_MAINTENANCE_INITIAL_MIN_DELAY: Duration = Duration::from_secs(5 * 60);
-const AUTO_SWITCH_MAINTENANCE_INITIAL_MAX_DELAY: Duration = Duration::from_secs(15 * 60);
-const AUTO_SWITCH_MAINTENANCE_MIN_INTERVAL: Duration = Duration::from_secs(45 * 60);
-const AUTO_SWITCH_MAINTENANCE_MAX_INTERVAL: Duration = Duration::from_secs(75 * 60);
+const AUTO_SWITCH_MAINTENANCE_MIN_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const AUTO_SWITCH_MAINTENANCE_MAX_INTERVAL: Duration = Duration::from_secs(45 * 60);
 const ACTIVE_ACCOUNT_WATCH_INTERVAL: Duration = Duration::from_secs(1);
 const RUNTIME_COMMAND_BUFFER: usize = 4;
 const INTERNAL_REQUEST_ID_PREFIX: &str = "codex-switch/";
@@ -377,25 +375,16 @@ async fn run_auto_switch_maintenance(
     runtime_commands: mpsc::Sender<RuntimeCommand>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    if sleep_until_shutdown(
-        random_auto_switch_maintenance_initial_delay(),
-        &mut shutdown,
-    )
-    .await
-    {
-        return;
-    }
-
     loop {
+        if sleep_until_shutdown(random_auto_switch_maintenance_interval(), &mut shutdown).await {
+            return;
+        }
+
         if auto_switch_maintenance_switched_account().await {
             match runtime_commands.try_send(RuntimeCommand::SyncActiveAccount) {
                 Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
                 Err(mpsc::error::TrySendError::Closed(_)) => return,
             }
-        }
-
-        if sleep_until_shutdown(random_auto_switch_maintenance_interval(), &mut shutdown).await {
-            return;
         }
     }
 }
@@ -502,13 +491,6 @@ fn active_account_auth_marker(account: &StoredAccount) -> String {
         ),
         AuthData::ApiKey { .. } => format!("api_key:{last_used_at}"),
     }
-}
-
-fn random_auto_switch_maintenance_initial_delay() -> Duration {
-    random_duration_between(
-        AUTO_SWITCH_MAINTENANCE_INITIAL_MIN_DELAY,
-        AUTO_SWITCH_MAINTENANCE_INITIAL_MAX_DELAY,
-    )
 }
 
 fn random_auto_switch_maintenance_interval() -> Duration {
