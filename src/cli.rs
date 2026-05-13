@@ -31,6 +31,17 @@ pub enum Command {
         #[arg(long)]
         file: Option<PathBuf>,
     },
+    /// Export a stored account as Codex CLI auth.json.
+    Export {
+        /// Account name, full ID, or unique ID prefix.
+        account: String,
+        /// Write auth.json to this file instead of stdout.
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Overwrite the output file if it already exists.
+        #[arg(long, requires = "file")]
+        force: bool,
+    },
     /// Switch Codex to a stored account.
     Switch {
         /// Account name, full ID, or unique ID prefix.

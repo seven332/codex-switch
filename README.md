@@ -20,6 +20,7 @@ cargo install --path .
 codex-switch list
 codex-switch login <name> [--device-auth]
 codex-switch import <name> [--file <path>]
+codex-switch export <name-or-id> [--file <path>] [--force]
 codex-switch switch <name-or-id>
 codex-switch auto-switch
 codex-switch run [--codex-bin <path>] -- [CODEX_ARGS]...
@@ -70,6 +71,25 @@ Use `codex-switch login <name> --device-auth` for device authorization. The CLI 
 `import` reads an existing Codex `auth.json`. When `--file` is omitted, it imports from the current Codex auth file: `$CODEX_HOME/auth.json` when `CODEX_HOME` is set, otherwise `~/.codex/auth.json`.
 
 `login` and `import` reject accounts that match an already stored auth identity.
+
+## Export
+
+`export` writes a stored account as Codex-compatible `auth.json` JSON. By default it prints to stdout:
+
+```sh
+codex-switch export my-account
+```
+
+The exported JSON contains credentials. Treat stdout and exported files as secrets.
+
+Use `--file` to write to a file. Existing files are not overwritten unless `--force` is passed.
+
+```sh
+codex-switch export my-account --file ./auth.json
+codex-switch export my-account --file ./auth.json --force
+```
+
+Exporting does not change the active account or the current Codex auth file.
 
 ## Usage
 
