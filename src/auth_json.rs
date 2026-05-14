@@ -138,10 +138,13 @@ mod tests {
             account_auth_json_content(&account).expect("auth.json should serialize successfully");
 
         assert!(content.ends_with('\n'));
+        let value: serde_json::Value =
+            serde_json::from_str(&content).expect("exported auth.json should be valid JSON");
         let auth: AuthDotJson =
             serde_json::from_str(&content).expect("exported auth.json should be valid JSON");
         let tokens = auth.tokens.expect("OAuth export should include tokens");
 
+        assert!(value.get("OPENAI_API_KEY").is_none());
         assert_eq!(auth.auth_mode.as_deref(), Some("chatgpt"));
         assert_eq!(auth.openai_api_key, None);
         assert_eq!(auth.last_refresh, account.token_last_refresh_at);
@@ -158,6 +161,8 @@ mod tests {
             account_auth_json_content(&account).expect("auth.json should serialize successfully");
 
         assert!(content.ends_with('\n'));
+        let value: serde_json::Value =
+            serde_json::from_str(&content).expect("exported auth.json should be valid JSON");
         let auth: AuthDotJson =
             serde_json::from_str(&content).expect("exported auth.json should be valid JSON");
 
@@ -168,8 +173,43 @@ mod tests {
                 .map(|value| value.expose_secret()),
             Some("sk-test")
         );
+        assert_eq!(
+            value.get("OPENAI_API_KEY").and_then(|value| value.as_str()),
+            Some("sk-test")
+        );
         assert!(auth.tokens.is_none());
         assert!(auth.last_refresh.is_none());
+    }
+
+    #[test]
+    fn auth_json_deserializes_missing_or_null_api_key_as_none() {
+        for content in [
+            r#"{
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": "id-token",
+                    "access_token": "access-token",
+                    "refresh_token": "refresh-token",
+                    "account_id": "account-id"
+                }
+            }"#,
+            r#"{
+                "auth_mode": "chatgpt",
+                "OPENAI_API_KEY": null,
+                "tokens": {
+                    "id_token": "id-token",
+                    "access_token": "access-token",
+                    "refresh_token": "refresh-token",
+                    "account_id": "account-id"
+                }
+            }"#,
+        ] {
+            let auth: AuthDotJson =
+                serde_json::from_str(content).expect("auth.json should deserialize");
+
+            assert_eq!(auth.openai_api_key, None);
+            assert!(auth.tokens.is_some());
+        }
     }
 
     #[test]
