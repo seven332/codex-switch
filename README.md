@@ -24,6 +24,7 @@ codex-switch export <name-or-id> [--file <path>] [--force]
 codex-switch switch <name-or-id>
 codex-switch auto-switch
 codex-switch run [--codex-bin <path>] -- [CODEX_ARGS]...
+codex-switch update [--check] [--version <version>]
 codex-switch usage [name-or-id]
 codex-switch usage --all
 codex-switch delete <name-or-id>
@@ -90,6 +91,22 @@ codex-switch export my-account --file ./auth.json --force
 ```
 
 Exporting does not change the current Codex auth file.
+
+## Update
+
+`update` checks GitHub Releases and replaces the current release binary with the matching platform asset:
+
+```sh
+codex-switch update --check
+codex-switch update
+codex-switch update --version 0.1.10
+```
+
+The updater verifies the GitHub release asset SHA-256 digest before replacing the executable. It does not run `sudo`; if the current executable path is not writable, rerun your install script or install the binary with elevated permissions. If codex-switch was installed with Cargo, use:
+
+```sh
+cargo install codex-switch --locked --force
+```
 
 ## Usage
 
