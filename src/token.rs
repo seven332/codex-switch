@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, sleep};
+use uuid::Uuid;
 
 use crate::auth_json;
 use crate::codex_http;
@@ -45,11 +46,12 @@ struct RefreshTokenResponse {
 
 struct TokenRefreshFileLock {
     path: PathBuf,
+    lock_id: String,
 }
 
 impl Drop for TokenRefreshFileLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        release_token_refresh_file_lock(&self.path, &self.lock_id);
     }
 }
 
@@ -189,10 +191,13 @@ async fn acquire_token_refresh_file_lock() -> Result<TokenRefreshFileLock> {
             .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
     }
 
+    let lock_id = Uuid::new_v4().to_string();
     let deadline = tokio::time::Instant::now() + TOKEN_REFRESH_LOCK_WAIT_TIMEOUT;
     loop {
-        match create_token_refresh_lock_file(&path) {
-            Ok(()) => return Ok(TokenRefreshFileLock { path }),
+        match create_token_refresh_lock_file(&path, &lock_id) {
+            Ok(()) => {
+                return Ok(TokenRefreshFileLock { path, lock_id });
+            }
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
                 if tokio::time::Instant::now() >= deadline {
                     anyhow::bail!(
@@ -217,7 +222,7 @@ fn token_refresh_lock_path() -> Result<PathBuf> {
         .join("token-refresh.lock"))
 }
 
-fn create_token_refresh_lock_file(path: &Path) -> io::Result<()> {
+fn create_token_refresh_lock_file(path: &Path, lock_id: &str) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -227,7 +232,7 @@ fn create_token_refresh_lock_file(path: &Path) -> io::Result<()> {
             .create_new(true)
             .mode(0o600)
             .open(path)?;
-        write_token_refresh_lock_metadata(path, &mut file)
+        write_token_refresh_lock_metadata(path, lock_id, &mut file)
     }
 
     #[cfg(not(unix))]
@@ -236,15 +241,20 @@ fn create_token_refresh_lock_file(path: &Path) -> io::Result<()> {
             .write(true)
             .create_new(true)
             .open(path)?;
-        write_token_refresh_lock_metadata(path, &mut file)
+        write_token_refresh_lock_metadata(path, lock_id, &mut file)
     }
 }
 
-fn write_token_refresh_lock_metadata(path: &Path, file: &mut fs::File) -> io::Result<()> {
+fn write_token_refresh_lock_metadata(
+    path: &Path,
+    lock_id: &str,
+    file: &mut fs::File,
+) -> io::Result<()> {
     let result = (|| {
         writeln!(
             file,
-            "pid={}\ncreated_at={}",
+            "lock_id={}\npid={}\ncreated_at={}",
+            lock_id,
             std::process::id(),
             Utc::now().to_rfc3339()
         )?;
@@ -256,6 +266,21 @@ fn write_token_refresh_lock_metadata(path: &Path, file: &mut fs::File) -> io::Re
     }
 
     result
+}
+
+fn release_token_refresh_file_lock(path: &Path, lock_id: &str) {
+    if fs::read_to_string(path)
+        .ok()
+        .is_some_and(|content| token_refresh_lock_belongs_to_owner(&content, lock_id))
+    {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn token_refresh_lock_belongs_to_owner(content: &str, lock_id: &str) -> bool {
+    content
+        .lines()
+        .any(|line| line.strip_prefix("lock_id=") == Some(lock_id))
 }
 
 fn auth_expired_or_needs_refresh(account: &StoredAccount, access_token: &str) -> bool {
@@ -359,13 +384,17 @@ fn refresh_token_endpoint_from_env(value: Result<String, std::env::VarError>) ->
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::{
-        REFRESH_TOKEN_URL, auth_expired_or_needs_refresh, parse_jwt_expiration,
-        refresh_token_endpoint_from_env,
+        REFRESH_TOKEN_URL, TokenRefreshFileLock, auth_expired_or_needs_refresh,
+        create_token_refresh_lock_file, parse_jwt_expiration, refresh_token_endpoint_from_env,
+        token_refresh_lock_belongs_to_owner,
     };
     use crate::types::{AuthData, AuthMode, StoredAccount};
     use base64::Engine;
     use chrono::{Duration, Utc};
+    use uuid::Uuid;
 
     #[test]
     fn parse_jwt_expiration_reads_exp_claim() {
@@ -416,6 +445,39 @@ mod tests {
             refresh_token_endpoint_from_env(Ok(" ".to_string())),
             REFRESH_TOKEN_URL
         );
+    }
+
+    #[test]
+    fn stale_guard_does_not_remove_replaced_token_refresh_lock() {
+        let (dir, lock_path) = temp_lock_path("replaced-token-refresh-lock");
+        let lock_a_id = Uuid::new_v4().to_string();
+        create_token_refresh_lock_file(&lock_path, &lock_a_id)
+            .expect("first lock should be created");
+        let lock_a = TokenRefreshFileLock {
+            path: lock_path.clone(),
+            lock_id: lock_a_id,
+        };
+        std::fs::remove_file(&lock_path).expect("test should remove first lock file");
+
+        let lock_b_id = Uuid::new_v4().to_string();
+        create_token_refresh_lock_file(&lock_path, &lock_b_id)
+            .expect("second lock should be created");
+        let lock_b = TokenRefreshFileLock {
+            path: lock_path.clone(),
+            lock_id: lock_b_id.clone(),
+        };
+        drop(lock_a);
+
+        let lock_content = std::fs::read_to_string(&lock_path).expect("second lock should remain");
+        assert!(token_refresh_lock_belongs_to_owner(
+            &lock_content,
+            &lock_b_id
+        ));
+
+        drop(lock_b);
+        assert!(!lock_path.exists());
+
+        std::fs::remove_dir_all(dir).expect("temp lock dir should be removed");
     }
 
     #[test]
@@ -495,6 +557,13 @@ mod tests {
         let payload =
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"exp":{exp}}}"#));
         format!("{header}.{payload}.")
+    }
+
+    fn temp_lock_path(name: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("codex-switch-{name}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp lock dir should be created");
+        let lock_path = dir.join("token-refresh.lock");
+        (dir, lock_path)
     }
 
     fn test_chatgpt_account(access_token: String) -> StoredAccount {
