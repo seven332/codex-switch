@@ -1700,9 +1700,9 @@ fn chatgpt_account(id: &str, last_used_at: Option<chrono::DateTime<Utc>>) -> Sto
         subscription_expires_at: None,
         auth_mode: AuthMode::ChatGPT,
         auth_data: AuthData::ChatGPT {
-            id_token: "id-token".to_string(),
-            access_token: "access-token".to_string(),
-            refresh_token: "refresh-token".to_string(),
+            id_token: "id-token".into(),
+            access_token: "access-token".into(),
+            refresh_token: "refresh-token".into(),
             account_id: Some(id.to_string()),
         },
         created_at: Utc::now(),
@@ -1722,7 +1722,7 @@ fn api_key_account(id: &str) -> StoredAccount {
         subscription_expires_at: None,
         auth_mode: AuthMode::ApiKey,
         auth_data: AuthData::ApiKey {
-            key: "api-key".to_string(),
+            key: "api-key".into(),
         },
         created_at: Utc::now(),
         last_used_at: None,

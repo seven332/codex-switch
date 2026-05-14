@@ -5,6 +5,7 @@ mod cli;
 mod codex_http;
 mod oauth;
 mod process;
+mod redaction;
 mod runtime;
 mod store;
 mod switcher;

@@ -11,8 +11,9 @@ use tokio::time::{Duration, sleep};
 
 use crate::auth_json;
 use crate::codex_http;
+use crate::redaction::redact_known_secrets;
 use crate::store;
-use crate::types::{AuthData, StoredAccount, parse_chatgpt_id_token_claims};
+use crate::types::{AuthData, RedactedString, StoredAccount, parse_chatgpt_id_token_claims};
 
 const REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR: &str = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
@@ -29,17 +30,17 @@ static TOKEN_REFRESH_LOCK: Mutex<()> = Mutex::const_new(());
 struct RefreshTokenRequest {
     client_id: &'static str,
     grant_type: &'static str,
-    refresh_token: String,
+    refresh_token: RedactedString,
 }
 
 #[derive(Debug, serde::Deserialize)]
 struct RefreshTokenResponse {
     #[serde(default)]
-    id_token: Option<String>,
+    id_token: Option<RedactedString>,
     #[serde(default)]
-    access_token: Option<String>,
+    access_token: Option<RedactedString>,
     #[serde(default)]
-    refresh_token: Option<String>,
+    refresh_token: Option<RedactedString>,
 }
 
 struct TokenRefreshFileLock {
@@ -56,7 +57,7 @@ pub async fn ensure_chatgpt_tokens_fresh(account: &StoredAccount) -> Result<Stor
     match &account.auth_data {
         AuthData::ApiKey { .. } => Ok(account.clone()),
         AuthData::ChatGPT { access_token, .. } => {
-            if auth_expired_or_needs_refresh(account, access_token) {
+            if auth_expired_or_needs_refresh(account, access_token.expose_secret()) {
                 refresh_chatgpt_tokens(account).await
             } else {
                 Ok(account.clone())
@@ -93,15 +94,16 @@ async fn refresh_chatgpt_tokens_locked(account: &StoredAccount) -> Result<Stored
         } => (refresh_token.clone(), account_id.clone()),
     };
 
-    if current_refresh_token.trim().is_empty() {
+    if current_refresh_token.expose_secret().trim().is_empty() {
         anyhow::bail!("Missing refresh token for account {}", account.name);
     }
 
-    let refreshed = refresh_tokens_with_refresh_token(&current_refresh_token).await?;
+    let refreshed =
+        refresh_tokens_with_refresh_token(current_refresh_token.expose_secret()).await?;
     let claims = refreshed
         .id_token
-        .as_deref()
-        .map(parse_chatgpt_id_token_claims);
+        .as_ref()
+        .map(|id_token| parse_chatgpt_id_token_claims(id_token.expose_secret()));
     let next_account_id = claims
         .as_ref()
         .and_then(|claims| claims.account_id.clone())
@@ -173,7 +175,7 @@ fn chatgpt_account_needs_refresh(account: &StoredAccount) -> bool {
     match &account.auth_data {
         AuthData::ApiKey { .. } => false,
         AuthData::ChatGPT { access_token, .. } => {
-            auth_expired_or_needs_refresh(account, access_token)
+            auth_expired_or_needs_refresh(account, access_token.expose_secret())
         }
     }
 }
@@ -292,7 +294,7 @@ async fn refresh_tokens_with_refresh_token(refresh_token: &str) -> Result<Refres
     let body = RefreshTokenRequest {
         client_id: CLIENT_ID,
         grant_type: "refresh_token",
-        refresh_token: refresh_token.to_string(),
+        refresh_token: RedactedString::new(refresh_token),
     };
 
     let mut last_send_error = None;
@@ -330,7 +332,8 @@ async fn refresh_tokens_with_refresh_token(refresh_token: &str) -> Result<Refres
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body =
+            redact_known_secrets(response.text().await.unwrap_or_default(), &[refresh_token]);
         anyhow::bail!("Token refresh failed: {status} - {body}");
     }
 
@@ -413,6 +416,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn refresh_debug_output_redacts_secret_values() {
+        let request_refresh_token = "request-refresh-token-codex-switch-test-secret";
+        let id_token = "response-id-token-codex-switch-test-secret";
+        let access_token = "response-access-token-codex-switch-test-secret";
+        let response_refresh_token = "response-refresh-token-codex-switch-test-secret";
+        let request = super::RefreshTokenRequest {
+            client_id: super::CLIENT_ID,
+            grant_type: "refresh_token",
+            refresh_token: request_refresh_token.into(),
+        };
+        let response = super::RefreshTokenResponse {
+            id_token: Some(id_token.into()),
+            access_token: Some(access_token.into()),
+            refresh_token: Some(response_refresh_token.into()),
+        };
+        let debug = format!("{request:?} {response:?}");
+
+        for secret in [
+            request_refresh_token,
+            id_token,
+            access_token,
+            response_refresh_token,
+        ] {
+            assert!(!debug.contains(secret), "debug output leaked {secret}");
+        }
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn refresh_json_preserves_secret_values() {
+        let request_refresh_token = "request-refresh-token-json-compat-secret";
+        let id_token = "response-id-token-json-compat-secret";
+        let access_token = "response-access-token-json-compat-secret";
+        let response_refresh_token = "response-refresh-token-json-compat-secret";
+        let request = super::RefreshTokenRequest {
+            client_id: super::CLIENT_ID,
+            grant_type: "refresh_token",
+            refresh_token: request_refresh_token.into(),
+        };
+
+        let request_json =
+            serde_json::to_string(&request).expect("serialize refresh token request");
+        assert!(request_json.contains(request_refresh_token));
+
+        let response: super::RefreshTokenResponse = serde_json::from_str(&format!(
+            r#"{{"id_token":"{id_token}","access_token":"{access_token}","refresh_token":"{response_refresh_token}"}}"#
+        ))
+        .expect("deserialize refresh token response");
+        assert_eq!(
+            response
+                .id_token
+                .as_ref()
+                .map(|value| value.expose_secret()),
+            Some(id_token)
+        );
+        assert_eq!(
+            response
+                .access_token
+                .as_ref()
+                .map(|value| value.expose_secret()),
+            Some(access_token)
+        );
+        assert_eq!(
+            response
+                .refresh_token
+                .as_ref()
+                .map(|value| value.expose_secret()),
+            Some(response_refresh_token)
+        );
+    }
+
     fn test_jwt_with_exp(exp: i64) -> String {
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
         let payload =
@@ -432,9 +507,9 @@ mod tests {
             subscription_expires_at: None,
             auth_mode: AuthMode::ChatGPT,
             auth_data: AuthData::ChatGPT {
-                id_token: "id-token".to_string(),
-                access_token,
-                refresh_token: "refresh-token".to_string(),
+                id_token: "id-token".into(),
+                access_token: access_token.into(),
+                refresh_token: "refresh-token".into(),
                 account_id: None,
             },
             created_at: Utc::now(),

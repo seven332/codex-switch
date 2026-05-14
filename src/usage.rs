@@ -60,7 +60,7 @@ fn extract_chatgpt_auth(account: &StoredAccount) -> Result<(&str, Option<&str>, 
             account_id,
             ..
         } => Ok((
-            access_token.as_str(),
+            access_token.expose_secret(),
             account_id.as_deref(),
             account.chatgpt_account_is_fedramp,
         )),
