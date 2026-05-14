@@ -67,11 +67,14 @@ fn import_from_auth_json_contents(content: &str, account_name: String) -> Result
     } = auth;
 
     if let Some(api_key) = openai_api_key {
-        return Ok(StoredAccount::new_api_key(account_name, api_key));
+        return Ok(StoredAccount::new_api_key(
+            account_name,
+            api_key.into_inner(),
+        ));
     }
 
     if let Some(tokens) = tokens {
-        let claims = parse_chatgpt_id_token_claims(&tokens.id_token);
+        let claims = parse_chatgpt_id_token_claims(tokens.id_token.expose_secret());
         return Ok(StoredAccount::new_chatgpt(NewChatGptAccount {
             name: account_name,
             email: claims.email,
@@ -142,9 +145,9 @@ mod tests {
         assert_eq!(auth.auth_mode.as_deref(), Some("chatgpt"));
         assert_eq!(auth.openai_api_key, None);
         assert_eq!(auth.last_refresh, account.token_last_refresh_at);
-        assert_eq!(tokens.id_token, "id-token");
-        assert_eq!(tokens.access_token, "access-token");
-        assert_eq!(tokens.refresh_token, "refresh-token");
+        assert_eq!(tokens.id_token.expose_secret(), "id-token");
+        assert_eq!(tokens.access_token.expose_secret(), "access-token");
+        assert_eq!(tokens.refresh_token.expose_secret(), "refresh-token");
         assert_eq!(tokens.account_id.as_deref(), Some("account-id"));
     }
 
@@ -159,7 +162,12 @@ mod tests {
             serde_json::from_str(&content).expect("exported auth.json should be valid JSON");
 
         assert_eq!(auth.auth_mode.as_deref(), Some("apikey"));
-        assert_eq!(auth.openai_api_key.as_deref(), Some("sk-test"));
+        assert_eq!(
+            auth.openai_api_key
+                .as_ref()
+                .map(|value| value.expose_secret()),
+            Some("sk-test")
+        );
         assert!(auth.tokens.is_none());
         assert!(auth.last_refresh.is_none());
     }
@@ -197,7 +205,12 @@ mod tests {
             &fs::read_to_string(&path).expect("test should read exported auth.json"),
         )
         .expect("exported auth.json should be valid JSON");
-        assert_eq!(auth.openai_api_key.as_deref(), Some("sk-test"));
+        assert_eq!(
+            auth.openai_api_key
+                .as_ref()
+                .map(|value| value.expose_secret()),
+            Some("sk-test")
+        );
 
         fs::remove_file(path).expect("test should remove temp file");
     }
@@ -231,9 +244,9 @@ mod tests {
             chatgpt_account_is_fedramp: false,
             token_last_refresh_at: Utc.with_ymd_and_hms(2026, 5, 13, 12, 0, 0).unwrap(),
             subscription_expires_at: None,
-            id_token: "id-token".to_string(),
-            access_token: "access-token".to_string(),
-            refresh_token: "refresh-token".to_string(),
+            id_token: "id-token".into(),
+            access_token: "access-token".into(),
+            refresh_token: "refresh-token".into(),
             account_id: Some("account-id".to_string()),
         })
     }

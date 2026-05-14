@@ -1354,7 +1354,7 @@ async fn external_auth_payload(account: &StoredAccount) -> Result<ExternalAuthPa
             account_id,
             ..
         } => Ok(ExternalAuthPayload {
-            access_token,
+            access_token: access_token.into_inner(),
             chatgpt_account_id: account_id
                 .filter(|account_id| !account_id.trim().is_empty())
                 .context("ChatGPT account id is required for runtime switching")?,

@@ -14,7 +14,10 @@ use tokio::time::{sleep, timeout};
 use chrono::Utc;
 
 use crate::codex_http;
-use crate::types::{NewChatGptAccount, StoredAccount, parse_chatgpt_id_token_claims};
+use crate::redaction::redact_known_secrets;
+use crate::types::{
+    NewChatGptAccount, RedactedString, StoredAccount, parse_chatgpt_id_token_claims,
+};
 
 const DEFAULT_ISSUER: &str = "https://auth.openai.com";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -35,23 +38,23 @@ pub enum LoginFlow {
 
 #[derive(Debug, Clone)]
 struct PkceCodes {
-    code_verifier: String,
+    code_verifier: RedactedString,
     code_challenge: String,
 }
 
 #[derive(Debug, Clone)]
 struct DeviceCode {
     verification_url: String,
-    user_code: String,
-    device_auth_id: String,
+    user_code: RedactedString,
+    device_auth_id: RedactedString,
     interval: u64,
 }
 
 #[derive(Debug, Deserialize)]
 struct UserCodeResponse {
-    device_auth_id: String,
+    device_auth_id: RedactedString,
     #[serde(alias = "user_code", alias = "usercode")]
-    user_code: String,
+    user_code: RedactedString,
     #[serde(default, deserialize_with = "deserialize_interval")]
     interval: u64,
 }
@@ -63,23 +66,23 @@ struct UserCodeRequest {
 
 #[derive(Debug, Serialize)]
 struct TokenPollRequest {
-    device_auth_id: String,
-    user_code: String,
+    device_auth_id: RedactedString,
+    user_code: RedactedString,
 }
 
 #[derive(Debug, Deserialize)]
 struct CodeSuccessResponse {
-    authorization_code: String,
-    code_verifier: String,
+    authorization_code: RedactedString,
+    code_verifier: RedactedString,
     #[allow(dead_code)]
     code_challenge: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
-    id_token: String,
-    access_token: String,
-    refresh_token: String,
+    id_token: RedactedString,
+    access_token: RedactedString,
+    refresh_token: RedactedString,
 }
 
 pub async fn login(account_name: String, flow: LoginFlow) -> Result<StoredAccount> {
@@ -123,9 +126,9 @@ async fn device_auth_login() -> Result<TokenResponse> {
     exchange_authorization_code_for_tokens(
         &client,
         issuer,
-        &code.authorization_code,
+        code.authorization_code.expose_secret(),
         &redirect_uri,
-        &code.code_verifier,
+        code.code_verifier.expose_secret(),
     )
     .await
 }
@@ -138,7 +141,7 @@ fn oauth_http_client() -> Result<reqwest::Client> {
 }
 
 fn stored_account_from_tokens(account_name: String, tokens: TokenResponse) -> StoredAccount {
-    let claims = parse_chatgpt_id_token_claims(&tokens.id_token);
+    let claims = parse_chatgpt_id_token_claims(tokens.id_token.expose_secret());
 
     StoredAccount::new_chatgpt(NewChatGptAccount {
         name: account_name,
@@ -175,7 +178,7 @@ async fn request_device_code(client: &reqwest::Client, issuer: &str) -> Result<D
             );
         }
 
-        let body = response.text().await.unwrap_or_default();
+        let body = redact_known_secrets(response.text().await.unwrap_or_default(), &[]);
         anyhow::bail!("device code request failed with status {status}: {body}");
     }
 
@@ -231,7 +234,13 @@ async fn poll_for_authorization_code(
             continue;
         }
 
-        let body = response.text().await.unwrap_or_default();
+        let body = redact_known_secrets(
+            response.text().await.unwrap_or_default(),
+            &[
+                device_code.device_auth_id.expose_secret(),
+                device_code.user_code.expose_secret(),
+            ],
+        );
         anyhow::bail!("device auth failed with status {status}: {body}");
     }
 }
@@ -261,7 +270,10 @@ async fn exchange_authorization_code_for_tokens(
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = redact_known_secrets(
+            response.text().await.unwrap_or_default(),
+            &[authorization_code, code_verifier],
+        );
         anyhow::bail!("token endpoint returned status {status}: {body}");
     }
 
@@ -395,7 +407,7 @@ async fn handle_browser_callback(
         issuer,
         code,
         redirect_uri,
-        &pkce.code_verifier,
+        pkce.code_verifier.expose_secret(),
     )
     .await
     {
@@ -559,7 +571,7 @@ fn generate_pkce() -> PkceCodes {
     let code_challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
 
     PkceCodes {
-        code_verifier,
+        code_verifier: RedactedString::new(code_verifier),
         code_challenge,
     }
 }
@@ -607,7 +619,7 @@ fn print_device_code_prompt(device_code: &DeviceCode) {
     println!("   {}", device_code.verification_url);
     println!();
     println!("2. Enter this one-time code, expires in 15 minutes:");
-    println!("   {}", device_code.user_code);
+    println!("   {}", device_code.user_code.expose_secret());
     println!();
     println!("Waiting for authorization...");
 }
@@ -638,7 +650,7 @@ mod tests {
     #[test]
     fn authorize_url_uses_codex_oauth_parameters() {
         let pkce = super::PkceCodes {
-            code_verifier: "verifier".to_string(),
+            code_verifier: "verifier".into(),
             code_challenge: "challenge".to_string(),
         };
         let url = build_authorize_url(
@@ -671,5 +683,85 @@ mod tests {
             Some(crate::codex_http::originator_value().as_str())
         );
         assert_eq!(params.get("state").map(String::as_str), Some("state"));
+    }
+
+    #[test]
+    fn oauth_debug_output_redacts_secret_values() {
+        let device_auth_id = "device-auth-id-codex-switch-test-secret";
+        let user_code = "user-code-codex-switch-test-secret";
+        let pkce_verifier = "pkce-verifier-codex-switch-test-secret";
+        let authorization_code = "authorization-code-codex-switch-test-secret";
+        let code_verifier = "code-verifier-codex-switch-test-secret";
+        let id_token = "id-token-codex-switch-test-secret";
+        let access_token = "access-token-codex-switch-test-secret";
+        let refresh_token = "refresh-token-codex-switch-test-secret";
+        let device_code = super::DeviceCode {
+            verification_url: "https://auth.openai.com/codex/device".to_string(),
+            user_code: user_code.into(),
+            device_auth_id: device_auth_id.into(),
+            interval: 5,
+        };
+        let user_code_response = super::UserCodeResponse {
+            device_auth_id: device_auth_id.into(),
+            user_code: user_code.into(),
+            interval: 5,
+        };
+        let token_poll_request = super::TokenPollRequest {
+            device_auth_id: device_auth_id.into(),
+            user_code: user_code.into(),
+        };
+        let pkce = super::PkceCodes {
+            code_verifier: pkce_verifier.into(),
+            code_challenge: "challenge".to_string(),
+        };
+        let code = super::CodeSuccessResponse {
+            authorization_code: authorization_code.into(),
+            code_verifier: code_verifier.into(),
+            code_challenge: "challenge".to_string(),
+        };
+        let tokens = super::TokenResponse {
+            id_token: id_token.into(),
+            access_token: access_token.into(),
+            refresh_token: refresh_token.into(),
+        };
+        let debug = format!(
+            "{device_code:?} {user_code_response:?} {token_poll_request:?} {pkce:?} {code:?} {tokens:?}"
+        );
+
+        for secret in [
+            device_auth_id,
+            user_code,
+            pkce_verifier,
+            authorization_code,
+            code_verifier,
+            id_token,
+            access_token,
+            refresh_token,
+        ] {
+            assert!(!debug.contains(secret), "debug output leaked {secret}");
+        }
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn oauth_json_preserves_secret_values() {
+        let device_auth_id = "device-auth-id-json-compat-secret";
+        let user_code = "user-code-json-compat-secret";
+        let request = super::TokenPollRequest {
+            device_auth_id: device_auth_id.into(),
+            user_code: user_code.into(),
+        };
+
+        let json = serde_json::to_string(&request).expect("serialize token poll request");
+
+        assert!(json.contains(device_auth_id));
+        assert!(json.contains(user_code));
+
+        let response: super::UserCodeResponse = serde_json::from_str(&format!(
+            r#"{{"device_auth_id":"{device_auth_id}","user_code":"{user_code}","interval":5}}"#
+        ))
+        .expect("deserialize user code response");
+        assert_eq!(response.device_auth_id.expose_secret(), device_auth_id);
+        assert_eq!(response.user_code.expose_secret(), user_code);
     }
 }

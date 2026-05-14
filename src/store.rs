@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::types::{AccountsStore, AuthData, StoredAccount};
+use crate::types::{AccountsStore, AuthData, RedactedString, StoredAccount};
 
 pub fn config_dir() -> Result<PathBuf> {
     let home = dirs::home_dir().context("Could not find home directory")?;
@@ -196,8 +196,14 @@ fn has_same_auth_identity(left: &StoredAccount, right: &StoredAccount) -> bool {
             },
         ) => {
             same_non_empty_option(left_account_id.as_deref(), right_account_id.as_deref())
-                || same_non_empty(left_refresh_token, right_refresh_token)
-                || same_non_empty(left_id_token, right_id_token)
+                || same_non_empty(
+                    left_refresh_token.expose_secret(),
+                    right_refresh_token.expose_secret(),
+                )
+                || same_non_empty(
+                    left_id_token.expose_secret(),
+                    right_id_token.expose_secret(),
+                )
                 || (same_non_empty_option(
                     left.chatgpt_user_id.as_deref(),
                     right.chatgpt_user_id.as_deref(),
@@ -344,9 +350,9 @@ pub fn rename_account_by_selector(selector: &str, new_name: String) -> Result<St
 
 #[derive(Debug, Clone)]
 pub struct ChatGptTokenUpdate {
-    pub id_token: Option<String>,
-    pub access_token: Option<String>,
-    pub refresh_token: Option<String>,
+    pub id_token: Option<RedactedString>,
+    pub access_token: Option<RedactedString>,
+    pub refresh_token: Option<RedactedString>,
     pub chatgpt_account_id: Option<String>,
     pub email: Option<String>,
     pub plan_type: Option<String>,
@@ -528,9 +534,9 @@ mod tests {
             chatgpt_account_is_fedramp: false,
             token_last_refresh_at: Utc::now(),
             subscription_expires_at: None,
-            id_token: id_token.to_string(),
-            access_token: "access-token".to_string(),
-            refresh_token: refresh_token.to_string(),
+            id_token: id_token.into(),
+            access_token: "access-token".into(),
+            refresh_token: refresh_token.into(),
             account_id: account_id.map(str::to_string),
         })
     }

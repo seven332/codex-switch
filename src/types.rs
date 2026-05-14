@@ -5,6 +5,43 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// String wrapper that redacts Debug output. This does not zeroize memory.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RedactedString(String);
+
+impl RedactedString {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Debug for RedactedString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl From<String> for RedactedString {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<&str> for RedactedString {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountsStore {
     pub version: u32,
@@ -54,7 +91,9 @@ impl StoredAccount {
             token_last_refresh_at: None,
             subscription_expires_at: None,
             auth_mode: AuthMode::ApiKey,
-            auth_data: AuthData::ApiKey { key: api_key },
+            auth_data: AuthData::ApiKey {
+                key: RedactedString::new(api_key),
+            },
             created_at: Utc::now(),
             last_used_at: None,
         }
@@ -92,9 +131,9 @@ pub struct NewChatGptAccount {
     pub chatgpt_account_is_fedramp: bool,
     pub token_last_refresh_at: DateTime<Utc>,
     pub subscription_expires_at: Option<DateTime<Utc>>,
-    pub id_token: String,
-    pub access_token: String,
-    pub refresh_token: String,
+    pub id_token: RedactedString,
+    pub access_token: RedactedString,
+    pub refresh_token: RedactedString,
     pub account_id: Option<String>,
 }
 
@@ -118,12 +157,12 @@ impl fmt::Display for AuthMode {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuthData {
     ApiKey {
-        key: String,
+        key: RedactedString,
     },
     ChatGPT {
-        id_token: String,
-        access_token: String,
-        refresh_token: String,
+        id_token: RedactedString,
+        access_token: RedactedString,
+        refresh_token: RedactedString,
         account_id: Option<String>,
     },
 }
@@ -196,7 +235,7 @@ pub struct AuthDotJson {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<String>,
     #[serde(rename = "OPENAI_API_KEY")]
-    pub openai_api_key: Option<String>,
+    pub openai_api_key: Option<RedactedString>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens: Option<TokenData>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -205,9 +244,9 @@ pub struct AuthDotJson {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenData {
-    pub id_token: String,
-    pub access_token: String,
-    pub refresh_token: String,
+    pub id_token: RedactedString,
+    pub access_token: RedactedString,
+    pub refresh_token: RedactedString,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
 }
@@ -443,5 +482,135 @@ impl PlanType {
             Self::Edu => "edu",
             Self::Unknown => "unknown",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacted_string_debug_redacts_secret_but_json_preserves_value() {
+        let secret = "secret-value-that-must-stay-private";
+        let value = RedactedString::new(secret);
+
+        assert_eq!(format!("{value:?}"), "<redacted>");
+
+        let json = serde_json::to_string(&value).expect("serialize redacted string");
+        assert!(json.contains(secret));
+
+        let decoded: RedactedString =
+            serde_json::from_str(&json).expect("deserialize redacted string");
+        assert_eq!(decoded.expose_secret(), secret);
+    }
+
+    #[test]
+    fn account_debug_redacts_api_key_and_chatgpt_tokens() {
+        let api_secret = "sk-codex-switch-test-secret";
+        let id_secret = "id-token-codex-switch-test-secret";
+        let access_secret = "access-token-codex-switch-test-secret";
+        let refresh_secret = "refresh-token-codex-switch-test-secret";
+
+        let api_auth = AuthData::ApiKey {
+            key: api_secret.into(),
+        };
+        let chatgpt_auth = AuthData::ChatGPT {
+            id_token: id_secret.into(),
+            access_token: access_secret.into(),
+            refresh_token: refresh_secret.into(),
+            account_id: Some("account-id".to_string()),
+        };
+        let api_account = StoredAccount::new_api_key("api".to_string(), api_secret.to_string());
+        let chatgpt_account = StoredAccount::new_chatgpt(NewChatGptAccount {
+            name: "chatgpt".to_string(),
+            email: Some("user@example.com".to_string()),
+            plan_type: Some("pro".to_string()),
+            chatgpt_user_id: Some("user-id".to_string()),
+            chatgpt_account_is_fedramp: false,
+            token_last_refresh_at: Utc::now(),
+            subscription_expires_at: None,
+            id_token: id_secret.into(),
+            access_token: access_secret.into(),
+            refresh_token: refresh_secret.into(),
+            account_id: Some("account-id".to_string()),
+        });
+        let debug = format!("{api_auth:?} {chatgpt_auth:?} {api_account:?} {chatgpt_account:?}");
+
+        for secret in [api_secret, id_secret, access_secret, refresh_secret] {
+            assert!(!debug.contains(secret), "debug output leaked {secret}");
+        }
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn accounts_and_auth_json_keep_raw_secret_json_values() {
+        let api_secret = "sk-json-compat-secret";
+        let id_secret = "id-token-json-compat-secret";
+        let access_secret = "access-token-json-compat-secret";
+        let refresh_secret = "refresh-token-json-compat-secret";
+
+        let api_account = StoredAccount::new_api_key("api".to_string(), api_secret.to_string());
+        let chatgpt_account = StoredAccount::new_chatgpt(NewChatGptAccount {
+            name: "chatgpt".to_string(),
+            email: None,
+            plan_type: Some("pro".to_string()),
+            chatgpt_user_id: None,
+            chatgpt_account_is_fedramp: false,
+            token_last_refresh_at: Utc::now(),
+            subscription_expires_at: None,
+            id_token: id_secret.into(),
+            access_token: access_secret.into(),
+            refresh_token: refresh_secret.into(),
+            account_id: Some("account-id".to_string()),
+        });
+        let store = AccountsStore {
+            version: 1,
+            accounts: vec![api_account, chatgpt_account],
+            active_account_id: None,
+            masked_account_ids: Vec::new(),
+        };
+        let auth_json = AuthDotJson {
+            auth_mode: Some("chatgpt".to_string()),
+            openai_api_key: Some(api_secret.into()),
+            tokens: Some(TokenData {
+                id_token: id_secret.into(),
+                access_token: access_secret.into(),
+                refresh_token: refresh_secret.into(),
+                account_id: Some("account-id".to_string()),
+            }),
+            last_refresh: None,
+        };
+        let auth_debug = format!(
+            "{auth_json:?} {:?}",
+            auth_json.tokens.as_ref().expect("tokens")
+        );
+        for secret in [api_secret, id_secret, access_secret, refresh_secret] {
+            assert!(
+                !auth_debug.contains(secret),
+                "auth debug output leaked {secret}"
+            );
+        }
+        assert!(auth_debug.contains("<redacted>"));
+
+        let store_json = serde_json::to_string(&store).expect("serialize accounts store");
+        let auth_file_json = serde_json::to_string(&auth_json).expect("serialize auth json");
+        for secret in [api_secret, id_secret, access_secret, refresh_secret] {
+            assert!(store_json.contains(secret), "accounts json lost {secret}");
+            assert!(auth_file_json.contains(secret), "auth json lost {secret}");
+        }
+
+        let decoded_auth: AuthDotJson =
+            serde_json::from_str(&auth_file_json).expect("deserialize auth json");
+        assert_eq!(
+            decoded_auth
+                .openai_api_key
+                .as_ref()
+                .map(RedactedString::expose_secret),
+            Some(api_secret)
+        );
+        let decoded_tokens = decoded_auth.tokens.expect("tokens");
+        assert_eq!(decoded_tokens.id_token.expose_secret(), id_secret);
+        assert_eq!(decoded_tokens.access_token.expose_secret(), access_secret);
+        assert_eq!(decoded_tokens.refresh_token.expose_secret(), refresh_secret);
     }
 }
