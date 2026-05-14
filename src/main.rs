@@ -130,14 +130,12 @@ async fn run() -> Result<()> {
             if all {
                 print_all_usage().await?;
             } else {
-                let account = match account {
-                    Some(selector) => store::get_account_by_selector(&selector)?,
-                    None => store::get_active_account()?.context(
-                        "No active account. Pass a name-or-id, or run codex-switch switch <name-or-id>.",
-                    )?,
-                };
+                let accounts_store = store::load_accounts()?;
+                let account = usage_account_from_store(&accounts_store, account.as_deref())?;
+                let is_active =
+                    accounts_store.active_account_id.as_deref() == Some(account.id.as_str());
                 let info = usage::get_account_usage(&account).await?;
-                print_usage(&account, &info);
+                print_usage(&account, &info, is_active);
             }
         }
         Command::Delete { account } => {
@@ -159,6 +157,36 @@ async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn usage_account_from_store(
+    accounts_store: &AccountsStore,
+    selector: Option<&str>,
+) -> Result<StoredAccount> {
+    match selector {
+        Some(selector) => {
+            let account_id = store::resolve_account_id(accounts_store, selector)?;
+            accounts_store
+                .accounts
+                .iter()
+                .find(|account| account.id == account_id)
+                .cloned()
+                .context("Account not found after resolving selector")
+        }
+        None => accounts_store
+            .active_account_id
+            .as_deref()
+            .and_then(|active_id| {
+                accounts_store
+                    .accounts
+                    .iter()
+                    .find(|account| account.id == active_id)
+            })
+            .cloned()
+            .context(
+                "No active account. Pass a name-or-id, or run codex-switch switch <name-or-id>.",
+            ),
+    }
 }
 
 fn print_auto_switch_result(result: auto_switch::AutoSwitchResult) {
@@ -219,7 +247,8 @@ async fn print_all_usage() -> Result<()> {
             println!();
         }
         if let Some(info) = by_id.get(&account.id) {
-            print_usage(account, info);
+            let is_active = store.active_account_id.as_deref() == Some(account.id.as_str());
+            print_usage(account, info, is_active);
         }
     }
 
@@ -255,8 +284,8 @@ fn print_accounts(store: &AccountsStore) {
     }
 }
 
-fn print_usage(account: &StoredAccount, info: &UsageInfo) {
-    println!("{} ({})", account.name, store::short_id(&account.id));
+fn print_usage(account: &StoredAccount, info: &UsageInfo, is_active: bool) {
+    println!("{}", format_usage_account_header(account, is_active));
 
     if matches!(info.error.as_deref(), Some("usage unsupported")) {
         println!("usage: unsupported");
@@ -286,6 +315,15 @@ fn print_usage(account: &StoredAccount, info: &UsageInfo) {
         println!("rate limit reached: {kind}");
     }
     print_additional_limits(info);
+}
+
+fn format_usage_account_header(account: &StoredAccount, is_active: bool) -> String {
+    let marker = if is_active { "* " } else { "" };
+    format!(
+        "{marker}{} ({})",
+        account.name,
+        store::short_id(&account.id)
+    )
 }
 
 fn print_limit_window(
@@ -370,4 +408,62 @@ fn format_unix_timestamp(timestamp: i64) -> String {
                 .to_string()
         })
         .unwrap_or_else(|| timestamp.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_usage_account_header, usage_account_from_store};
+    use crate::store;
+    use crate::types::{AccountsStore, StoredAccount};
+
+    #[test]
+    fn usage_header_marks_active_account() {
+        let account = StoredAccount::new_api_key("work".to_string(), "sk-test".to_string());
+
+        assert_eq!(
+            format_usage_account_header(&account, true),
+            format!("* work ({})", store::short_id(&account.id))
+        );
+    }
+
+    #[test]
+    fn usage_header_leaves_inactive_account_unmarked() {
+        let account = StoredAccount::new_api_key("work".to_string(), "sk-test".to_string());
+
+        assert_eq!(
+            format_usage_account_header(&account, false),
+            format!("work ({})", store::short_id(&account.id))
+        );
+    }
+
+    #[test]
+    fn usage_account_from_store_uses_active_account_without_reloading() {
+        let account = StoredAccount::new_api_key("work".to_string(), "sk-test".to_string());
+        let accounts_store = AccountsStore {
+            version: 1,
+            accounts: vec![account.clone()],
+            active_account_id: Some(account.id.clone()),
+            masked_account_ids: Vec::new(),
+        };
+
+        let selected = usage_account_from_store(&accounts_store, None).expect("active account");
+
+        assert_eq!(selected.id, account.id);
+    }
+
+    #[test]
+    fn usage_account_from_store_resolves_explicit_selector() {
+        let account = StoredAccount::new_api_key("work".to_string(), "sk-test".to_string());
+        let accounts_store = AccountsStore {
+            version: 1,
+            accounts: vec![account.clone()],
+            active_account_id: None,
+            masked_account_ids: Vec::new(),
+        };
+
+        let selected =
+            usage_account_from_store(&accounts_store, Some("work")).expect("selected account");
+
+        assert_eq!(selected.id, account.id);
+    }
 }
