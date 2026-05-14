@@ -25,6 +25,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, accept_hdr_async, conne
 use uuid::Uuid;
 
 use crate::account_selector::{self, SelectionConfig};
+use crate::auth_json;
 use crate::auto_switch::{self, AutoSwitchResult};
 use crate::codex_http;
 use crate::store;
@@ -53,11 +54,11 @@ enum RuntimeCommand {
 #[derive(Debug)]
 enum BackgroundRuntimeRequest {
     AutoSwitch,
-    PrepareActiveAccountLogin,
+    PrepareCurrentAccountLogin,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum ActiveAccountWatchStatus {
+enum CurrentAccountWatchStatus {
     Unchanged,
     Queued,
     Full,
@@ -74,8 +75,8 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
     let initial = auto_switch::auto_switch_allow_running()
         .await
         .context("Initial account auto-switch failed")?;
-    if let AutoSwitchResult::ActiveUnsupported { reason, .. } = initial {
-        anyhow::bail!("active account does not support runtime auto-switch: {reason}");
+    if let AutoSwitchResult::CurrentUnsupported { reason, .. } = initial {
+        anyhow::bail!("current account does not support runtime auto-switch: {reason}");
     }
 
     let port = reserve_local_port()?;
@@ -121,7 +122,7 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
         runtime_auto_switch_coordinator.clone(),
         maintenance_shutdown_rx.clone(),
     ));
-    let active_account_watch_task = tokio::spawn(run_active_account_watcher(
+    let current_account_watch_task = tokio::spawn(run_current_account_watcher(
         background_runtime_tx.clone(),
         maintenance_shutdown_rx,
     ));
@@ -145,7 +146,7 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
                 maintenance_shutdown_tx,
                 background_runtime_task,
                 maintenance_task,
-                active_account_watch_task,
+                current_account_watch_task,
             )
             .await;
             shutdown_child(&mut app_server).await;
@@ -181,7 +182,7 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
         maintenance_shutdown_tx,
         background_runtime_task,
         maintenance_task,
-        active_account_watch_task,
+        current_account_watch_task,
     )
     .await;
     shutdown_child(&mut app_server).await;
@@ -392,12 +393,12 @@ async fn stop_runtime_background_tasks(
     shutdown: watch::Sender<bool>,
     background_runtime_task: JoinHandle<()>,
     maintenance_task: JoinHandle<()>,
-    active_account_watch_task: JoinHandle<()>,
+    current_account_watch_task: JoinHandle<()>,
 ) {
     let _ = shutdown.send(true);
     stop_task_with_timeout(background_runtime_task).await;
     stop_task_with_timeout(maintenance_task).await;
-    stop_task_with_timeout(active_account_watch_task).await;
+    stop_task_with_timeout(current_account_watch_task).await;
 }
 
 async fn stop_task_with_timeout(mut task: JoinHandle<()>) {
@@ -547,8 +548,8 @@ async fn run_background_runtime_worker(
                         finish_background_auto_switch(&coordinator);
                         command
                     }
-                    BackgroundRuntimeRequest::PrepareActiveAccountLogin => {
-                        prepare_active_account_login_command().await
+                    BackgroundRuntimeRequest::PrepareCurrentAccountLogin => {
+                        prepare_current_account_login_command().await
                     }
                 };
                 if let Some(command) = command
@@ -582,7 +583,7 @@ async fn prepare_login_command(account: StoredAccount) -> Result<RuntimeCommand>
 #[derive(Debug, Clone)]
 enum AutoSwitchLoginMode {
     SwitchedOnly,
-    EnsureActiveLogged {
+    EnsureCurrentLogged {
         app_server_account_id: Option<String>,
     },
 }
@@ -608,9 +609,9 @@ fn auto_switch_login_account(
 ) -> Option<StoredAccount> {
     match result {
         AutoSwitchResult::Switched { to, .. } => Some(*to),
-        AutoSwitchResult::ActiveKept { account, .. } => match mode {
+        AutoSwitchResult::CurrentKept { account, .. } => match mode {
             AutoSwitchLoginMode::SwitchedOnly => None,
-            AutoSwitchLoginMode::EnsureActiveLogged {
+            AutoSwitchLoginMode::EnsureCurrentLogged {
                 app_server_account_id,
             } => {
                 if app_server_account_id.as_deref() == Some(account.id.as_str()) {
@@ -620,12 +621,13 @@ fn auto_switch_login_account(
                 }
             }
         },
-        AutoSwitchResult::ActiveUnsupported { .. } => None,
+        AutoSwitchResult::CurrentUnsupported { .. } => None,
     }
 }
 
-async fn prepare_active_account_login_command() -> Option<RuntimeCommand> {
-    let account = store::get_active_account().ok().flatten()?;
+async fn prepare_current_account_login_command() -> Option<RuntimeCommand> {
+    let store = store::load_accounts().ok()?;
+    let account = auth_json::current_stored_account(&store).ok().flatten()?;
     if !matches!(account.auth_data, AuthData::ChatGPT { .. }) {
         return None;
     }
@@ -660,78 +662,71 @@ async fn sleep_until_shutdown(duration: Duration, shutdown: &mut watch::Receiver
     }
 }
 
-async fn run_active_account_watcher(
+async fn run_current_account_watcher(
     background_requests: mpsc::Sender<BackgroundRuntimeRequest>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let mut last_snapshot = active_account_snapshot().ok();
+    let mut last_snapshot = current_account_snapshot().ok();
 
     loop {
         if sleep_until_shutdown(ACTIVE_ACCOUNT_WATCH_INTERVAL, &mut shutdown).await {
             return;
         }
 
-        let Ok(current_snapshot) = active_account_snapshot() else {
+        let Ok(current_snapshot) = current_account_snapshot() else {
             continue;
         };
-        match handle_active_account_snapshot_change(
+        match handle_current_account_snapshot_change(
             &background_requests,
             &mut last_snapshot,
             current_snapshot,
         ) {
-            ActiveAccountWatchStatus::Unchanged
-            | ActiveAccountWatchStatus::Queued
-            | ActiveAccountWatchStatus::Full => {}
-            ActiveAccountWatchStatus::Closed => return,
+            CurrentAccountWatchStatus::Unchanged
+            | CurrentAccountWatchStatus::Queued
+            | CurrentAccountWatchStatus::Full => {}
+            CurrentAccountWatchStatus::Closed => return,
         }
     }
 }
 
-fn handle_active_account_snapshot_change(
+fn handle_current_account_snapshot_change(
     background_requests: &mpsc::Sender<BackgroundRuntimeRequest>,
-    last_snapshot: &mut Option<ActiveAccountSnapshot>,
-    current_snapshot: ActiveAccountSnapshot,
-) -> ActiveAccountWatchStatus {
+    last_snapshot: &mut Option<CurrentAccountSnapshot>,
+    current_snapshot: CurrentAccountSnapshot,
+) -> CurrentAccountWatchStatus {
     if Some(current_snapshot.clone()) == *last_snapshot {
-        return ActiveAccountWatchStatus::Unchanged;
+        return CurrentAccountWatchStatus::Unchanged;
     }
 
-    match background_requests.try_send(BackgroundRuntimeRequest::PrepareActiveAccountLogin) {
+    match background_requests.try_send(BackgroundRuntimeRequest::PrepareCurrentAccountLogin) {
         Ok(()) => {
             *last_snapshot = Some(current_snapshot);
-            ActiveAccountWatchStatus::Queued
+            CurrentAccountWatchStatus::Queued
         }
-        Err(mpsc::error::TrySendError::Full(_)) => ActiveAccountWatchStatus::Full,
-        Err(mpsc::error::TrySendError::Closed(_)) => ActiveAccountWatchStatus::Closed,
+        Err(mpsc::error::TrySendError::Full(_)) => CurrentAccountWatchStatus::Full,
+        Err(mpsc::error::TrySendError::Closed(_)) => CurrentAccountWatchStatus::Closed,
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ActiveAccountSnapshot {
-    active_account_id: Option<String>,
+struct CurrentAccountSnapshot {
+    current_account_id: Option<String>,
     auth_marker: Option<String>,
 }
 
-fn active_account_snapshot() -> Result<ActiveAccountSnapshot> {
+fn current_account_snapshot() -> Result<CurrentAccountSnapshot> {
     let store = store::load_accounts()?;
-    let active_account_id = store.active_account_id.clone();
-    let auth_marker = active_account_id
-        .as_deref()
-        .and_then(|active_id| {
-            store
-                .accounts
-                .iter()
-                .find(|account| account.id == active_id)
-        })
-        .map(active_account_auth_marker);
+    let current_account = auth_json::current_stored_account(&store)?;
+    let current_account_id = current_account.as_ref().map(|account| account.id.clone());
+    let auth_marker = current_account.as_ref().map(current_account_auth_marker);
 
-    Ok(ActiveAccountSnapshot {
-        active_account_id,
+    Ok(CurrentAccountSnapshot {
+        current_account_id,
         auth_marker,
     })
 }
 
-fn active_account_auth_marker(account: &StoredAccount) -> String {
+fn current_account_auth_marker(account: &StoredAccount) -> String {
     let last_used_at = account
         .last_used_at
         .map(|value| value.timestamp_millis())
@@ -895,7 +890,7 @@ impl ProxyState {
     ) -> Result<()> {
         if let Some(prepared) = serialized_auto_switch_prepared_login(
             &self.runtime_auto_switch_coordinator,
-            AutoSwitchLoginMode::EnsureActiveLogged {
+            AutoSwitchLoginMode::EnsureCurrentLogged {
                 app_server_account_id: self.app_server_account_id.clone(),
             },
         )
@@ -912,7 +907,7 @@ impl ProxyState {
         app_server_write: &mut SplitSink<WsStream, Message>,
         prepared: PreparedAccountLogin,
     ) -> Result<()> {
-        if !active_account_id_matches(&prepared.account_id)? {
+        if !current_account_id_matches(&prepared.account_id)? {
             return Ok(());
         }
         if self.app_server_account_id.as_deref() == Some(prepared.account_id.as_str())
@@ -1304,15 +1299,9 @@ fn find_refresh_account(previous_account_id: Option<&str>) -> Result<StoredAccou
             });
     }
 
-    let active_id = store.active_account_id.as_deref();
-    store
-        .accounts
-        .into_iter()
-        .find(|account| {
-            Some(account.id.as_str()) == active_id
-                && matches!(account.auth_data, AuthData::ChatGPT { .. })
-        })
-        .context("No active ChatGPT account available for auth refresh")
+    auth_json::current_stored_account(&store)?
+        .filter(|account| matches!(account.auth_data, AuthData::ChatGPT { .. }))
+        .context("No current ChatGPT account available for auth refresh")
 }
 
 fn chatgpt_account_id(account: &StoredAccount) -> Option<String> {
@@ -1322,8 +1311,10 @@ fn chatgpt_account_id(account: &StoredAccount) -> Option<String> {
     }
 }
 
-fn active_account_id_matches(account_id: &str) -> Result<bool> {
-    Ok(store::load_accounts()?.active_account_id.as_deref() == Some(account_id))
+fn current_account_id_matches(account_id: &str) -> Result<bool> {
+    let store = store::load_accounts()?;
+    Ok(auth_json::current_stored_account_best_effort(&store)
+        .is_some_and(|account| account.id == account_id))
 }
 
 struct PreparedAccountLogin {
@@ -1439,10 +1430,10 @@ mod tests {
     use tokio::time::{Instant, timeout};
 
     use super::{
-        ActiveAccountSnapshot, ActiveAccountWatchStatus, BackgroundAutoSwitchQueueStatus,
-        BackgroundRuntimeRequest, RateLimitAutoSwitchTrigger, classify_rate_limit_notification,
+        BackgroundAutoSwitchQueueStatus, BackgroundRuntimeRequest, CurrentAccountSnapshot,
+        CurrentAccountWatchStatus, RateLimitAutoSwitchTrigger, classify_rate_limit_notification,
         codex_args_with_default_cwd, finish_background_auto_switch,
-        handle_active_account_snapshot_change, has_cwd_arg, initialize_app_server_request,
+        handle_current_account_snapshot_change, has_cwd_arg, initialize_app_server_request,
         queue_background_auto_switch, random_duration_between,
         run_serialized_auto_switch_operation, shared_runtime_auto_switch_coordinator,
         usage_limit_error_requires_switch, validate_remote_capable_codex_args,
@@ -1697,7 +1688,7 @@ mod tests {
         let coordinator = shared_runtime_auto_switch_coordinator();
         let now = Instant::now();
         sender
-            .try_send(BackgroundRuntimeRequest::PrepareActiveAccountLogin)
+            .try_send(BackgroundRuntimeRequest::PrepareCurrentAccountLogin)
             .expect("test queue has room for the first request");
 
         assert_eq!(
@@ -1727,41 +1718,41 @@ mod tests {
     }
 
     #[test]
-    fn active_account_watcher_advances_snapshot_only_after_queueing_sync() {
+    fn current_account_watcher_advances_snapshot_only_after_queueing_sync() {
         let (sender, mut receiver) = mpsc::channel(1);
-        let current_snapshot = active_snapshot("account-a");
+        let current_snapshot = current_snapshot("account-a");
         let mut last_snapshot = None;
 
-        let status = handle_active_account_snapshot_change(
+        let status = handle_current_account_snapshot_change(
             &sender,
             &mut last_snapshot,
             current_snapshot.clone(),
         );
 
-        assert_eq!(status, ActiveAccountWatchStatus::Queued);
+        assert_eq!(status, CurrentAccountWatchStatus::Queued);
         assert_eq!(last_snapshot, Some(current_snapshot));
         assert!(matches!(
             receiver.try_recv(),
-            Ok(BackgroundRuntimeRequest::PrepareActiveAccountLogin)
+            Ok(BackgroundRuntimeRequest::PrepareCurrentAccountLogin)
         ));
     }
 
     #[test]
-    fn active_account_watcher_retries_when_sync_queue_is_full() {
+    fn current_account_watcher_retries_when_sync_queue_is_full() {
         let (sender, _receiver) = mpsc::channel(1);
         sender
-            .try_send(BackgroundRuntimeRequest::PrepareActiveAccountLogin)
+            .try_send(BackgroundRuntimeRequest::PrepareCurrentAccountLogin)
             .expect("test queue has capacity for first command");
-        let current_snapshot = active_snapshot("account-a");
+        let current_snapshot = current_snapshot("account-a");
         let mut last_snapshot = None;
 
-        let status = handle_active_account_snapshot_change(
+        let status = handle_current_account_snapshot_change(
             &sender,
             &mut last_snapshot,
             current_snapshot.clone(),
         );
 
-        assert_eq!(status, ActiveAccountWatchStatus::Full);
+        assert_eq!(status, CurrentAccountWatchStatus::Full);
         assert_eq!(last_snapshot, None);
     }
 
@@ -1821,9 +1812,9 @@ mod tests {
         );
     }
 
-    fn active_snapshot(account_id: &str) -> ActiveAccountSnapshot {
-        ActiveAccountSnapshot {
-            active_account_id: Some(account_id.to_string()),
+    fn current_snapshot(account_id: &str) -> CurrentAccountSnapshot {
+        CurrentAccountSnapshot {
+            current_account_id: Some(account_id.to_string()),
             auth_marker: Some(format!("chatgpt:{account_id}:1:1")),
         }
     }

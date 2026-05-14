@@ -176,6 +176,16 @@ pub fn find_duplicate_account(account: &StoredAccount) -> Result<Option<StoredAc
         .find(|existing| has_same_auth_identity(existing, account)))
 }
 
+pub fn find_matching_account<'a>(
+    store: &'a AccountsStore,
+    account: &StoredAccount,
+) -> Option<&'a StoredAccount> {
+    store
+        .accounts
+        .iter()
+        .find(|existing| has_same_auth_identity(existing, account))
+}
+
 fn has_same_auth_identity(left: &StoredAccount, right: &StoredAccount) -> bool {
     match (&left.auth_data, &right.auth_data) {
         (AuthData::ApiKey { key: left_key }, AuthData::ApiKey { key: right_key }) => {
@@ -264,33 +274,6 @@ pub fn get_account_by_selector(selector: &str) -> Result<StoredAccount> {
         .context("Account not found after resolving selector")
 }
 
-pub fn get_active_account() -> Result<Option<StoredAccount>> {
-    let store = load_accounts()?;
-    let Some(active_id) = store.active_account_id else {
-        return Ok(None);
-    };
-
-    Ok(store
-        .accounts
-        .into_iter()
-        .find(|account| account.id == active_id))
-}
-
-pub fn set_active_account(account_id: &str) -> Result<()> {
-    let mut store = load_accounts()?;
-
-    if !store
-        .accounts
-        .iter()
-        .any(|account| account.id == account_id)
-    {
-        anyhow::bail!("Account not found: {account_id}");
-    }
-
-    store.active_account_id = Some(account_id.to_string());
-    save_accounts(&store)
-}
-
 pub fn touch_account(account_id: &str) -> Result<()> {
     let mut store = load_accounts()?;
 
@@ -315,10 +298,6 @@ pub fn remove_account_by_selector(selector: &str) -> Result<StoredAccount> {
         .position(|account| account.id == account_id)
         .context("Account not found after resolving selector")?;
     let removed = store.accounts.remove(index);
-
-    if store.active_account_id.as_deref() == Some(&removed.id) {
-        store.active_account_id = None;
-    }
 
     save_accounts(&store)?;
     Ok(removed)

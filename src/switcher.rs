@@ -25,7 +25,6 @@ pub async fn switch_to_account_unchecked(selector: &str) -> Result<StoredAccount
 
     let account = token::ensure_chatgpt_tokens_fresh(&account).await?;
     auth_json::write_account_auth(&account)?;
-    store::set_active_account(&account.id)?;
     store::touch_account(&account.id)?;
 
     store::get_account_by_selector(&account.id)

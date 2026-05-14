@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use chrono::Utc;
 
-use crate::store::{write_new_private_file, write_private_file};
+use crate::store::{self, write_new_private_file, write_private_file};
 use crate::types::{
-    AuthData, AuthDotJson, NewChatGptAccount, StoredAccount, TokenData,
+    AccountsStore, AuthData, AuthDotJson, NewChatGptAccount, StoredAccount, TokenData,
     parse_chatgpt_id_token_claims,
 };
 
@@ -54,6 +54,39 @@ pub fn import_from_auth_json(path: &Path, account_name: String) -> Result<Stored
         .with_context(|| format!("Failed to read auth.json: {}", path.display()))?;
     import_from_auth_json_contents(&content, account_name)
         .with_context(|| format!("Failed to parse auth.json: {}", path.display()))
+}
+
+pub fn current_auth_account() -> Result<Option<StoredAccount>> {
+    let path = codex_auth_file()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read auth.json: {}", path.display()))?;
+    import_from_auth_json_contents(&content, "current-auth".to_string())
+        .map(Some)
+        .with_context(|| format!("Failed to parse auth.json: {}", path.display()))
+}
+
+pub fn current_stored_account(store: &AccountsStore) -> Result<Option<StoredAccount>> {
+    let Some(current_auth_account) = current_auth_account()? else {
+        return Ok(None);
+    };
+
+    Ok(store::find_matching_account(store, &current_auth_account).cloned())
+}
+
+pub fn current_stored_account_best_effort(store: &AccountsStore) -> Option<StoredAccount> {
+    current_stored_account(store).ok().flatten()
+}
+
+pub fn current_stored_account_id(store: &AccountsStore) -> Result<Option<String>> {
+    Ok(current_stored_account(store)?.map(|account| account.id))
+}
+
+pub fn current_stored_account_id_best_effort(store: &AccountsStore) -> Option<String> {
+    current_stored_account_best_effort(store).map(|account| account.id)
 }
 
 fn import_from_auth_json_contents(content: &str, account_name: String) -> Result<StoredAccount> {

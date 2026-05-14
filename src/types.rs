@@ -46,7 +46,6 @@ impl From<&str> for RedactedString {
 pub struct AccountsStore {
     pub version: u32,
     pub accounts: Vec<StoredAccount>,
-    pub active_account_id: Option<String>,
     #[serde(default)]
     pub masked_account_ids: Vec<String>,
 }
@@ -56,7 +55,6 @@ impl Default for AccountsStore {
         Self {
             version: 1,
             accounts: Vec::new(),
-            active_account_id: None,
             masked_account_ids: Vec::new(),
         }
     }
@@ -566,7 +564,6 @@ mod tests {
         let store = AccountsStore {
             version: 1,
             accounts: vec![api_account, chatgpt_account],
-            active_account_id: None,
             masked_account_ids: Vec::new(),
         };
         let auth_json = AuthDotJson {
@@ -612,5 +609,27 @@ mod tests {
         assert_eq!(decoded_tokens.id_token.expose_secret(), id_secret);
         assert_eq!(decoded_tokens.access_token.expose_secret(), access_secret);
         assert_eq!(decoded_tokens.refresh_token.expose_secret(), refresh_secret);
+    }
+
+    #[test]
+    fn accounts_store_does_not_serialize_active_account_id() {
+        let store = AccountsStore::default();
+        let value = serde_json::to_value(&store).expect("serialize accounts store");
+
+        assert!(value.get("active_account_id").is_none());
+    }
+
+    #[test]
+    fn accounts_store_ignores_legacy_active_account_id() {
+        let store: AccountsStore = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "accounts": [],
+            "active_account_id": "legacy-account-id",
+            "masked_account_ids": []
+        }))
+        .expect("deserialize accounts store");
+
+        assert!(store.accounts.is_empty());
+        assert!(store.masked_account_ids.is_empty());
     }
 }

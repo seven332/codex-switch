@@ -1,6 +1,7 @@
 use anyhow::Result;
 
 use crate::account_selector::{self, AccountUsageCandidate, SelectionConfig};
+use crate::auth_json;
 use crate::process;
 use crate::store;
 use crate::switcher;
@@ -11,11 +12,11 @@ const HARD_USAGE_LIMIT_PERCENT: f64 = 100.0;
 
 #[derive(Debug)]
 pub enum AutoSwitchResult {
-    ActiveKept {
+    CurrentKept {
         account: Box<StoredAccount>,
         reason: String,
     },
-    ActiveUnsupported {
+    CurrentUnsupported {
         account: Box<StoredAccount>,
         reason: String,
     },
@@ -53,28 +54,19 @@ async fn auto_switch_inner(allow_running: bool) -> Result<AutoSwitchResult> {
         anyhow::bail!("No accounts stored.");
     }
 
-    let active = store
-        .active_account_id
-        .as_deref()
-        .and_then(|active_id| {
-            store
-                .accounts
-                .iter()
-                .find(|account| account.id == active_id)
-        })
-        .cloned();
+    let current = auth_json::current_stored_account_best_effort(&store);
 
-    let active_id = active.as_ref().map(|account| account.id.as_str());
+    let current_id = current.as_ref().map(|account| account.id.as_str());
     let mut evaluations = Vec::with_capacity(store.accounts.len());
-    let mut active_decision = None;
+    let mut current_decision = None;
     let mut skipped = Vec::new();
 
     for account in &store.accounts {
-        let is_active = Some(account.id.as_str()) == active_id;
+        let is_current = Some(account.id.as_str()) == current_id;
         let info = match usage::get_account_usage(account).await {
             Ok(info) => info,
             Err(err) => {
-                if is_active {
+                if is_current {
                     anyhow::bail!("Failed to get usage for {}: {err}", account.name);
                 }
                 skipped.push(format!("{}: {err}", account.name));
@@ -83,18 +75,18 @@ async fn auto_switch_inner(allow_running: bool) -> Result<AutoSwitchResult> {
         };
 
         let decision = assess_usage(&info);
-        if is_active {
-            active_decision = Some(decision.clone());
+        if is_current {
+            current_decision = Some(decision.clone());
             match &decision {
                 UsageDecision::Unsupported(reason) => {
-                    return Ok(AutoSwitchResult::ActiveUnsupported {
+                    return Ok(AutoSwitchResult::CurrentUnsupported {
                         account: Box::new(account.clone()),
                         reason: reason.clone(),
                     });
                 }
                 UsageDecision::Error(reason) => {
                     anyhow::bail!(
-                        "Could not evaluate active account {}: {reason}",
+                        "Could not evaluate current account {}: {reason}",
                         account.name
                     );
                 }
@@ -116,24 +108,24 @@ async fn auto_switch_inner(allow_running: bool) -> Result<AutoSwitchResult> {
 
     if let Some(selection) = select_usable_account_by_policy(&evaluations) {
         let selected_account = selection.account;
-        if Some(selected_account.id.as_str()) == active_id {
-            let reason = match active_decision {
+        if Some(selected_account.id.as_str()) == current_id {
+            let reason = match current_decision {
                 Some(UsageDecision::Usable(reason)) => reason,
-                _ => "usage policy kept active account".to_string(),
+                _ => "usage policy kept current account".to_string(),
             };
-            return Ok(AutoSwitchResult::ActiveKept {
+            return Ok(AutoSwitchResult::CurrentKept {
                 account: Box::new(selected_account.clone()),
                 reason,
             });
         }
 
-        let switch_reason = match active_decision {
+        let switch_reason = match current_decision {
             Some(UsageDecision::Unavailable(reason)) => reason,
             Some(UsageDecision::Usable(_)) => format!(
                 "usage policy selected an account with better quota headroom ({:.1} bottleneck score)",
                 selection.metrics.bottleneck_headroom
             ),
-            None => "no active account".to_string(),
+            None => "no current account".to_string(),
             Some(UsageDecision::Unsupported(reason) | UsageDecision::Error(reason)) => reason,
         };
         let switched = if allow_running {
@@ -142,27 +134,28 @@ async fn auto_switch_inner(allow_running: bool) -> Result<AutoSwitchResult> {
             switcher::switch_to_account(&selected_account.id).await?
         };
         return Ok(AutoSwitchResult::Switched {
-            from: active.map(Box::new),
+            from: current.map(Box::new),
             to: Box::new(switched),
             reason: switch_reason,
         });
     }
 
-    if let (Some(account), Some(UsageDecision::Usable(reason))) = (&active, active_decision.clone())
+    if let (Some(account), Some(UsageDecision::Usable(reason))) =
+        (&current, current_decision.clone())
     {
-        return Ok(AutoSwitchResult::ActiveKept {
+        return Ok(AutoSwitchResult::CurrentKept {
             account: Box::new(account.clone()),
             reason,
         });
     }
 
-    let mut switch_reason = match active_decision {
+    let mut switch_reason = match current_decision {
         Some(UsageDecision::Unavailable(reason)) => reason,
         Some(UsageDecision::Usable(_)) => {
-            "active account is usable, but usage policy found no selectable account".to_string()
+            "current account is usable, but usage policy found no selectable account".to_string()
         }
         Some(UsageDecision::Unsupported(reason) | UsageDecision::Error(reason)) => reason,
-        None => "no active account".to_string(),
+        None => "no current account".to_string(),
     };
 
     if let Some(detail) = skipped.first() {
