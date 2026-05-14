@@ -10,6 +10,8 @@ const SHADOW_PRICE_EPSILON: f64 = 0.01;
 const SHADOW_PRICE_MIN_RESET_FACTOR: f64 = 0.02;
 const SHADOW_PRICE_RESET_EXPONENT: f64 = 1.5;
 const SHADOW_PRICE_IMMEDIATE_RISK_WEIGHT: f64 = 0.15;
+const RESET_WEIGHTED_MINIMAX_MIN_RESET_FACTOR: f64 = 0.1;
+const RESET_WEIGHTED_MINIMAX_RESET_EXPONENT: f64 = 1.25;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SelectionConfig {
@@ -33,6 +35,7 @@ pub enum SelectionPolicyKind {
     #[default]
     DeadlineAware,
     ShadowPrice,
+    ResetWeightedMinimax,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -175,6 +178,44 @@ impl AccountSelectionPolicy for ShadowPricePolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ResetWeightedMinimaxPolicy {
+    pub config: SelectionConfig,
+}
+
+impl ResetWeightedMinimaxPolicy {
+    pub fn new(config: SelectionConfig) -> Self {
+        Self {
+            config: SelectionConfig {
+                policy: SelectionPolicyKind::ResetWeightedMinimax,
+                ..config
+            },
+        }
+    }
+}
+
+impl Default for ResetWeightedMinimaxPolicy {
+    fn default() -> Self {
+        Self::new(SelectionConfig::default())
+    }
+}
+
+impl AccountSelectionPolicy for ResetWeightedMinimaxPolicy {
+    fn select_account_at<'a>(
+        &mut self,
+        candidates: &[AccountUsageCandidate<'a>],
+        context: SelectionContext,
+    ) -> Option<AccountSelection<'a>> {
+        evaluated_candidates(candidates, self.config)
+            .into_iter()
+            .min_by(|left, right| compare_reset_weighted_minimax(left, right, context))
+            .map(|candidate| AccountSelection {
+                account: candidate.account,
+                metrics: candidate.metrics,
+            })
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Default)]
 pub struct DrainFirstPolicy {
@@ -310,10 +351,16 @@ pub fn select_account<'a>(
 ) -> Option<AccountSelection<'a>> {
     // Keep the runtime default on the proven policy until simulations show a
     // clear user-unavailable-time improvement from a replacement policy.
-    if config.policy == SelectionPolicyKind::ShadowPrice {
-        ShadowPricePolicy::new(config).select_account(candidates)
-    } else {
-        DeadlineAwarePolicy::new(config).select_account(candidates)
+    match config.policy {
+        SelectionPolicyKind::ShadowPrice => {
+            ShadowPricePolicy::new(config).select_account(candidates)
+        }
+        SelectionPolicyKind::ResetWeightedMinimax => {
+            ResetWeightedMinimaxPolicy::new(config).select_account(candidates)
+        }
+        SelectionPolicyKind::DeadlineAware => {
+            DeadlineAwarePolicy::new(config).select_account(candidates)
+        }
     }
 }
 
@@ -507,6 +554,79 @@ fn compare_shadow_price_score(
         })
 }
 
+fn compare_reset_weighted_minimax(
+    left: &EvaluatedCandidate<'_>,
+    right: &EvaluatedCandidate<'_>,
+    context: SelectionContext,
+) -> Ordering {
+    compare_bool_desc(
+        left.metrics.safe_for_reset_priority,
+        right.metrics.safe_for_reset_priority,
+    )
+    .then_with(|| {
+        if left.metrics.safe_for_reset_priority && right.metrics.safe_for_reset_priority {
+            compare_reset_weighted_minimax_score(left, right, context)
+                .then_with(|| compare_headroom_desc(left, right))
+        } else {
+            compare_headroom_desc(left, right)
+                .then_with(|| compare_reset_weighted_minimax_score(left, right, context))
+        }
+    })
+    .then_with(|| {
+        compare_optional_reset(
+            left.metrics.bottleneck_resets_at,
+            right.metrics.bottleneck_resets_at,
+        )
+    })
+    .then_with(|| compare_last_used(left.account.last_used_at, right.account.last_used_at))
+    .then_with(|| left.order.cmp(&right.order))
+}
+
+fn compare_reset_weighted_minimax_score(
+    left: &EvaluatedCandidate<'_>,
+    right: &EvaluatedCandidate<'_>,
+    context: SelectionContext,
+) -> Ordering {
+    reset_weighted_minimax_score(left, context)
+        .total_cmp(&reset_weighted_minimax_score(right, context))
+        .then_with(|| {
+            compare_optional_reset(
+                left.metrics.bottleneck_resets_at,
+                right.metrics.bottleneck_resets_at,
+            )
+        })
+}
+
+fn reset_weighted_minimax_score(
+    candidate: &EvaluatedCandidate<'_>,
+    context: SelectionContext,
+) -> f64 {
+    let bottleneck_risk = (1.0 - candidate.metrics.bottleneck_headroom / 100.0).clamp(0.0, 1.0);
+    let reset_factor = reset_weighted_minimax_reset_factor(
+        candidate.metrics.bottleneck_resets_at,
+        bottleneck_window_minutes(candidate),
+        context,
+    );
+    bottleneck_risk * reset_factor
+}
+
+fn bottleneck_window_minutes(candidate: &EvaluatedCandidate<'_>) -> Option<i64> {
+    match candidate.metrics.bottleneck {
+        UsageWindow::FiveHour => candidate.usage.primary_window_minutes,
+        UsageWindow::Weekly => candidate.usage.secondary_window_minutes,
+    }
+}
+
+fn reset_weighted_minimax_reset_factor(
+    resets_at: Option<i64>,
+    window_minutes: Option<i64>,
+    context: SelectionContext,
+) -> f64 {
+    reset_delay_ratio(resets_at, window_minutes, context)
+        .powf(RESET_WEIGHTED_MINIMAX_RESET_EXPONENT)
+        .clamp(RESET_WEIGHTED_MINIMAX_MIN_RESET_FACTOR, 1.0)
+}
+
 fn shadow_price_score(
     candidate: &EvaluatedCandidate<'_>,
     config: SelectionConfig,
@@ -559,6 +679,16 @@ fn shadow_reset_factor(
     window_minutes: Option<i64>,
     context: SelectionContext,
 ) -> f64 {
+    reset_delay_ratio(resets_at, window_minutes, context)
+        .powf(SHADOW_PRICE_RESET_EXPONENT)
+        .clamp(SHADOW_PRICE_MIN_RESET_FACTOR, 1.0)
+}
+
+fn reset_delay_ratio(
+    resets_at: Option<i64>,
+    window_minutes: Option<i64>,
+    context: SelectionContext,
+) -> f64 {
     let (Some(resets_at), Some(window_minutes)) = (resets_at, window_minutes) else {
         return 1.0;
     };
@@ -574,10 +704,7 @@ fn shadow_reset_factor(
     }
 
     let reset_delay = resets_at.saturating_sub(context.now).max(0);
-    let normalized_delay = (reset_delay as f64 / window_seconds as f64).clamp(0.0, 1.0);
-    normalized_delay
-        .powf(SHADOW_PRICE_RESET_EXPONENT)
-        .clamp(SHADOW_PRICE_MIN_RESET_FACTOR, 1.0)
+    (reset_delay as f64 / window_seconds as f64).clamp(0.0, 1.0)
 }
 
 fn compare_bool_desc(left: bool, right: bool) -> Ordering {
@@ -623,8 +750,8 @@ mod tests {
 
     use super::{
         AccountSelectionPolicy, AccountUsageCandidate, DeadlineAwarePolicy, DrainFirstPolicy,
-        MaxHeadroomPolicy, ResetFirstPolicy, SelectionConfig, SelectionContext,
-        SelectionPolicyKind, ShadowPricePolicy, UsageWindow, select_account,
+        MaxHeadroomPolicy, ResetFirstPolicy, ResetWeightedMinimaxPolicy, SelectionConfig,
+        SelectionContext, SelectionPolicyKind, ShadowPricePolicy, UsageWindow, select_account,
     };
     use crate::types::{AuthData, AuthMode, StoredAccount, UsageInfo};
 
@@ -930,6 +1057,55 @@ mod tests {
     }
 
     #[test]
+    fn reset_weighted_minimax_prefers_earlier_reset_when_risk_matches() {
+        let soon = chatgpt_account("soon", None);
+        let later = chatgpt_account("later", None);
+        let soon_info = usage_info("soon", 50.0, 50.0, 60, 604_800);
+        let later_info = usage_info("later", 50.0, 50.0, 18_000, 604_800);
+        let candidates = [candidate(&later, &later_info), candidate(&soon, &soon_info)];
+
+        let selection = ResetWeightedMinimaxPolicy::default()
+            .select_account_at(&candidates, SelectionContext::at(0))
+            .expect("usable account should be selected");
+
+        assert_eq!(selection.account.id, "soon");
+    }
+
+    #[test]
+    fn reset_weighted_minimax_protects_headroom_below_safe_threshold() {
+        let soon = chatgpt_account("soon", None);
+        let safer = chatgpt_account("safer", None);
+        let soon_info = usage_info("soon", 99.0, 10.0, 60, 604_800);
+        let safer_info = usage_info("safer", 96.0, 10.0, 18_000, 604_800);
+        let candidates = [candidate(&soon, &soon_info), candidate(&safer, &safer_info)];
+
+        let selection = ResetWeightedMinimaxPolicy::default()
+            .select_account_at(&candidates, SelectionContext::at(0))
+            .expect("usable account should be selected");
+
+        assert_eq!(selection.account.id, "safer");
+    }
+
+    #[test]
+    fn selection_config_can_select_reset_weighted_minimax_policy() {
+        let soon = chatgpt_account("soon", None);
+        let later = chatgpt_account("later", None);
+        let now = Utc::now().timestamp();
+        let soon_info = usage_info("soon", 50.0, 50.0, now + 60, now + 604_800);
+        let later_info = usage_info("later", 50.0, 50.0, now + 18_000, now + 604_800);
+        let candidates = [candidate(&later, &later_info), candidate(&soon, &soon_info)];
+        let config = SelectionConfig {
+            policy: SelectionPolicyKind::ResetWeightedMinimax,
+            ..SelectionConfig::default()
+        };
+
+        let selection =
+            select_account(&candidates, config).expect("usable account should be selected");
+
+        assert_eq!(selection.account.id, "soon");
+    }
+
+    #[test]
     fn simulator_finds_deadline_aware_policy_sustainable_burn_near_weekly_capacity() {
         let max_burn = max_sustainable_burn_for_policy(2, DeadlineAwarePolicy::default);
         let theoretical_weekly_max =
@@ -1023,6 +1199,10 @@ mod tests {
                 .iter()
                 .find(|stats| stats.policy_name == "shadow-price")
                 .expect("shadow-price stats should be present");
+            let reset_weighted_minimax = policy_stats
+                .iter()
+                .find(|stats| stats.policy_name == "reset-weighted-minimax")
+                .expect("reset-weighted-minimax stats should be present");
 
             for stats in &policy_stats {
                 assert!(
@@ -1055,6 +1235,12 @@ mod tests {
                 shadow_price.stats.user_unavailable_minutes()
                     <= deadline_aware.stats.user_unavailable_minutes(),
                 "shadow-price should not increase unavailable time vs deadline-aware in {}: {policy_stats:?}",
+                scenario.name
+            );
+            assert!(
+                reset_weighted_minimax.stats.user_unavailable_minutes()
+                    <= shadow_price.stats.user_unavailable_minutes(),
+                "reset-weighted-minimax should not increase unavailable time vs shadow-price in {}: {policy_stats:?}",
                 scenario.name
             );
         }
@@ -1210,6 +1396,10 @@ mod tests {
                 "shadow-price",
                 simulate_policy_trace(&mut ShadowPricePolicy::default(), &trace, limits),
             ),
+            (
+                "reset-weighted-minimax",
+                simulate_policy_trace(&mut ResetWeightedMinimaxPolicy::default(), &trace, limits),
+            ),
         ];
 
         for (policy_name, outcome) in policy_outcomes {
@@ -1264,6 +1454,58 @@ mod tests {
             f64::from(shadow_price_failed_credits)
                 <= f64::from(deadline_aware_failed_credits) * 1.01,
             "shadow-price failed credits should stay within 1% of deadline-aware: {shadow_price_failed_credits} vs {deadline_aware_failed_credits}",
+        );
+    }
+
+    #[test]
+    fn generated_trace_suite_keeps_reset_weighted_minimax_best_overall() {
+        let mut deadline_aware_unavailable = 0;
+        let mut shadow_price_unavailable = 0;
+        let mut reset_weighted_minimax_unavailable = 0;
+        let mut deadline_aware_failed_credits = 0;
+        let mut reset_weighted_minimax_failed_credits = 0;
+        let mut evaluated_traces = 0;
+        let mut reset_weighted_minimax_regressions = 0;
+
+        for seed in 1_u64..=32 {
+            let limits = generated_trace_limits(seed);
+            let trace = generated_trace(seed);
+            let deadline_aware =
+                simulate_policy_trace(&mut DeadlineAwarePolicy::default(), &trace, limits);
+            let shadow_price =
+                simulate_policy_trace(&mut ShadowPricePolicy::default(), &trace, limits);
+            let reset_weighted_minimax =
+                simulate_policy_trace(&mut ResetWeightedMinimaxPolicy::default(), &trace, limits);
+
+            deadline_aware_unavailable += deadline_aware.user_unavailable_minutes();
+            shadow_price_unavailable += shadow_price.user_unavailable_minutes();
+            reset_weighted_minimax_unavailable += reset_weighted_minimax.user_unavailable_minutes();
+            deadline_aware_failed_credits += deadline_aware.failed_credits;
+            reset_weighted_minimax_failed_credits += reset_weighted_minimax.failed_credits;
+            evaluated_traces += 1;
+            if reset_weighted_minimax.user_unavailable_minutes()
+                > deadline_aware.user_unavailable_minutes()
+            {
+                reset_weighted_minimax_regressions += 1;
+            }
+        }
+
+        assert_eq!(evaluated_traces, 32);
+        assert!(
+            reset_weighted_minimax_regressions < evaluated_traces,
+            "reset-weighted-minimax should not regress every generated trace",
+        );
+        assert!(
+            reset_weighted_minimax_unavailable < shadow_price_unavailable,
+            "reset-weighted-minimax aggregate unavailable time should improve over shadow-price: {reset_weighted_minimax_unavailable} vs {shadow_price_unavailable}",
+        );
+        assert!(
+            reset_weighted_minimax_unavailable < deadline_aware_unavailable,
+            "reset-weighted-minimax aggregate unavailable time should improve over deadline-aware: {reset_weighted_minimax_unavailable} vs {deadline_aware_unavailable}",
+        );
+        assert!(
+            reset_weighted_minimax_failed_credits <= deadline_aware_failed_credits,
+            "reset-weighted-minimax failed credits should not exceed deadline-aware: {reset_weighted_minimax_failed_credits} vs {deadline_aware_failed_credits}",
         );
     }
 
@@ -1592,12 +1834,13 @@ mod tests {
         ]
     }
 
-    fn policy_stats_for_scenario(scenario: SimScenario) -> [PolicyStats; 5] {
+    fn policy_stats_for_scenario(scenario: SimScenario) -> [PolicyStats; 6] {
         let mut deadline_aware = DeadlineAwarePolicy::default();
         let mut drain_first = DrainFirstPolicy::new(SelectionConfig::default());
         let mut max_headroom = MaxHeadroomPolicy::new(SelectionConfig::default());
         let mut reset_first = ResetFirstPolicy::new(SelectionConfig::default());
         let mut shadow_price = ShadowPricePolicy::default();
+        let mut reset_weighted_minimax = ResetWeightedMinimaxPolicy::default();
 
         [
             PolicyStats {
@@ -1619,6 +1862,10 @@ mod tests {
             PolicyStats {
                 policy_name: "shadow-price",
                 stats: simulate_policy_scenario(&mut shadow_price, scenario),
+            },
+            PolicyStats {
+                policy_name: "reset-weighted-minimax",
+                stats: simulate_policy_scenario(&mut reset_weighted_minimax, scenario),
             },
         ]
     }
