@@ -47,7 +47,7 @@ pub enum Command {
         /// Account name, full ID, or unique ID prefix.
         account: String,
     },
-    /// Switch to a usable account when the active account is out of usage.
+    /// Switch to a usable account when the current Codex auth account is out of usage.
     AutoSwitch,
     /// Run Codex with runtime account auto-switching.
     Run {
@@ -58,12 +58,12 @@ pub enum Command {
         #[arg(value_name = "CODEX_ARGS", num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true)]
         codex_args: Vec<String>,
     },
-    /// Show usage for one account, the active account, or all accounts.
+    /// Show usage for one account, the current Codex auth account, or all accounts.
     Usage {
         /// Query every stored account.
         #[arg(long, conflicts_with = "account")]
         all: bool,
-        /// Account name, full ID, or unique ID prefix. Defaults to active account.
+        /// Account name, full ID, or unique ID prefix. Defaults to the current Codex auth account.
         account: Option<String>,
     },
     /// Delete a stored account.

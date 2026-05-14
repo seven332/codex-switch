@@ -36,7 +36,8 @@ async fn run() -> Result<()> {
     match cli.command {
         Command::List => {
             let store = store::load_accounts()?;
-            print_accounts(&store);
+            let current_account_id = auth_json::current_stored_account_id_best_effort(&store);
+            print_accounts(&store, current_account_id.as_deref());
         }
         Command::Login { name, device_auth } => {
             store::ensure_name_available(&name)?;
@@ -131,11 +132,18 @@ async fn run() -> Result<()> {
                 print_all_usage().await?;
             } else {
                 let accounts_store = store::load_accounts()?;
-                let account = usage_account_from_store(&accounts_store, account.as_deref())?;
-                let is_active =
-                    accounts_store.active_account_id.as_deref() == Some(account.id.as_str());
+                let current_account_id = match account.as_deref() {
+                    Some(_) => auth_json::current_stored_account_id_best_effort(&accounts_store),
+                    None => auth_json::current_stored_account_id(&accounts_store)?,
+                };
+                let account = usage_account_from_store(
+                    &accounts_store,
+                    account.as_deref(),
+                    current_account_id.as_deref(),
+                )?;
+                let is_current = current_account_id.as_deref() == Some(account.id.as_str());
                 let info = usage::get_account_usage(&account).await?;
-                print_usage(&account, &info, is_active);
+                print_usage(&account, &info, is_current);
             }
         }
         Command::Delete { account } => {
@@ -162,6 +170,7 @@ async fn run() -> Result<()> {
 fn usage_account_from_store(
     accounts_store: &AccountsStore,
     selector: Option<&str>,
+    current_account_id: Option<&str>,
 ) -> Result<StoredAccount> {
     match selector {
         Some(selector) => {
@@ -173,35 +182,33 @@ fn usage_account_from_store(
                 .cloned()
                 .context("Account not found after resolving selector")
         }
-        None => accounts_store
-            .active_account_id
-            .as_deref()
-            .and_then(|active_id| {
+        None => current_account_id
+            .and_then(|current_account_id| {
                 accounts_store
                     .accounts
                     .iter()
-                    .find(|account| account.id == active_id)
+                    .find(|account| account.id == current_account_id)
             })
             .cloned()
             .context(
-                "No active account. Pass a name-or-id, or run codex-switch switch <name-or-id>.",
+                "No stored account matches current Codex auth.json. Pass a name-or-id, or run codex-switch import <name>.",
             ),
     }
 }
 
 fn print_auto_switch_result(result: auto_switch::AutoSwitchResult) {
     match result {
-        auto_switch::AutoSwitchResult::ActiveKept { account, reason } => {
+        auto_switch::AutoSwitchResult::CurrentKept { account, reason } => {
             println!(
-                "Active account is usable: {} ({}) - {}",
+                "Current account is usable: {} ({}) - {}",
                 account.name,
                 store::short_id(&account.id),
                 reason
             );
         }
-        auto_switch::AutoSwitchResult::ActiveUnsupported { account, reason } => {
+        auto_switch::AutoSwitchResult::CurrentUnsupported { account, reason } => {
             println!(
-                "Active account was not switched: {} ({}) - {}",
+                "Current account was not switched: {} ({}) - {}",
                 account.name,
                 store::short_id(&account.id),
                 reason
@@ -235,6 +242,7 @@ async fn print_all_usage() -> Result<()> {
         println!("No accounts stored.");
         return Ok(());
     }
+    let current_account_id = auth_json::current_stored_account_id_best_effort(&store);
 
     let results = usage::get_all_account_usage(&store.accounts).await;
     let by_id: HashMap<String, UsageInfo> = results
@@ -247,15 +255,15 @@ async fn print_all_usage() -> Result<()> {
             println!();
         }
         if let Some(info) = by_id.get(&account.id) {
-            let is_active = store.active_account_id.as_deref() == Some(account.id.as_str());
-            print_usage(account, info, is_active);
+            let is_current = current_account_id.as_deref() == Some(account.id.as_str());
+            print_usage(account, info, is_current);
         }
     }
 
     Ok(())
 }
 
-fn print_accounts(store: &AccountsStore) {
+fn print_accounts(store: &AccountsStore, current_account_id: Option<&str>) {
     if store.accounts.is_empty() {
         println!("No accounts stored.");
         return;
@@ -266,14 +274,14 @@ fn print_accounts(store: &AccountsStore) {
         "", "ID", "NAME", "EMAIL", "PLAN", "AUTH"
     );
     for account in &store.accounts {
-        let active = if store.active_account_id.as_deref() == Some(&account.id) {
+        let current_marker = if current_account_id == Some(account.id.as_str()) {
             "*"
         } else {
             ""
         };
         println!(
             "{:<3} {:<8} {:<22} {:<32} {:<10} {:<10} {}",
-            active,
+            current_marker,
             store::short_id(&account.id),
             account.name,
             account.email.as_deref().unwrap_or("-"),
@@ -284,8 +292,8 @@ fn print_accounts(store: &AccountsStore) {
     }
 }
 
-fn print_usage(account: &StoredAccount, info: &UsageInfo, is_active: bool) {
-    println!("{}", format_usage_account_header(account, is_active));
+fn print_usage(account: &StoredAccount, info: &UsageInfo, is_current: bool) {
+    println!("{}", format_usage_account_header(account, is_current));
 
     if matches!(info.error.as_deref(), Some("usage unsupported")) {
         println!("usage: unsupported");
@@ -317,8 +325,8 @@ fn print_usage(account: &StoredAccount, info: &UsageInfo, is_active: bool) {
     print_additional_limits(info);
 }
 
-fn format_usage_account_header(account: &StoredAccount, is_active: bool) -> String {
-    let marker = if is_active { "* " } else { "" };
+fn format_usage_account_header(account: &StoredAccount, is_current: bool) -> String {
+    let marker = if is_current { "* " } else { "" };
     format!(
         "{marker}{} ({})",
         account.name,
@@ -417,7 +425,7 @@ mod tests {
     use crate::types::{AccountsStore, StoredAccount};
 
     #[test]
-    fn usage_header_marks_active_account() {
+    fn usage_header_marks_current_account() {
         let account = StoredAccount::new_api_key("work".to_string(), "sk-test".to_string());
 
         assert_eq!(
@@ -427,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_header_leaves_inactive_account_unmarked() {
+    fn usage_header_leaves_non_current_account_unmarked() {
         let account = StoredAccount::new_api_key("work".to_string(), "sk-test".to_string());
 
         assert_eq!(
@@ -437,18 +445,33 @@ mod tests {
     }
 
     #[test]
-    fn usage_account_from_store_uses_active_account_without_reloading() {
+    fn usage_account_from_store_uses_current_auth_account() {
         let account = StoredAccount::new_api_key("work".to_string(), "sk-test".to_string());
         let accounts_store = AccountsStore {
             version: 1,
             accounts: vec![account.clone()],
-            active_account_id: Some(account.id.clone()),
             masked_account_ids: Vec::new(),
         };
 
-        let selected = usage_account_from_store(&accounts_store, None).expect("active account");
+        let selected = usage_account_from_store(&accounts_store, None, Some(&account.id))
+            .expect("current account");
 
         assert_eq!(selected.id, account.id);
+    }
+
+    #[test]
+    fn usage_account_from_store_requires_current_auth_account() {
+        let account = StoredAccount::new_api_key("work".to_string(), "sk-test".to_string());
+        let accounts_store = AccountsStore {
+            version: 1,
+            accounts: vec![account.clone()],
+            masked_account_ids: Vec::new(),
+        };
+
+        let err = usage_account_from_store(&accounts_store, None, None)
+            .expect_err("usage without current auth should fail");
+
+        assert!(err.to_string().contains("current Codex auth.json"));
     }
 
     #[test]
@@ -457,12 +480,11 @@ mod tests {
         let accounts_store = AccountsStore {
             version: 1,
             accounts: vec![account.clone()],
-            active_account_id: None,
             masked_account_ids: Vec::new(),
         };
 
-        let selected =
-            usage_account_from_store(&accounts_store, Some("work")).expect("selected account");
+        let selected = usage_account_from_store(&accounts_store, Some("work"), None)
+            .expect("selected account");
 
         assert_eq!(selected.id, account.id);
     }

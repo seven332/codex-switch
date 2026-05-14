@@ -110,7 +110,9 @@ async fn refresh_chatgpt_tokens_locked(account: &StoredAccount) -> Result<Stored
         .or(current_account_id);
     let token_last_refresh_at = Utc::now();
 
-    let is_active = store::load_accounts()?.active_account_id.as_deref() == Some(&account.id);
+    let accounts_store = store::load_accounts()?;
+    let is_current = auth_json::current_stored_account_best_effort(&accounts_store)
+        .is_some_and(|current_account| current_account.id == account.id);
     let updated = store::update_account_chatgpt_tokens(
         &account.id,
         store::ChatGptTokenUpdate {
@@ -129,7 +131,7 @@ async fn refresh_chatgpt_tokens_locked(account: &StoredAccount) -> Result<Stored
         },
     )?;
 
-    if is_active {
+    if is_current {
         auth_json::write_account_auth(&updated)?;
     }
 

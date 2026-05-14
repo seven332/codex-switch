@@ -47,7 +47,7 @@ On Unix, both files are written with `0600` permissions.
 
 `auto-switch` also refuses to switch while Codex is running. When Codex is not running, it checks stored ChatGPT OAuth accounts and switches to the account selected by the quota-aware policy. Accounts that are out of credits, rate-limited, usage-limited, or at 100% usage are not selectable. API key accounts are not usage-checkable and are skipped as replacement candidates.
 
-`run` is the runtime auto-switching entrypoint. It checks accounts before startup, starts `codex app-server`, launches Codex as a remote TUI through a local websocket proxy, and passes arguments after `--` to `codex`. During the managed session, the proxy watches Codex app-server `account/rateLimits/updated` notifications and usage-limit errors. It also performs best-effort background auto-switch checks every 15-45 minutes. Hard usage-limit signals trigger an immediate recovery attempt. Non-hard rate-limit updates only schedule a background re-check when the active account is near the shared 5% bottleneck headroom threshold, so normal updates do not block the TUI on usage API calls. If another shell runs `codex-switch switch <name-or-id>`, managed `run` sessions detect the active account change and hot-load it when the selected account is ChatGPT OAuth.
+`run` is the runtime auto-switching entrypoint. It checks accounts before startup, starts `codex app-server`, launches Codex as a remote TUI through a local websocket proxy, and passes arguments after `--` to `codex`. During the managed session, the proxy watches Codex app-server `account/rateLimits/updated` notifications and usage-limit errors. It also performs best-effort background auto-switch checks every 15-45 minutes. Hard usage-limit signals trigger an immediate recovery attempt. Non-hard rate-limit updates only schedule a background re-check when the current Codex auth account is near the shared 5% bottleneck headroom threshold, so normal updates do not block the TUI on usage API calls. If another shell runs `codex-switch switch <name-or-id>`, managed `run` sessions detect the current Codex auth account change and hot-load it when the selected account is ChatGPT OAuth.
 
 ```sh
 codex-switch run
@@ -60,7 +60,7 @@ codex-switch run -- resume <session-id>
 
 ## Login
 
-`login` uses ChatGPT/OpenAI browser OAuth by default. It starts a local callback server, opens the browser, and saves the account. It does not switch the active account or write Codex `auth.json`; run `codex-switch switch <name-or-id>` when you want to use the new account.
+`login` uses ChatGPT/OpenAI browser OAuth by default. It starts a local callback server, opens the browser, and saves the account. It does not write Codex `auth.json`; run `codex-switch switch <name-or-id>` when you want to use the new account.
 
 The browser callback server uses the same ports as Codex: `1455` by default, with `1457` as the fallback.
 
@@ -89,7 +89,7 @@ codex-switch export my-account --file ./auth.json
 codex-switch export my-account --file ./auth.json --force
 ```
 
-Exporting does not change the active account or the current Codex auth file.
+Exporting does not change the current Codex auth file.
 
 ## Usage
 
