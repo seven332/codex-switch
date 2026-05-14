@@ -8,6 +8,7 @@ mod process;
 mod redaction;
 mod runtime;
 mod store;
+mod store_lock;
 mod switcher;
 mod token;
 mod types;
@@ -47,13 +48,6 @@ async fn run() -> Result<()> {
                 oauth::LoginFlow::Browser
             };
             let account = oauth::login(name, flow).await?;
-            if let Some(existing) = store::find_duplicate_account(&account)? {
-                anyhow::bail!(
-                    "account is already stored as {} ({})",
-                    existing.name,
-                    store::short_id(&existing.id)
-                );
-            }
             let stored = store::add_account(account)?;
             println!(
                 "Logged in {} ({})",
@@ -68,15 +62,6 @@ async fn run() -> Result<()> {
             };
             let account = auth_json::import_from_auth_json(&file, name)?;
 
-            if let Some(existing) = store::find_duplicate_account(&account)? {
-                anyhow::bail!(
-                    "auth.json is already imported as {} ({})",
-                    existing.name,
-                    store::short_id(&existing.id)
-                );
-            }
-
-            store::ensure_name_available(&account.name)?;
             let stored = store::add_account(account)?;
             println!(
                 "Imported {} ({}) from {}",

@@ -6,7 +6,13 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+use crate::store_lock::acquire_accounts_file_lock;
 use crate::types::{AccountsStore, AuthData, RedactedString, StoredAccount};
+
+enum StoreUpdate<T> {
+    Changed(T),
+    Unchanged(T),
+}
 
 pub fn config_dir() -> Result<PathBuf> {
     let home = dirs::home_dir().context("Could not find home directory")?;
@@ -17,14 +23,21 @@ pub fn accounts_file() -> Result<PathBuf> {
     Ok(config_dir()?.join("accounts.json"))
 }
 
+fn accounts_lock_file() -> Result<PathBuf> {
+    Ok(config_dir()?.join("accounts.lock"))
+}
+
 pub fn load_accounts() -> Result<AccountsStore> {
     let path = accounts_file()?;
+    load_accounts_from_path(&path)
+}
 
+fn load_accounts_from_path(path: &Path) -> Result<AccountsStore> {
     if !path.exists() {
         return Ok(AccountsStore::default());
     }
 
-    let content = fs::read_to_string(&path)
+    let content = fs::read_to_string(path)
         .with_context(|| format!("Failed to read accounts file: {}", path.display()))?;
     let store = serde_json::from_str(&content)
         .with_context(|| format!("Failed to parse accounts file: {}", path.display()))?;
@@ -32,12 +45,35 @@ pub fn load_accounts() -> Result<AccountsStore> {
     Ok(store)
 }
 
-pub fn save_accounts(store: &AccountsStore) -> Result<()> {
-    let path = accounts_file()?;
+fn save_accounts_to_path(path: &Path, store: &AccountsStore) -> Result<()> {
     let mut content =
         serde_json::to_string_pretty(store).context("Failed to serialize accounts store")?;
     content.push('\n');
-    write_private_file(&path, &content)
+    write_private_file(path, &content)
+}
+
+fn mutate_accounts<T>(
+    mutation: impl FnOnce(&mut AccountsStore) -> Result<StoreUpdate<T>>,
+) -> Result<T> {
+    let path = accounts_file()?;
+    let lock_path = accounts_lock_file()?;
+    mutate_accounts_at(&path, &lock_path, mutation)
+}
+
+fn mutate_accounts_at<T>(
+    path: &Path,
+    lock_path: &Path,
+    mutation: impl FnOnce(&mut AccountsStore) -> Result<StoreUpdate<T>>,
+) -> Result<T> {
+    let _lock = acquire_accounts_file_lock(lock_path)?;
+    let mut store = load_accounts_from_path(path)?;
+    match mutation(&mut store)? {
+        StoreUpdate::Changed(value) => {
+            save_accounts_to_path(path, &store)?;
+            Ok(value)
+        }
+        StoreUpdate::Unchanged(value) => Ok(value),
+    }
 }
 
 pub fn write_private_file(path: &Path, content: &str) -> Result<()> {
@@ -152,28 +188,7 @@ pub fn ensure_name_available(name: &str) -> Result<()> {
 }
 
 pub fn add_account(account: StoredAccount) -> Result<StoredAccount> {
-    let mut store = load_accounts()?;
-
-    if store
-        .accounts
-        .iter()
-        .any(|existing| existing.name == account.name)
-    {
-        anyhow::bail!("An account named '{}' already exists", account.name);
-    }
-
-    let stored = account.clone();
-    store.accounts.push(account);
-    save_accounts(&store)?;
-    Ok(stored)
-}
-
-pub fn find_duplicate_account(account: &StoredAccount) -> Result<Option<StoredAccount>> {
-    let store = load_accounts()?;
-    Ok(store
-        .accounts
-        .into_iter()
-        .find(|existing| has_same_auth_identity(existing, account)))
+    mutate_accounts(|store| add_account_to_store(store, account))
 }
 
 pub fn find_matching_account<'a>(
@@ -275,56 +290,15 @@ pub fn get_account_by_selector(selector: &str) -> Result<StoredAccount> {
 }
 
 pub fn touch_account(account_id: &str) -> Result<()> {
-    let mut store = load_accounts()?;
-
-    if let Some(account) = store
-        .accounts
-        .iter_mut()
-        .find(|account| account.id == account_id)
-    {
-        account.last_used_at = Some(Utc::now());
-        save_accounts(&store)?;
-    }
-
-    Ok(())
+    mutate_accounts(|store| touch_account_in_store(store, account_id))
 }
 
 pub fn remove_account_by_selector(selector: &str) -> Result<StoredAccount> {
-    let mut store = load_accounts()?;
-    let account_id = resolve_account_id(&store, selector)?;
-    let index = store
-        .accounts
-        .iter()
-        .position(|account| account.id == account_id)
-        .context("Account not found after resolving selector")?;
-    let removed = store.accounts.remove(index);
-
-    save_accounts(&store)?;
-    Ok(removed)
+    mutate_accounts(|store| remove_account_by_selector_from_store(store, selector))
 }
 
 pub fn rename_account_by_selector(selector: &str, new_name: String) -> Result<StoredAccount> {
-    let mut store = load_accounts()?;
-    let account_id = resolve_account_id(&store, selector)?;
-
-    if store
-        .accounts
-        .iter()
-        .any(|account| account.id != account_id && account.name == new_name)
-    {
-        anyhow::bail!("An account named '{new_name}' already exists");
-    }
-
-    let account = store
-        .accounts
-        .iter_mut()
-        .find(|account| account.id == account_id)
-        .context("Account not found after resolving selector")?;
-    account.name = new_name;
-    let updated = account.clone();
-
-    save_accounts(&store)?;
-    Ok(updated)
+    mutate_accounts(|store| rename_account_by_selector_in_store(store, selector, new_name))
 }
 
 #[derive(Debug, Clone)]
@@ -345,7 +319,93 @@ pub fn update_account_chatgpt_tokens(
     account_id: &str,
     update: ChatGptTokenUpdate,
 ) -> Result<StoredAccount> {
-    let mut store = load_accounts()?;
+    mutate_accounts(|store| update_account_chatgpt_tokens_in_store(store, account_id, update))
+}
+
+fn add_account_to_store(
+    store: &mut AccountsStore,
+    account: StoredAccount,
+) -> Result<StoreUpdate<StoredAccount>> {
+    if store
+        .accounts
+        .iter()
+        .any(|existing| existing.name == account.name)
+    {
+        anyhow::bail!("An account named '{}' already exists", account.name);
+    }
+
+    if let Some(existing) = store
+        .accounts
+        .iter()
+        .find(|existing| has_same_auth_identity(existing, &account))
+    {
+        anyhow::bail!(
+            "account is already stored as {} ({})",
+            existing.name,
+            short_id(&existing.id)
+        );
+    }
+
+    let stored = account.clone();
+    store.accounts.push(account);
+    Ok(StoreUpdate::Changed(stored))
+}
+
+fn touch_account_in_store(store: &mut AccountsStore, account_id: &str) -> Result<StoreUpdate<()>> {
+    if let Some(account) = store
+        .accounts
+        .iter_mut()
+        .find(|account| account.id == account_id)
+    {
+        account.last_used_at = Some(Utc::now());
+        return Ok(StoreUpdate::Changed(()));
+    }
+
+    Ok(StoreUpdate::Unchanged(()))
+}
+
+fn remove_account_by_selector_from_store(
+    store: &mut AccountsStore,
+    selector: &str,
+) -> Result<StoreUpdate<StoredAccount>> {
+    let account_id = resolve_account_id(store, selector)?;
+    let index = store
+        .accounts
+        .iter()
+        .position(|account| account.id == account_id)
+        .context("Account not found after resolving selector")?;
+    Ok(StoreUpdate::Changed(store.accounts.remove(index)))
+}
+
+fn rename_account_by_selector_in_store(
+    store: &mut AccountsStore,
+    selector: &str,
+    new_name: String,
+) -> Result<StoreUpdate<StoredAccount>> {
+    let account_id = resolve_account_id(store, selector)?;
+
+    if store
+        .accounts
+        .iter()
+        .any(|account| account.id != account_id && account.name == new_name)
+    {
+        anyhow::bail!("An account named '{new_name}' already exists");
+    }
+
+    let account = store
+        .accounts
+        .iter_mut()
+        .find(|account| account.id == account_id)
+        .context("Account not found after resolving selector")?;
+    account.name = new_name;
+    Ok(StoreUpdate::Changed(account.clone()))
+}
+
+fn update_account_chatgpt_tokens_in_store(
+    store: &mut AccountsStore,
+    account_id: &str,
+    update: ChatGptTokenUpdate,
+) -> Result<StoreUpdate<StoredAccount>> {
     let account = store
         .accounts
         .iter_mut()
@@ -400,30 +460,35 @@ pub fn update_account_chatgpt_tokens(
     }
 
     let updated = account.clone();
-    save_accounts(&store)?;
-    Ok(updated)
+    Ok(StoreUpdate::Changed(updated))
 }
 
 pub fn update_account_usage_metadata(
     account_id: &str,
     plan_type: Option<String>,
 ) -> Result<Option<StoredAccount>> {
-    let mut store = load_accounts()?;
+    mutate_accounts(|store| update_account_usage_metadata_in_store(store, account_id, plan_type))
+}
+
+fn update_account_usage_metadata_in_store(
+    store: &mut AccountsStore,
+    account_id: &str,
+    plan_type: Option<String>,
+) -> Result<StoreUpdate<Option<StoredAccount>>> {
     let Some(account) = store
         .accounts
         .iter_mut()
         .find(|account| account.id == account_id)
     else {
-        return Ok(None);
+        return Ok(StoreUpdate::Unchanged(None));
     };
 
     if !apply_usage_metadata(account, plan_type) {
-        return Ok(Some(account.clone()));
+        return Ok(StoreUpdate::Unchanged(Some(account.clone())));
     }
 
     let updated = account.clone();
-    save_accounts(&store)?;
-    Ok(Some(updated))
+    Ok(StoreUpdate::Changed(Some(updated)))
 }
 
 fn apply_usage_metadata(account: &mut StoredAccount, plan_type: Option<String>) -> bool {
@@ -448,9 +513,8 @@ pub fn short_id(id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_usage_metadata, has_same_auth_identity};
+    use super::*;
     use crate::types::{NewChatGptAccount, StoredAccount};
-    use chrono::Utc;
 
     #[test]
     fn duplicate_auth_matches_api_key() {
@@ -499,6 +563,122 @@ mod tests {
         assert_eq!(account.plan_type.as_deref(), Some("pro"));
     }
 
+    #[test]
+    fn transaction_waits_for_lock_and_reloads_latest_store() {
+        let (dir, path, lock_path) = temp_store_paths("delayed-usage");
+        let account = chatgpt_account("account", Some("account-id"), "refresh", "id");
+        let account_id = account.id.clone();
+        save_accounts_to_path(&path, &store_with_accounts(vec![account]))
+            .expect("initial store should save");
+
+        let lock = acquire_accounts_file_lock(&lock_path).expect("test should acquire lock");
+        let worker_path = path.clone();
+        let worker_lock_path = lock_path.clone();
+        let worker_account_id = account_id.clone();
+        let worker = std::thread::spawn(move || {
+            mutate_accounts_at(&worker_path, &worker_lock_path, |store| {
+                update_account_usage_metadata_in_store(
+                    store,
+                    &worker_account_id,
+                    Some("pro".to_string()),
+                )
+            })
+        });
+
+        let mut latest_store = load_accounts_from_path(&path).expect("latest store should load");
+        latest_store.accounts[0].name = "renamed".to_string();
+        save_accounts_to_path(&path, &latest_store).expect("latest store should save");
+        drop(lock);
+
+        worker
+            .join()
+            .expect("worker should not panic")
+            .expect("usage update should save");
+
+        let final_store = load_accounts_from_path(&path).expect("final store should load");
+        let final_account = final_store.accounts.first().expect("account should remain");
+        assert_eq!(final_account.name, "renamed");
+        assert_eq!(final_account.plan_type.as_deref(), Some("pro"));
+
+        fs::remove_dir_all(dir).expect("temp store should be removed");
+    }
+
+    #[test]
+    fn transaction_reloads_latest_store_for_sequential_usage_update() {
+        let (dir, path, lock_path) = temp_store_paths("sequential-usage");
+        let account = chatgpt_account("account", Some("account-id"), "refresh", "id");
+        let account_id = account.id.clone();
+        save_accounts_to_path(&path, &store_with_accounts(vec![account]))
+            .expect("initial store should save");
+
+        mutate_accounts_at(&path, &lock_path, |store| {
+            rename_account_by_selector_in_store(store, &account_id, "renamed".to_string())
+        })
+        .expect("rename should save");
+
+        mutate_accounts_at(&path, &lock_path, |store| {
+            update_account_usage_metadata_in_store(store, &account_id, Some("pro".to_string()))
+        })
+        .expect("usage update should save");
+
+        let final_store = load_accounts_from_path(&path).expect("final store should load");
+        let final_account = final_store.accounts.first().expect("account should remain");
+        assert_eq!(final_account.name, "renamed");
+        assert_eq!(final_account.plan_type.as_deref(), Some("pro"));
+
+        fs::remove_dir_all(dir).expect("temp store should be removed");
+    }
+
+    #[test]
+    fn deleted_account_is_not_resurrected_by_delayed_token_or_usage_update() {
+        let (dir, path, lock_path) = temp_store_paths("deleted-account");
+        let account = chatgpt_account("account", Some("account-id"), "refresh", "id");
+        let account_id = account.id.clone();
+        save_accounts_to_path(&path, &store_with_accounts(vec![account]))
+            .expect("initial store should save");
+
+        mutate_accounts_at(&path, &lock_path, |store| {
+            remove_account_by_selector_from_store(store, &account_id)
+        })
+        .expect("delete should save");
+
+        let token_result = mutate_accounts_at(&path, &lock_path, |store| {
+            update_account_chatgpt_tokens_in_store(store, &account_id, token_update())
+        });
+        assert!(token_result.is_err());
+
+        let usage_result = mutate_accounts_at(&path, &lock_path, |store| {
+            update_account_usage_metadata_in_store(store, &account_id, Some("pro".to_string()))
+        })
+        .expect("usage metadata sync should ignore missing account");
+        assert!(usage_result.is_none());
+
+        let final_store = load_accounts_from_path(&path).expect("final store should load");
+        assert!(final_store.accounts.is_empty());
+
+        fs::remove_dir_all(dir).expect("temp store should be removed");
+    }
+
+    #[test]
+    fn add_account_checks_duplicate_auth_inside_transaction() {
+        let (dir, path, lock_path) = temp_store_paths("duplicate-add");
+        let account = StoredAccount::new_api_key("first".to_string(), "sk-test".to_string());
+        save_accounts_to_path(&path, &store_with_accounts(vec![account]))
+            .expect("initial store should save");
+
+        let duplicate = StoredAccount::new_api_key("second".to_string(), "sk-test".to_string());
+        let err = mutate_accounts_at(&path, &lock_path, |store| {
+            add_account_to_store(store, duplicate)
+        })
+        .expect_err("duplicate auth should be rejected inside the transaction");
+
+        assert!(err.to_string().contains("account is already stored as"));
+        let final_store = load_accounts_from_path(&path).expect("final store should load");
+        assert_eq!(final_store.accounts.len(), 1);
+
+        fs::remove_dir_all(dir).expect("temp store should be removed");
+    }
+
     fn chatgpt_account(
         name: &str,
         account_id: Option<&str>,
@@ -518,5 +698,37 @@ mod tests {
             refresh_token: refresh_token.into(),
             account_id: account_id.map(str::to_string),
         })
+    }
+
+    fn token_update() -> ChatGptTokenUpdate {
+        ChatGptTokenUpdate {
+            id_token: Some("new-id-token".into()),
+            access_token: Some("new-access-token".into()),
+            refresh_token: Some("new-refresh-token".into()),
+            chatgpt_account_id: Some("new-account-id".to_string()),
+            email: Some("user@example.com".to_string()),
+            plan_type: Some("pro".to_string()),
+            chatgpt_user_id: Some("user-id".to_string()),
+            chatgpt_account_is_fedramp: Some(false),
+            token_last_refresh_at: Utc::now(),
+            subscription_expires_at: None,
+        }
+    }
+
+    fn store_with_accounts(accounts: Vec<StoredAccount>) -> AccountsStore {
+        AccountsStore {
+            version: 1,
+            accounts,
+            masked_account_ids: Vec::new(),
+        }
+    }
+
+    fn temp_store_paths(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("codex-switch-store-{name}-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp store dir should be created");
+        let accounts_path = dir.join("accounts.json");
+        let lock_path = dir.join("accounts.lock");
+        (dir, accounts_path, lock_path)
     }
 }
