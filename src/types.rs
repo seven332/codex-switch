@@ -234,7 +234,7 @@ pub fn parse_chatgpt_id_token_claims(id_token: &str) -> ChatGptIdTokenClaims {
 pub struct AuthDotJson {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<String>,
-    #[serde(rename = "OPENAI_API_KEY")]
+    #[serde(rename = "OPENAI_API_KEY", skip_serializing_if = "Option::is_none")]
     pub openai_api_key: Option<RedactedString>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens: Option<TokenData>,
