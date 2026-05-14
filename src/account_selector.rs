@@ -6,11 +6,16 @@ use crate::types::{AuthData, StoredAccount, UsageInfo};
 
 pub const DEFAULT_MIN_SAFE_HEADROOM: f64 = 5.0;
 pub const DEFAULT_WEEKLY_TO_FIVE_HOUR_RATIO: f64 = 4.0;
+const SHADOW_PRICE_EPSILON: f64 = 0.01;
+const SHADOW_PRICE_MIN_RESET_FACTOR: f64 = 0.02;
+const SHADOW_PRICE_RESET_EXPONENT: f64 = 1.5;
+const SHADOW_PRICE_IMMEDIATE_RISK_WEIGHT: f64 = 0.15;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SelectionConfig {
     pub min_safe_headroom: f64,
     pub weekly_to_five_hour_ratio: f64,
+    pub policy: SelectionPolicyKind,
 }
 
 impl Default for SelectionConfig {
@@ -18,8 +23,16 @@ impl Default for SelectionConfig {
         Self {
             min_safe_headroom: DEFAULT_MIN_SAFE_HEADROOM,
             weekly_to_five_hour_ratio: DEFAULT_WEEKLY_TO_FIVE_HOUR_RATIO,
+            policy: SelectionPolicyKind::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SelectionPolicyKind {
+    #[default]
+    DeadlineAware,
+    ShadowPrice,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -52,17 +65,44 @@ pub enum UsageWindow {
     Weekly,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SelectionContext {
+    pub now: i64,
+}
+
+impl SelectionContext {
+    pub fn now() -> Self {
+        Self {
+            now: Utc::now().timestamp(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn at(now: i64) -> Self {
+        Self { now }
+    }
+}
+
 struct EvaluatedCandidate<'a> {
     account: &'a StoredAccount,
+    usage: &'a UsageInfo,
     metrics: UsageSelectionMetrics,
     order: usize,
 }
 
 pub trait AccountSelectionPolicy {
+    fn select_account_at<'a>(
+        &mut self,
+        candidates: &[AccountUsageCandidate<'a>],
+        context: SelectionContext,
+    ) -> Option<AccountSelection<'a>>;
+
     fn select_account<'a>(
         &mut self,
         candidates: &[AccountUsageCandidate<'a>],
-    ) -> Option<AccountSelection<'a>>;
+    ) -> Option<AccountSelection<'a>> {
+        self.select_account_at(candidates, SelectionContext::now())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -72,18 +112,62 @@ pub struct DeadlineAwarePolicy {
 
 impl DeadlineAwarePolicy {
     pub fn new(config: SelectionConfig) -> Self {
-        Self { config }
+        Self {
+            config: SelectionConfig {
+                policy: SelectionPolicyKind::DeadlineAware,
+                ..config
+            },
+        }
     }
 }
 
 impl AccountSelectionPolicy for DeadlineAwarePolicy {
-    fn select_account<'a>(
+    fn select_account_at<'a>(
         &mut self,
         candidates: &[AccountUsageCandidate<'a>],
+        _context: SelectionContext,
     ) -> Option<AccountSelection<'a>> {
         evaluated_candidates(candidates, self.config)
             .into_iter()
             .min_by(compare_candidates)
+            .map(|candidate| AccountSelection {
+                account: candidate.account,
+                metrics: candidate.metrics,
+            })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ShadowPricePolicy {
+    pub config: SelectionConfig,
+}
+
+impl ShadowPricePolicy {
+    pub fn new(config: SelectionConfig) -> Self {
+        Self {
+            config: SelectionConfig {
+                policy: SelectionPolicyKind::ShadowPrice,
+                ..config
+            },
+        }
+    }
+}
+
+impl Default for ShadowPricePolicy {
+    fn default() -> Self {
+        Self::new(SelectionConfig::default())
+    }
+}
+
+impl AccountSelectionPolicy for ShadowPricePolicy {
+    fn select_account_at<'a>(
+        &mut self,
+        candidates: &[AccountUsageCandidate<'a>],
+        context: SelectionContext,
+    ) -> Option<AccountSelection<'a>> {
+        evaluated_candidates(candidates, self.config)
+            .into_iter()
+            .min_by(|left, right| compare_shadow_price(left, right, self.config, context))
             .map(|candidate| AccountSelection {
                 account: candidate.account,
                 metrics: candidate.metrics,
@@ -114,9 +198,10 @@ impl DrainFirstPolicy {
 
 #[cfg(test)]
 impl AccountSelectionPolicy for DrainFirstPolicy {
-    fn select_account<'a>(
+    fn select_account_at<'a>(
         &mut self,
         candidates: &[AccountUsageCandidate<'a>],
+        _context: SelectionContext,
     ) -> Option<AccountSelection<'a>> {
         let evaluated = evaluated_candidates(candidates, self.config);
         let selected = self
@@ -152,9 +237,10 @@ impl MaxHeadroomPolicy {
 
 #[cfg(test)]
 impl AccountSelectionPolicy for MaxHeadroomPolicy {
-    fn select_account<'a>(
+    fn select_account_at<'a>(
         &mut self,
         candidates: &[AccountUsageCandidate<'a>],
+        _context: SelectionContext,
     ) -> Option<AccountSelection<'a>> {
         evaluated_candidates(candidates, self.config)
             .into_iter()
@@ -193,9 +279,10 @@ impl ResetFirstPolicy {
 
 #[cfg(test)]
 impl AccountSelectionPolicy for ResetFirstPolicy {
-    fn select_account<'a>(
+    fn select_account_at<'a>(
         &mut self,
         candidates: &[AccountUsageCandidate<'a>],
+        _context: SelectionContext,
     ) -> Option<AccountSelection<'a>> {
         evaluated_candidates(candidates, self.config)
             .into_iter()
@@ -221,7 +308,13 @@ pub fn select_account<'a>(
     candidates: &[AccountUsageCandidate<'a>],
     config: SelectionConfig,
 ) -> Option<AccountSelection<'a>> {
-    DeadlineAwarePolicy::new(config).select_account(candidates)
+    // Keep the runtime default on the proven policy until simulations show a
+    // clear user-unavailable-time improvement from a replacement policy.
+    if config.policy == SelectionPolicyKind::ShadowPrice {
+        ShadowPricePolicy::new(config).select_account(candidates)
+    } else {
+        DeadlineAwarePolicy::new(config).select_account(candidates)
+    }
 }
 
 pub fn usage_selection_metrics(
@@ -255,6 +348,7 @@ fn evaluated_candidates<'a>(
             )
             .map(|metrics| EvaluatedCandidate {
                 account: candidate.account,
+                usage: candidate.usage,
                 metrics,
                 order,
             })
@@ -368,6 +462,124 @@ fn compare_candidates(left: &EvaluatedCandidate<'_>, right: &EvaluatedCandidate<
     .then_with(|| left.order.cmp(&right.order))
 }
 
+fn compare_shadow_price(
+    left: &EvaluatedCandidate<'_>,
+    right: &EvaluatedCandidate<'_>,
+    config: SelectionConfig,
+    context: SelectionContext,
+) -> Ordering {
+    compare_bool_desc(
+        left.metrics.safe_for_reset_priority,
+        right.metrics.safe_for_reset_priority,
+    )
+    .then_with(|| {
+        if left.metrics.safe_for_reset_priority && right.metrics.safe_for_reset_priority {
+            compare_shadow_price_score(left, right, config, context)
+                .then_with(|| compare_headroom_desc(left, right))
+        } else {
+            compare_headroom_desc(left, right)
+                .then_with(|| compare_shadow_price_score(left, right, config, context))
+        }
+    })
+    .then_with(|| {
+        compare_optional_reset(
+            left.metrics.bottleneck_resets_at,
+            right.metrics.bottleneck_resets_at,
+        )
+    })
+    .then_with(|| compare_last_used(left.account.last_used_at, right.account.last_used_at))
+    .then_with(|| left.order.cmp(&right.order))
+}
+
+fn compare_shadow_price_score(
+    left: &EvaluatedCandidate<'_>,
+    right: &EvaluatedCandidate<'_>,
+    config: SelectionConfig,
+    context: SelectionContext,
+) -> Ordering {
+    shadow_price_score(left, config, context)
+        .total_cmp(&shadow_price_score(right, config, context))
+        .then_with(|| {
+            compare_optional_reset(
+                left.metrics.bottleneck_resets_at,
+                right.metrics.bottleneck_resets_at,
+            )
+        })
+}
+
+fn shadow_price_score(
+    candidate: &EvaluatedCandidate<'_>,
+    config: SelectionConfig,
+    context: SelectionContext,
+) -> f64 {
+    let weekly_to_five_hour_ratio =
+        normalized_weekly_to_five_hour_ratio(config.weekly_to_five_hour_ratio);
+    shadow_window_price(
+        candidate.usage.primary_used_percent,
+        candidate.usage.primary_window_minutes,
+        candidate.usage.primary_resets_at,
+        1.0,
+        context,
+    ) + shadow_window_price(
+        candidate.usage.secondary_used_percent,
+        candidate.usage.secondary_window_minutes,
+        candidate.usage.secondary_resets_at,
+        weekly_to_five_hour_ratio,
+        context,
+    )
+}
+
+fn shadow_window_price(
+    used_percent: Option<f64>,
+    window_minutes: Option<i64>,
+    resets_at: Option<i64>,
+    capacity_weight: f64,
+    context: SelectionContext,
+) -> f64 {
+    let Some(used_percent) = used_percent.filter(|value| value.is_finite()) else {
+        return f64::INFINITY;
+    };
+    let capacity_weight = if capacity_weight.is_finite() && capacity_weight > 0.0 {
+        capacity_weight
+    } else {
+        DEFAULT_WEEKLY_TO_FIVE_HOUR_RATIO
+    };
+    let used = (used_percent / 100.0).clamp(0.0, 1.0);
+    let headroom = (1.0 - used).clamp(0.0, 1.0);
+    let remaining_units = (headroom * capacity_weight).max(SHADOW_PRICE_EPSILON);
+    let pressure = used / remaining_units;
+    let reset_factor = shadow_reset_factor(resets_at, window_minutes, context);
+    let risk_factor = SHADOW_PRICE_IMMEDIATE_RISK_WEIGHT
+        + (1.0 - SHADOW_PRICE_IMMEDIATE_RISK_WEIGHT) * reset_factor;
+    pressure * risk_factor
+}
+
+fn shadow_reset_factor(
+    resets_at: Option<i64>,
+    window_minutes: Option<i64>,
+    context: SelectionContext,
+) -> f64 {
+    let (Some(resets_at), Some(window_minutes)) = (resets_at, window_minutes) else {
+        return 1.0;
+    };
+    if window_minutes <= 0 {
+        return 1.0;
+    }
+
+    let Some(window_seconds) = window_minutes.checked_mul(60) else {
+        return 1.0;
+    };
+    if window_seconds <= 0 {
+        return 1.0;
+    }
+
+    let reset_delay = resets_at.saturating_sub(context.now).max(0);
+    let normalized_delay = (reset_delay as f64 / window_seconds as f64).clamp(0.0, 1.0);
+    normalized_delay
+        .powf(SHADOW_PRICE_RESET_EXPONENT)
+        .clamp(SHADOW_PRICE_MIN_RESET_FACTOR, 1.0)
+}
+
 fn compare_bool_desc(left: bool, right: bool) -> Ordering {
     right.cmp(&left)
 }
@@ -411,7 +623,8 @@ mod tests {
 
     use super::{
         AccountSelectionPolicy, AccountUsageCandidate, DeadlineAwarePolicy, DrainFirstPolicy,
-        MaxHeadroomPolicy, ResetFirstPolicy, SelectionConfig, UsageWindow, select_account,
+        MaxHeadroomPolicy, ResetFirstPolicy, SelectionConfig, SelectionContext,
+        SelectionPolicyKind, ShadowPricePolicy, UsageWindow, select_account,
     };
     use crate::types::{AuthData, AuthMode, StoredAccount, UsageInfo};
 
@@ -610,6 +823,113 @@ mod tests {
     }
 
     #[test]
+    fn shadow_price_prefers_less_used_when_reset_times_match() {
+        let lower_pressure = chatgpt_account("lower-pressure", None);
+        let higher_pressure = chatgpt_account("higher-pressure", None);
+        let lower_pressure_info = usage_info("lower-pressure", 20.0, 20.0, 18_000, 604_800);
+        let higher_pressure_info = usage_info("higher-pressure", 60.0, 60.0, 18_000, 604_800);
+        let candidates = [
+            candidate(&higher_pressure, &higher_pressure_info),
+            candidate(&lower_pressure, &lower_pressure_info),
+        ];
+
+        let selection = ShadowPricePolicy::default()
+            .select_account_at(&candidates, SelectionContext::at(0))
+            .expect("usable account should be selected");
+
+        assert_eq!(selection.account.id, "lower-pressure");
+    }
+
+    #[test]
+    fn shadow_price_discounts_used_quota_that_resets_soon() {
+        let soon = chatgpt_account("soon", None);
+        let later = chatgpt_account("later", None);
+        let soon_info = usage_info("soon", 75.0, 10.0, 60, 604_800);
+        let later_info = usage_info("later", 40.0, 10.0, 18_000, 604_800);
+        let candidates = [candidate(&later, &later_info), candidate(&soon, &soon_info)];
+
+        let selection = ShadowPricePolicy::default()
+            .select_account_at(&candidates, SelectionContext::at(0))
+            .expect("usable account should be selected");
+
+        assert_eq!(selection.account.id, "soon");
+    }
+
+    #[test]
+    fn shadow_price_prices_weekly_pressure_independently() {
+        let weekly_pressure = chatgpt_account("weekly-pressure", None);
+        let five_hour_pressure = chatgpt_account("five-hour-pressure", None);
+        let weekly_pressure_info = usage_info("weekly-pressure", 10.0, 95.0, 18_000, 604_800);
+        let five_hour_pressure_info = usage_info("five-hour-pressure", 65.0, 20.0, 18_000, 604_800);
+        let candidates = [
+            candidate(&weekly_pressure, &weekly_pressure_info),
+            candidate(&five_hour_pressure, &five_hour_pressure_info),
+        ];
+
+        let selection = ShadowPricePolicy::default()
+            .select_account_at(&candidates, SelectionContext::at(0))
+            .expect("usable account should be selected");
+
+        assert_eq!(selection.account.id, "five-hour-pressure");
+    }
+
+    #[test]
+    fn shadow_price_treats_missing_reset_as_conservative() {
+        let unknown_reset = chatgpt_account("unknown-reset", None);
+        let soon_reset = chatgpt_account("soon-reset", None);
+        let mut unknown_reset_info = usage_info("unknown-reset", 50.0, 10.0, 60, 604_800);
+        unknown_reset_info.primary_resets_at = None;
+        let soon_reset_info = usage_info("soon-reset", 50.0, 10.0, 60, 604_800);
+        let candidates = [
+            candidate(&unknown_reset, &unknown_reset_info),
+            candidate(&soon_reset, &soon_reset_info),
+        ];
+
+        let selection = ShadowPricePolicy::default()
+            .select_account_at(&candidates, SelectionContext::at(0))
+            .expect("usable account should be selected");
+
+        assert_eq!(selection.account.id, "soon-reset");
+    }
+
+    #[test]
+    fn shadow_price_keeps_nonzero_pressure_for_imminent_resets() {
+        let near_exhausted = chatgpt_account("near-exhausted", None);
+        let safer = chatgpt_account("safer", None);
+        let near_exhausted_info = usage_info("near-exhausted", 99.0, 10.0, 0, 604_800);
+        let safer_info = usage_info("safer", 50.0, 10.0, 18_000, 604_800);
+        let candidates = [
+            candidate(&near_exhausted, &near_exhausted_info),
+            candidate(&safer, &safer_info),
+        ];
+
+        let selection = ShadowPricePolicy::default()
+            .select_account_at(&candidates, SelectionContext::at(0))
+            .expect("usable account should be selected");
+
+        assert_eq!(selection.account.id, "safer");
+    }
+
+    #[test]
+    fn selection_config_can_select_shadow_price_policy() {
+        let soon = chatgpt_account("soon", None);
+        let later = chatgpt_account("later", None);
+        let now = Utc::now().timestamp();
+        let soon_info = usage_info("soon", 75.0, 10.0, now + 60, now + 604_800);
+        let later_info = usage_info("later", 40.0, 10.0, now + 18_000, now + 604_800);
+        let candidates = [candidate(&later, &later_info), candidate(&soon, &soon_info)];
+        let config = SelectionConfig {
+            policy: SelectionPolicyKind::ShadowPrice,
+            ..SelectionConfig::default()
+        };
+
+        let selection =
+            select_account(&candidates, config).expect("usable account should be selected");
+
+        assert_eq!(selection.account.id, "soon");
+    }
+
+    #[test]
     fn simulator_finds_deadline_aware_policy_sustainable_burn_near_weekly_capacity() {
         let max_burn = max_sustainable_burn_for_policy(2, DeadlineAwarePolicy::default);
         let theoretical_weekly_max =
@@ -699,6 +1019,10 @@ mod tests {
                 .iter()
                 .find(|stats| stats.policy_name == "drain-first")
                 .expect("drain-first stats should be present");
+            let shadow_price = policy_stats
+                .iter()
+                .find(|stats| stats.policy_name == "shadow-price")
+                .expect("shadow-price stats should be present");
 
             for stats in &policy_stats {
                 assert!(
@@ -725,6 +1049,12 @@ mod tests {
                 deadline_aware.stats.user_unavailable_minutes()
                     <= drain_first.stats.user_unavailable_minutes(),
                 "deadline-aware should not increase unavailable time vs drain-first in {}: {policy_stats:?}",
+                scenario.name
+            );
+            assert!(
+                shadow_price.stats.user_unavailable_minutes()
+                    <= deadline_aware.stats.user_unavailable_minutes(),
+                "shadow-price should not increase unavailable time vs deadline-aware in {}: {policy_stats:?}",
                 scenario.name
             );
         }
@@ -770,12 +1100,12 @@ mod tests {
         assert_eq!(first_usage.primary_resets_at, Some(0));
         assert_eq!(
             second_usage.primary_resets_at,
-            Some(FIVE_HOUR_WINDOW_MINUTES / 2)
+            Some((FIVE_HOUR_WINDOW_MINUTES / 2) * 60)
         );
         assert_eq!(first_usage.secondary_resets_at, Some(0));
         assert_eq!(
             second_usage.secondary_resets_at,
-            Some(WEEKLY_WINDOW_MINUTES / 2)
+            Some((WEEKLY_WINDOW_MINUTES / 2) * 60)
         );
     }
 
@@ -876,6 +1206,10 @@ mod tests {
                     limits,
                 ),
             ),
+            (
+                "shadow-price",
+                simulate_policy_trace(&mut ShadowPricePolicy::default(), &trace, limits),
+            ),
         ];
 
         for (policy_name, outcome) in policy_outcomes {
@@ -884,6 +1218,53 @@ mod tests {
                 "{policy_name} exceeded the offline oracle: {outcome:?} vs {oracle:?}",
             );
         }
+    }
+
+    #[test]
+    fn generated_trace_suite_keeps_shadow_price_no_worse_than_deadline_aware() {
+        let mut deadline_aware_unavailable = 0;
+        let mut shadow_price_unavailable = 0;
+        let mut deadline_aware_failed_credits = 0;
+        let mut shadow_price_failed_credits = 0;
+        let mut evaluated_traces = 0;
+        let mut shadow_price_regressions = 0;
+
+        for seed in 1_u64..=32 {
+            let limits = generated_trace_limits(seed);
+            let trace = generated_trace(seed);
+            let deadline_aware =
+                simulate_policy_trace(&mut DeadlineAwarePolicy::default(), &trace, limits);
+            let shadow_price =
+                simulate_policy_trace(&mut ShadowPricePolicy::default(), &trace, limits);
+
+            deadline_aware_unavailable += deadline_aware.user_unavailable_minutes();
+            shadow_price_unavailable += shadow_price.user_unavailable_minutes();
+            deadline_aware_failed_credits += deadline_aware.failed_credits;
+            shadow_price_failed_credits += shadow_price.failed_credits;
+            evaluated_traces += 1;
+            if shadow_price.user_unavailable_minutes() > deadline_aware.user_unavailable_minutes() {
+                shadow_price_regressions += 1;
+            }
+        }
+
+        assert_eq!(evaluated_traces, 32);
+        assert!(
+            shadow_price_regressions < evaluated_traces,
+            "shadow-price should not regress every generated trace",
+        );
+        assert!(
+            deadline_aware_unavailable > 0,
+            "generated traces should exercise unavailable-time behavior",
+        );
+        assert!(
+            shadow_price_unavailable < deadline_aware_unavailable,
+            "shadow-price aggregate unavailable time should improve: {shadow_price_unavailable} vs {deadline_aware_unavailable}",
+        );
+        assert!(
+            f64::from(shadow_price_failed_credits)
+                <= f64::from(deadline_aware_failed_credits) * 1.01,
+            "shadow-price failed credits should stay within 1% of deadline-aware: {shadow_price_failed_credits} vs {deadline_aware_failed_credits}",
+        );
     }
 
     const FIVE_HOUR_WINDOW_MINUTES: i64 = 300;
@@ -1064,6 +1445,45 @@ mod tests {
         stats: SimStats,
     }
 
+    struct DeterministicRng {
+        state: u64,
+    }
+
+    impl DeterministicRng {
+        fn new(seed: u64) -> Self {
+            Self {
+                state: seed ^ 0xe703_7ed1_a0b4_28db,
+            }
+        }
+
+        fn next_u32(&mut self) -> u32 {
+            self.state = self
+                .state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            u32::try_from(self.state >> 32).expect("upper 32 bits should fit u32")
+        }
+
+        fn range_i32(&mut self, min: i32, max: i32) -> i32 {
+            assert!(min <= max);
+            let width = u32::try_from(max - min + 1).expect("range width should fit u32");
+            let offset = i32::try_from(self.next_u32() % width).expect("offset should fit i32");
+            min + offset
+        }
+
+        fn range_u16(&mut self, min: u16, max: u16) -> u16 {
+            assert!(min <= max);
+            let width = u32::from(max - min) + 1;
+            let offset = u16::try_from(self.next_u32() % width).expect("offset should fit u16");
+            min + offset
+        }
+
+        fn one_in(&mut self, denominator: u32) -> bool {
+            assert!(denominator > 0);
+            self.next_u32().is_multiple_of(denominator)
+        }
+    }
+
     fn max_sustainable_burn_for_policy<P, F>(account_count: usize, mut policy_factory: F) -> f64
     where
         P: AccountSelectionPolicy,
@@ -1172,11 +1592,12 @@ mod tests {
         ]
     }
 
-    fn policy_stats_for_scenario(scenario: SimScenario) -> [PolicyStats; 4] {
+    fn policy_stats_for_scenario(scenario: SimScenario) -> [PolicyStats; 5] {
         let mut deadline_aware = DeadlineAwarePolicy::default();
         let mut drain_first = DrainFirstPolicy::new(SelectionConfig::default());
         let mut max_headroom = MaxHeadroomPolicy::new(SelectionConfig::default());
         let mut reset_first = ResetFirstPolicy::new(SelectionConfig::default());
+        let mut shadow_price = ShadowPricePolicy::default();
 
         [
             PolicyStats {
@@ -1195,7 +1616,52 @@ mod tests {
                 policy_name: "reset-first",
                 stats: simulate_policy_scenario(&mut reset_first, scenario),
             },
+            PolicyStats {
+                policy_name: "shadow-price",
+                stats: simulate_policy_scenario(&mut shadow_price, scenario),
+            },
         ]
+    }
+
+    fn generated_trace_limits(seed: u64) -> TraceLimits {
+        let mut rng = DeterministicRng::new(seed);
+        let five_hour_limit = rng.range_u16(18, 32);
+
+        TraceLimits {
+            account_count: 2 + usize::try_from(seed % 3).expect("seed modulo should fit usize"),
+            five_hour_limit,
+            weekly_limit: five_hour_limit * 4,
+            five_hour_window: 30,
+            weekly_window: 240,
+        }
+    }
+
+    fn generated_trace(seed: u64) -> Vec<TraceDemand> {
+        let mut rng = DeterministicRng::new(seed ^ 0xa076_1d64_78bd_642f);
+        let mut trace = Vec::new();
+        let mut minute = 0;
+
+        while minute < 480 {
+            minute += rng.range_i32(1, 3);
+            if !is_generated_trace_work_minute(minute) {
+                continue;
+            }
+
+            let burst = if rng.one_in(7) {
+                rng.range_u16(3, 8)
+            } else {
+                0
+            };
+            let credits = rng.range_u16(1, 4) + burst;
+            trace.push(TraceDemand { minute, credits });
+        }
+
+        trace
+    }
+
+    fn is_generated_trace_work_minute(minute: i32) -> bool {
+        let slot = minute % 120;
+        (10..55).contains(&slot) || (75..105).contains(&slot)
     }
 
     // Offline upper bound for small deterministic traces. This is a test oracle,
@@ -1289,11 +1755,16 @@ mod tests {
                 .zip(usages.iter())
                 .map(|(account, usage)| candidate(account, usage))
                 .collect::<Vec<_>>();
-            let selected_index = policy.select_account(&candidates).and_then(|selection| {
-                accounts
-                    .iter()
-                    .position(|account| account.id == selection.account.id)
-            });
+            let selected_index = policy
+                .select_account_at(
+                    &candidates,
+                    SelectionContext::at(i64::from(demand.minute) * 60),
+                )
+                .and_then(|selection| {
+                    accounts
+                        .iter()
+                        .position(|account| account.id == selection.account.id)
+                });
             let serving_index = selected_index
                 .filter(|index| states[*index].can_serve(demand.credits, limits))
                 .or_else(|| {
@@ -1424,11 +1895,13 @@ mod tests {
             .map(|(account, usage)| candidate(&account.account, usage))
             .collect::<Vec<_>>();
 
-        policy.select_account(&candidates).and_then(|selection| {
-            accounts
-                .iter()
-                .position(|account| account.account.id == selection.account.id)
-        })
+        policy
+            .select_account_at(&candidates, SelectionContext::at(minute * 60))
+            .and_then(|selection| {
+                accounts
+                    .iter()
+                    .position(|account| account.account.id == selection.account.id)
+            })
     }
 
     fn is_work_minute(minute: i64) -> bool {
@@ -1465,12 +1938,12 @@ mod tests {
             &mut self,
             five_hour_credits: f64,
             weekly_credits: f64,
-            five_hour_resets_at: i64,
-            weekly_resets_at: i64,
+            five_hour_resets_at_minute: i64,
+            weekly_resets_at_minute: i64,
         ) {
             if five_hour_credits > 0.0 {
                 self.five_hour_events.push_back(seed_usage_event(
-                    five_hour_resets_at,
+                    five_hour_resets_at_minute,
                     FIVE_HOUR_WINDOW_MINUTES,
                     five_hour_credits,
                 ));
@@ -1478,7 +1951,7 @@ mod tests {
             }
             if weekly_credits > 0.0 {
                 self.weekly_events.push_back(seed_usage_event(
-                    weekly_resets_at,
+                    weekly_resets_at_minute,
                     WEEKLY_WINDOW_MINUTES,
                     weekly_credits,
                 ));
@@ -1620,9 +2093,9 @@ mod tests {
         }
     }
 
-    fn seed_usage_event(reset_at: i64, window_minutes: i64, credits: f64) -> UsageEvent {
+    fn seed_usage_event(resets_at_minute: i64, window_minutes: i64, credits: f64) -> UsageEvent {
         UsageEvent {
-            at_minute: reset_at - window_minutes,
+            at_minute: resets_at_minute - window_minutes,
             credits,
         }
     }
@@ -1646,6 +2119,7 @@ mod tests {
         events
             .front()
             .map_or(minute, |event| event.at_minute + window_minutes)
+            * 60
     }
 
     fn total_credits(events: &VecDeque<UsageEvent>) -> f64 {
@@ -1662,7 +2136,7 @@ mod tests {
         minute: i32,
         limits: TraceLimits,
     ) -> UsageInfo {
-        usage_info(
+        usage_info_with_windows(
             account_id,
             used_percent(
                 f64::from(state.five_hour_used()),
@@ -1674,13 +2148,15 @@ mod tests {
             ),
             trace_reset_at(&state.five_hour_events, minute, limits.five_hour_window),
             trace_reset_at(&state.weekly_events, minute, limits.weekly_window),
+            i64::from(limits.five_hour_window),
+            i64::from(limits.weekly_window),
         )
     }
 
     fn trace_reset_at(events: &[TraceEvent], minute: i32, window_minutes: i32) -> i64 {
         events.first().map_or(i64::from(minute), |event| {
             i64::from(event.minute + window_minutes)
-        })
+        }) * 60
     }
 
     fn used_percent(used: f64, limit: f64) -> f64 {
@@ -1742,16 +2218,36 @@ mod tests {
         five_hour_resets_at: i64,
         weekly_resets_at: i64,
     ) -> UsageInfo {
+        usage_info_with_windows(
+            account_id,
+            five_hour_used_percent,
+            weekly_used_percent,
+            five_hour_resets_at,
+            weekly_resets_at,
+            300,
+            10_080,
+        )
+    }
+
+    fn usage_info_with_windows(
+        account_id: &str,
+        five_hour_used_percent: f64,
+        weekly_used_percent: f64,
+        five_hour_resets_at: i64,
+        weekly_resets_at: i64,
+        five_hour_window_minutes: i64,
+        weekly_window_minutes: i64,
+    ) -> UsageInfo {
         UsageInfo {
             account_id: account_id.to_string(),
             limit_id: Some("codex".to_string()),
             limit_name: None,
             plan_type: Some("pro".to_string()),
             primary_used_percent: Some(five_hour_used_percent),
-            primary_window_minutes: Some(300),
+            primary_window_minutes: Some(five_hour_window_minutes),
             primary_resets_at: Some(five_hour_resets_at),
             secondary_used_percent: Some(weekly_used_percent),
-            secondary_window_minutes: Some(10_080),
+            secondary_window_minutes: Some(weekly_window_minutes),
             secondary_resets_at: Some(weekly_resets_at),
             has_credits: None,
             unlimited_credits: None,
