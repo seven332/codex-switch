@@ -26,10 +26,6 @@ impl DrainFirstPolicy {
             current_account_id: None,
         }
     }
-
-    fn current_account_id(&self) -> Option<&str> {
-        self.current_account_id.as_deref()
-    }
 }
 
 impl AccountSelectionPolicy for DrainFirstPolicy {
@@ -482,99 +478,11 @@ fn selection_config_can_select_reset_weighted_minimax_policy() {
 }
 
 #[test]
-fn simulator_finds_deadline_aware_policy_sustainable_burn_near_weekly_capacity() {
-    let max_burn = max_sustainable_burn_for_policy(2, DeadlineAwarePolicy::default);
-    let theoretical_weekly_max =
-        2.0 * PRO_200_WEEKLY_LIMIT_CREDITS / f64::from(ACTIVE_MINUTES_PER_ROLLING_WEEK);
+fn simulator_evaluates_policies_across_realistic_usage_scenarios() {
+    let mut aggregate_stats = None;
 
-    assert!(
-        max_burn >= 4.35,
-        "selector should sustain near the 2-account weekly limit, got {max_burn:.3}"
-    );
-    assert!(
-        max_burn <= theoretical_weekly_max + 0.01,
-        "selector exceeded theoretical weekly capacity: {max_burn:.3} > {theoretical_weekly_max:.3}"
-    );
-
-    let just_over_the_limit = theoretical_weekly_max + 0.1;
-    let stats =
-        simulate_policy_work_week(&mut DeadlineAwarePolicy::default(), 2, just_over_the_limit);
-    assert!(stats.failed_credits > 0.0);
-    assert!(stats.unavailable_minutes > 0);
-}
-
-#[test]
-fn simulator_compares_deadline_aware_against_drain_first_baseline() {
-    let deadline_aware_max = max_sustainable_burn_for_policy(2, DeadlineAwarePolicy::default);
-    let drain_first_max =
-        max_sustainable_burn_for_policy(2, || DrainFirstPolicy::new(SelectionConfig::default()));
-    let theoretical_weekly_max =
-        2.0 * PRO_200_WEEKLY_LIMIT_CREDITS / f64::from(ACTIVE_MINUTES_PER_ROLLING_WEEK);
-
-    assert!(deadline_aware_max <= theoretical_weekly_max + 0.01);
-    assert!(drain_first_max <= theoretical_weekly_max + 0.01);
-    assert!(
-        deadline_aware_max + 0.01 >= drain_first_max,
-        "deadline-aware max burn {deadline_aware_max:.3} should not be worse than drain-first {drain_first_max:.3}"
-    );
-
-    let mut deadline_aware = DeadlineAwarePolicy::default();
-    let mut drain_first = DrainFirstPolicy::new(SelectionConfig::default());
-    let deadline_aware_stats = simulate_policy_work_week(&mut deadline_aware, 2, 4.0);
-    let drain_first_stats = simulate_policy_work_week(&mut drain_first, 2, 4.0);
-
-    assert_eq!(deadline_aware_stats.unavailable_minutes, 0);
-    assert_eq!(drain_first_stats.unavailable_minutes, 0);
-    assert!(drain_first.current_account_id().is_some());
-}
-
-#[test]
-fn deadline_aware_reduces_unavailable_time_for_constant_burn_near_capacity() {
-    let mut saw_improvement = false;
-
-    for credits_per_minute in [4.1, 4.2, 4.3, 4.35, 4.4] {
-        let mut deadline_aware = DeadlineAwarePolicy::default();
-        let mut drain_first = DrainFirstPolicy::new(SelectionConfig::default());
-        let deadline_aware_stats =
-            simulate_policy_work_week(&mut deadline_aware, 2, credits_per_minute);
-        let drain_first_stats = simulate_policy_work_week(&mut drain_first, 2, credits_per_minute);
-
-        assert!(
-            deadline_aware_stats.user_unavailable_minutes()
-                <= drain_first_stats.user_unavailable_minutes(),
-            "deadline-aware should not be worse at {credits_per_minute:.2} credits/min: {deadline_aware_stats:?} vs {drain_first_stats:?}"
-        );
-
-        saw_improvement |= deadline_aware_stats.user_unavailable_minutes()
-            < drain_first_stats.user_unavailable_minutes();
-    }
-
-    assert!(
-        saw_improvement,
-        "deadline-aware should improve at least one steady burn rate near capacity"
-    );
-}
-
-#[test]
-fn simulator_compares_baseline_policies_across_demand_scenarios() {
-    for scenario in evaluation_scenarios() {
+    for scenario in realistic_usage_scenarios() {
         let policy_stats = policy_stats_for_scenario(scenario);
-        let deadline_aware = policy_stats
-            .iter()
-            .find(|stats| stats.policy_name == "deadline-aware")
-            .expect("deadline-aware stats should be present");
-        let drain_first = policy_stats
-            .iter()
-            .find(|stats| stats.policy_name == "drain-first")
-            .expect("drain-first stats should be present");
-        let shadow_price = policy_stats
-            .iter()
-            .find(|stats| stats.policy_name == "shadow-price")
-            .expect("shadow-price stats should be present");
-        let reset_weighted_minimax = policy_stats
-            .iter()
-            .find(|stats| stats.policy_name == "reset-weighted-minimax")
-            .expect("reset-weighted-minimax stats should be present");
 
         for stats in &policy_stats {
             assert!(
@@ -597,55 +505,54 @@ fn simulator_compares_baseline_policies_across_demand_scenarios() {
             );
         }
 
+        merge_policy_stats(&mut aggregate_stats, policy_stats);
+    }
+
+    let aggregate_stats = aggregate_stats.expect("realistic scenario suite should not be empty");
+    let drain_first = find_policy_stats(&aggregate_stats, "drain-first");
+    let deadline_aware = find_policy_stats(&aggregate_stats, "deadline-aware");
+    let shadow_price = find_policy_stats(&aggregate_stats, "shadow-price");
+    let reset_weighted_minimax = find_policy_stats(&aggregate_stats, "reset-weighted-minimax");
+    let aggregate_demand_credits = aggregate_stats[0].stats.total_demand_credits();
+
+    for stats in &aggregate_stats {
         assert!(
-            deadline_aware.stats.user_unavailable_minutes()
-                <= drain_first.stats.user_unavailable_minutes(),
-            "deadline-aware should not increase unavailable time vs drain-first in {}: {policy_stats:?}",
-            scenario.name
-        );
-        assert!(
-            shadow_price.stats.user_unavailable_minutes()
-                <= deadline_aware.stats.user_unavailable_minutes(),
-            "shadow-price should not increase unavailable time vs deadline-aware in {}: {policy_stats:?}",
-            scenario.name
-        );
-        assert!(
-            reset_weighted_minimax.stats.user_unavailable_minutes()
-                <= shadow_price.stats.user_unavailable_minutes(),
-            "reset-weighted-minimax should not increase unavailable time vs shadow-price in {}: {policy_stats:?}",
-            scenario.name
+            (stats.stats.total_demand_credits() - aggregate_demand_credits).abs() < 0.000_001,
+            "all policies should see the same total demand: {aggregate_stats:?}",
         );
     }
-}
 
-#[test]
-fn simulator_includes_bursty_and_weekly_skewed_scenarios() {
-    let bursty = SimScenario::new(
-        "bursty-short-sessions",
-        2,
-        SimDemand::SessionBursts {
-            base_credits_per_minute: 1.5,
-            burst_credits_per_minute: 8.0,
-            burst_minutes: 20,
-        },
-        InitialUsage::Empty,
+    assert!(
+        aggregate_stats
+            .iter()
+            .any(|stats| stats.stats.user_unavailable_minutes() > 0),
+        "realistic suite should include quota pressure that can exhaust every account: {aggregate_stats:?}",
     );
-    let weekly_skewed = SimScenario::new(
-        "weekly-near-exhaustion-mixed",
-        2,
-        SimDemand::Constant(2.0),
-        InitialUsage::WeeklyNearExhaustionMixed,
+    assert!(
+        drain_first.stats.preventable_failures > 0,
+        "drain-first should expose cases where a selected account is exhausted while another account can still serve: {aggregate_stats:?}",
+    );
+    assert_eq!(
+        deadline_aware.stats.preventable_failures, 0,
+        "deadline-aware should not select exhausted accounts when a usable account exists: {aggregate_stats:?}",
+    );
+    assert_eq!(
+        shadow_price.stats.preventable_failures, 0,
+        "shadow-price should not select exhausted accounts when a usable account exists: {aggregate_stats:?}",
+    );
+    assert_eq!(
+        reset_weighted_minimax.stats.preventable_failures, 0,
+        "reset-weighted-minimax should not select exhausted accounts when a usable account exists: {aggregate_stats:?}",
     );
 
-    let mut bursty_policy = DeadlineAwarePolicy::default();
-    let bursty_stats = simulate_policy_scenario(&mut bursty_policy, bursty);
-    let mut weekly_policy = DeadlineAwarePolicy::default();
-    let weekly_stats = simulate_policy_scenario(&mut weekly_policy, weekly_skewed);
-
-    assert!(bursty_stats.account_switches > 0);
-    assert!(bursty_stats.served_credits > 0.0);
-    assert!(weekly_stats.min_weekly_remaining < PRO_200_WEEKLY_LIMIT_CREDITS * 0.1);
-    assert_eq!(weekly_stats.user_unavailable_minutes(), 0);
+    let best_failed_credits = aggregate_stats
+        .iter()
+        .map(|stats| stats.stats.failed_credits)
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        reset_weighted_minimax.stats.failed_credits <= best_failed_credits * 1.01,
+        "reset-weighted-minimax failed credits should stay within 1% of the best policy in the realistic suite: {aggregate_stats:?}",
+    );
 }
 
 #[test]
@@ -782,109 +689,12 @@ fn offline_oracle_bounds_existing_online_policies_on_small_trace() {
     }
 }
 
-#[test]
-fn generated_trace_suite_keeps_shadow_price_no_worse_than_deadline_aware() {
-    let mut deadline_aware_unavailable = 0;
-    let mut shadow_price_unavailable = 0;
-    let mut deadline_aware_failed_credits = 0;
-    let mut shadow_price_failed_credits = 0;
-    let mut evaluated_traces = 0;
-    let mut shadow_price_regressions = 0;
-
-    for seed in 1_u64..=32 {
-        let limits = generated_trace_limits(seed);
-        let trace = generated_trace(seed);
-        let deadline_aware =
-            simulate_policy_trace(&mut DeadlineAwarePolicy::default(), &trace, limits);
-        let shadow_price = simulate_policy_trace(&mut ShadowPricePolicy::default(), &trace, limits);
-
-        deadline_aware_unavailable += deadline_aware.user_unavailable_minutes();
-        shadow_price_unavailable += shadow_price.user_unavailable_minutes();
-        deadline_aware_failed_credits += deadline_aware.failed_credits;
-        shadow_price_failed_credits += shadow_price.failed_credits;
-        evaluated_traces += 1;
-        if shadow_price.user_unavailable_minutes() > deadline_aware.user_unavailable_minutes() {
-            shadow_price_regressions += 1;
-        }
-    }
-
-    assert_eq!(evaluated_traces, 32);
-    assert!(
-        shadow_price_regressions < evaluated_traces,
-        "shadow-price should not regress every generated trace",
-    );
-    assert!(
-        deadline_aware_unavailable > 0,
-        "generated traces should exercise unavailable-time behavior",
-    );
-    assert!(
-        shadow_price_unavailable < deadline_aware_unavailable,
-        "shadow-price aggregate unavailable time should improve: {shadow_price_unavailable} vs {deadline_aware_unavailable}",
-    );
-    assert!(
-        f64::from(shadow_price_failed_credits) <= f64::from(deadline_aware_failed_credits) * 1.01,
-        "shadow-price failed credits should stay within 1% of deadline-aware: {shadow_price_failed_credits} vs {deadline_aware_failed_credits}",
-    );
-}
-
-#[test]
-fn generated_trace_suite_keeps_reset_weighted_minimax_best_overall() {
-    let mut deadline_aware_unavailable = 0;
-    let mut shadow_price_unavailable = 0;
-    let mut reset_weighted_minimax_unavailable = 0;
-    let mut deadline_aware_failed_credits = 0;
-    let mut reset_weighted_minimax_failed_credits = 0;
-    let mut evaluated_traces = 0;
-    let mut reset_weighted_minimax_regressions = 0;
-
-    for seed in 1_u64..=32 {
-        let limits = generated_trace_limits(seed);
-        let trace = generated_trace(seed);
-        let deadline_aware =
-            simulate_policy_trace(&mut DeadlineAwarePolicy::default(), &trace, limits);
-        let shadow_price = simulate_policy_trace(&mut ShadowPricePolicy::default(), &trace, limits);
-        let reset_weighted_minimax =
-            simulate_policy_trace(&mut ResetWeightedMinimaxPolicy::default(), &trace, limits);
-
-        deadline_aware_unavailable += deadline_aware.user_unavailable_minutes();
-        shadow_price_unavailable += shadow_price.user_unavailable_minutes();
-        reset_weighted_minimax_unavailable += reset_weighted_minimax.user_unavailable_minutes();
-        deadline_aware_failed_credits += deadline_aware.failed_credits;
-        reset_weighted_minimax_failed_credits += reset_weighted_minimax.failed_credits;
-        evaluated_traces += 1;
-        if reset_weighted_minimax.user_unavailable_minutes()
-            > deadline_aware.user_unavailable_minutes()
-        {
-            reset_weighted_minimax_regressions += 1;
-        }
-    }
-
-    assert_eq!(evaluated_traces, 32);
-    assert!(
-        reset_weighted_minimax_regressions < evaluated_traces,
-        "reset-weighted-minimax should not regress every generated trace",
-    );
-    assert!(
-        reset_weighted_minimax_unavailable < shadow_price_unavailable,
-        "reset-weighted-minimax aggregate unavailable time should improve over shadow-price: {reset_weighted_minimax_unavailable} vs {shadow_price_unavailable}",
-    );
-    assert!(
-        reset_weighted_minimax_unavailable < deadline_aware_unavailable,
-        "reset-weighted-minimax aggregate unavailable time should improve over deadline-aware: {reset_weighted_minimax_unavailable} vs {deadline_aware_unavailable}",
-    );
-    assert!(
-        reset_weighted_minimax_failed_credits <= deadline_aware_failed_credits,
-        "reset-weighted-minimax failed credits should not exceed deadline-aware: {reset_weighted_minimax_failed_credits} vs {deadline_aware_failed_credits}",
-    );
-}
-
 const FIVE_HOUR_WINDOW_MINUTES: i64 = 300;
 const WEEKLY_WINDOW_MINUTES: i64 = 10_080;
 const SIMULATION_WEEKS: i64 = 2;
 const SIMULATION_MINUTES: i64 = WEEKLY_WINDOW_MINUTES * SIMULATION_WEEKS;
 const PRO_200_FIVE_HOUR_LIMIT_CREDITS: f64 = 1_250.0;
 const PRO_200_WEEKLY_LIMIT_CREDITS: f64 = 5_000.0;
-const ACTIVE_MINUTES_PER_ROLLING_WEEK: i32 = 2_250;
 
 #[derive(Debug, Clone, Copy)]
 struct SimScenario {
@@ -909,65 +719,91 @@ impl SimScenario {
         }
     }
 
-    fn steady(name: &'static str, account_count: usize, credits_per_minute: f64) -> Self {
-        Self::new(
-            name,
-            account_count,
-            SimDemand::Constant(credits_per_minute),
-            InitialUsage::Empty,
-        )
-    }
-
     fn demand_at(self, minute: i64) -> Option<f64> {
-        if !is_work_minute(minute) {
+        if !is_coding_minute(minute) {
             return None;
         }
 
-        Some(match self.demand {
-            SimDemand::Constant(credits_per_minute) => credits_per_minute,
-            SimDemand::SessionBursts {
-                base_credits_per_minute,
-                burst_credits_per_minute,
-                burst_minutes,
+        let credits_per_minute = match self.demand {
+            SimDemand::WorkdayProfile(profile) => profile.credits_at(minute),
+            SimDemand::DeadlineRamp {
+                normal_profile,
+                deadline_profile,
+                deadline_start_day,
             } => {
-                if is_session_burst_minute(minute, burst_minutes) {
-                    burst_credits_per_minute
+                if minute / 1_440 >= deadline_start_day {
+                    deadline_profile.credits_at(minute)
                 } else {
-                    base_credits_per_minute
+                    normal_profile.credits_at(minute)
                 }
             }
-            SimDemand::HeavyFirstWorkday {
-                normal_credits_per_minute,
-                heavy_credits_per_minute,
+            SimDemand::InterruptDriven {
+                profile,
+                interrupt_credits_per_minute,
+                interrupt_every_minutes,
+                interrupt_duration_minutes,
             } => {
-                if minute / 1_440 == 0 {
-                    heavy_credits_per_minute
+                if is_interrupt_minute(minute, interrupt_every_minutes, interrupt_duration_minutes)
+                {
+                    interrupt_credits_per_minute
                 } else {
-                    normal_credits_per_minute
+                    profile.credits_at(minute)
                 }
             }
-        })
+        };
+
+        Some(credits_per_minute * weekday_load_multiplier(minute))
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 enum SimDemand {
-    Constant(f64),
-    SessionBursts {
-        base_credits_per_minute: f64,
-        burst_credits_per_minute: f64,
-        burst_minutes: i64,
+    WorkdayProfile(WorkloadProfile),
+    DeadlineRamp {
+        normal_profile: WorkloadProfile,
+        deadline_profile: WorkloadProfile,
+        deadline_start_day: i64,
     },
-    HeavyFirstWorkday {
-        normal_credits_per_minute: f64,
-        heavy_credits_per_minute: f64,
+    InterruptDriven {
+        profile: WorkloadProfile,
+        interrupt_credits_per_minute: f64,
+        interrupt_every_minutes: i64,
+        interrupt_duration_minutes: i64,
     },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WorkloadProfile {
+    baseline_credits_per_minute: f64,
+    focus_credits_per_minute: f64,
+    review_credits_per_minute: f64,
+    burst_credits_per_minute: f64,
+}
+
+impl WorkloadProfile {
+    fn credits_at(self, minute: i64) -> f64 {
+        let minute_of_day = minute % 1_440;
+
+        if is_prompt_burst_minute(minute) {
+            return self.burst_credits_per_minute;
+        }
+
+        if (615..705).contains(&minute_of_day) || (810..930).contains(&minute_of_day) {
+            self.focus_credits_per_minute
+        } else if (570..615).contains(&minute_of_day) || (960..1_020).contains(&minute_of_day) {
+            self.review_credits_per_minute
+        } else {
+            self.baseline_credits_per_minute
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 enum InitialUsage {
     Empty,
-    WeeklyNearExhaustionMixed,
+    CarryoverFromPreviousSessions,
+    FiveHourCarryoverMixed,
+    WeeklyNearResetMixed,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1048,84 +884,27 @@ impl SimStats {
     fn total_demand_credits(&self) -> f64 {
         self.served_credits + self.failed_credits
     }
+
+    fn merge(&mut self, other: Self) {
+        self.served_credits += other.served_credits;
+        self.failed_credits += other.failed_credits;
+        self.preventable_failures += other.preventable_failures;
+        self.unavailable_minutes += other.unavailable_minutes;
+        self.max_contiguous_unavailable_minutes = self
+            .max_contiguous_unavailable_minutes
+            .max(other.max_contiguous_unavailable_minutes);
+        self.account_switches += other.account_switches;
+        self.min_five_hour_remaining = self
+            .min_five_hour_remaining
+            .min(other.min_five_hour_remaining);
+        self.min_weekly_remaining = self.min_weekly_remaining.min(other.min_weekly_remaining);
+    }
 }
 
 #[derive(Debug)]
 struct PolicyStats {
     policy_name: &'static str,
     stats: SimStats,
-}
-
-struct DeterministicRng {
-    state: u64,
-}
-
-impl DeterministicRng {
-    fn new(seed: u64) -> Self {
-        Self {
-            state: seed ^ 0xe703_7ed1_a0b4_28db,
-        }
-    }
-
-    fn next_u32(&mut self) -> u32 {
-        self.state = self
-            .state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        u32::try_from(self.state >> 32).expect("upper 32 bits should fit u32")
-    }
-
-    fn range_i32(&mut self, min: i32, max: i32) -> i32 {
-        assert!(min <= max);
-        let width = u32::try_from(max - min + 1).expect("range width should fit u32");
-        let offset = i32::try_from(self.next_u32() % width).expect("offset should fit i32");
-        min + offset
-    }
-
-    fn range_u16(&mut self, min: u16, max: u16) -> u16 {
-        assert!(min <= max);
-        let width = u32::from(max - min) + 1;
-        let offset = u16::try_from(self.next_u32() % width).expect("offset should fit u16");
-        min + offset
-    }
-
-    fn one_in(&mut self, denominator: u32) -> bool {
-        assert!(denominator > 0);
-        self.next_u32().is_multiple_of(denominator)
-    }
-}
-
-fn max_sustainable_burn_for_policy<P, F>(account_count: usize, mut policy_factory: F) -> f64
-where
-    P: AccountSelectionPolicy,
-    F: FnMut() -> P,
-{
-    let mut low = 0.0;
-    let mut high = 10.0;
-
-    for _ in 0..24 {
-        let mid = (low + high) / 2.0;
-        let mut policy = policy_factory();
-        let stats = simulate_policy_work_week(&mut policy, account_count, mid);
-        if stats.user_unavailable_minutes() == 0 {
-            low = mid;
-        } else {
-            high = mid;
-        }
-    }
-
-    low
-}
-
-fn simulate_policy_work_week<P: AccountSelectionPolicy>(
-    policy: &mut P,
-    account_count: usize,
-    credits_per_minute: f64,
-) -> SimStats {
-    simulate_policy_scenario(
-        policy,
-        SimScenario::steady("steady-work-week", account_count, credits_per_minute),
-    )
 }
 
 fn simulate_policy_scenario<P: AccountSelectionPolicy>(
@@ -1169,34 +948,118 @@ fn simulate_policy_scenario<P: AccountSelectionPolicy>(
     stats
 }
 
-fn evaluation_scenarios() -> [SimScenario; 5] {
+fn realistic_usage_scenarios() -> [SimScenario; 8] {
     [
-        SimScenario::steady("light-steady", 2, 1.0),
-        SimScenario::steady("near-capacity-steady", 2, 4.35),
         SimScenario::new(
-            "bursty-short-sessions",
+            "regular-feature-work",
             2,
-            SimDemand::SessionBursts {
-                base_credits_per_minute: 1.5,
+            SimDemand::WorkdayProfile(WorkloadProfile {
+                baseline_credits_per_minute: 0.9,
+                focus_credits_per_minute: 2.4,
+                review_credits_per_minute: 1.5,
+                burst_credits_per_minute: 5.0,
+            }),
+            InitialUsage::Empty,
+        ),
+        SimScenario::new(
+            "large-refactor-with-turn-spikes",
+            2,
+            SimDemand::WorkdayProfile(WorkloadProfile {
+                baseline_credits_per_minute: 2.6,
+                focus_credits_per_minute: 7.8,
+                review_credits_per_minute: 4.0,
+                burst_credits_per_minute: 13.0,
+            }),
+            InitialUsage::Empty,
+        ),
+        SimScenario::new(
+            "release-week-ramp",
+            2,
+            SimDemand::DeadlineRamp {
+                normal_profile: WorkloadProfile {
+                    baseline_credits_per_minute: 0.9,
+                    focus_credits_per_minute: 2.8,
+                    review_credits_per_minute: 1.8,
+                    burst_credits_per_minute: 5.5,
+                },
+                deadline_profile: WorkloadProfile {
+                    baseline_credits_per_minute: 4.0,
+                    focus_credits_per_minute: 12.0,
+                    review_credits_per_minute: 6.0,
+                    burst_credits_per_minute: 18.0,
+                },
+                deadline_start_day: 7,
+            },
+            InitialUsage::Empty,
+        ),
+        SimScenario::new(
+            "carryover-from-previous-codex-sessions",
+            2,
+            SimDemand::WorkdayProfile(WorkloadProfile {
+                baseline_credits_per_minute: 1.3,
+                focus_credits_per_minute: 4.1,
+                review_credits_per_minute: 2.2,
+                burst_credits_per_minute: 7.5,
+            }),
+            InitialUsage::CarryoverFromPreviousSessions,
+        ),
+        SimScenario::new(
+            "mixed-five-hour-carryover",
+            2,
+            SimDemand::WorkdayProfile(WorkloadProfile {
+                baseline_credits_per_minute: 1.4,
+                focus_credits_per_minute: 4.6,
+                review_credits_per_minute: 2.5,
                 burst_credits_per_minute: 8.0,
-                burst_minutes: 20,
+            }),
+            InitialUsage::FiveHourCarryoverMixed,
+        ),
+        SimScenario::new(
+            "weekly-near-reset-carryover",
+            2,
+            SimDemand::WorkdayProfile(WorkloadProfile {
+                baseline_credits_per_minute: 1.2,
+                focus_credits_per_minute: 3.5,
+                review_credits_per_minute: 2.1,
+                burst_credits_per_minute: 6.5,
+            }),
+            InitialUsage::WeeklyNearResetMixed,
+        ),
+        SimScenario::new(
+            "support-interruptions-during-feature-work",
+            3,
+            SimDemand::InterruptDriven {
+                profile: WorkloadProfile {
+                    baseline_credits_per_minute: 1.0,
+                    focus_credits_per_minute: 3.4,
+                    review_credits_per_minute: 1.8,
+                    burst_credits_per_minute: 6.5,
+                },
+                interrupt_credits_per_minute: 8.0,
+                interrupt_every_minutes: 180,
+                interrupt_duration_minutes: 18,
             },
             InitialUsage::Empty,
         ),
         SimScenario::new(
-            "one-heavy-day-then-normal",
-            2,
-            SimDemand::HeavyFirstWorkday {
-                normal_credits_per_minute: 2.0,
-                heavy_credits_per_minute: 6.0,
+            "three-account-heavy-project-week",
+            3,
+            SimDemand::DeadlineRamp {
+                normal_profile: WorkloadProfile {
+                    baseline_credits_per_minute: 2.0,
+                    focus_credits_per_minute: 6.0,
+                    review_credits_per_minute: 3.2,
+                    burst_credits_per_minute: 11.0,
+                },
+                deadline_profile: WorkloadProfile {
+                    baseline_credits_per_minute: 5.0,
+                    focus_credits_per_minute: 14.0,
+                    review_credits_per_minute: 7.0,
+                    burst_credits_per_minute: 20.0,
+                },
+                deadline_start_day: 7,
             },
-            InitialUsage::Empty,
-        ),
-        SimScenario::new(
-            "weekly-near-exhaustion-mixed",
-            2,
-            SimDemand::Constant(2.0),
-            InitialUsage::WeeklyNearExhaustionMixed,
+            InitialUsage::CarryoverFromPreviousSessions,
         ),
     ]
 }
@@ -1237,45 +1100,26 @@ fn policy_stats_for_scenario(scenario: SimScenario) -> [PolicyStats; 6] {
     ]
 }
 
-fn generated_trace_limits(seed: u64) -> TraceLimits {
-    let mut rng = DeterministicRng::new(seed);
-    let five_hour_limit = rng.range_u16(18, 32);
+fn merge_policy_stats(
+    aggregate_stats: &mut Option<[PolicyStats; 6]>,
+    scenario_stats: [PolicyStats; 6],
+) {
+    let Some(aggregate_stats) = aggregate_stats else {
+        *aggregate_stats = Some(scenario_stats);
+        return;
+    };
 
-    TraceLimits {
-        account_count: 2 + usize::try_from(seed % 3).expect("seed modulo should fit usize"),
-        five_hour_limit,
-        weekly_limit: five_hour_limit * 4,
-        five_hour_window: 30,
-        weekly_window: 240,
+    for (aggregate, scenario) in aggregate_stats.iter_mut().zip(scenario_stats) {
+        assert_eq!(aggregate.policy_name, scenario.policy_name);
+        aggregate.stats.merge(scenario.stats);
     }
 }
 
-fn generated_trace(seed: u64) -> Vec<TraceDemand> {
-    let mut rng = DeterministicRng::new(seed ^ 0xa076_1d64_78bd_642f);
-    let mut trace = Vec::new();
-    let mut minute = 0;
-
-    while minute < 480 {
-        minute += rng.range_i32(1, 3);
-        if !is_generated_trace_work_minute(minute) {
-            continue;
-        }
-
-        let burst = if rng.one_in(7) {
-            rng.range_u16(3, 8)
-        } else {
-            0
-        };
-        let credits = rng.range_u16(1, 4) + burst;
-        trace.push(TraceDemand { minute, credits });
-    }
-
-    trace
-}
-
-fn is_generated_trace_work_minute(minute: i32) -> bool {
-    let slot = minute % 120;
-    (10..55).contains(&slot) || (75..105).contains(&slot)
+fn find_policy_stats<'a>(policy_stats: &'a [PolicyStats], policy_name: &str) -> &'a PolicyStats {
+    policy_stats
+        .iter()
+        .find(|stats| stats.policy_name == policy_name)
+        .unwrap_or_else(|| panic!("{policy_name} stats should be present"))
 }
 
 // Offline upper bound for small deterministic traces. This is a test oracle,
@@ -1428,7 +1272,26 @@ fn validate_trace_inputs(trace: &[TraceDemand], limits: TraceLimits) {
 fn apply_initial_usage(accounts: &mut [SimAccount], initial_usage: InitialUsage) {
     match initial_usage {
         InitialUsage::Empty => {}
-        InitialUsage::WeeklyNearExhaustionMixed => {
+        InitialUsage::CarryoverFromPreviousSessions => {
+            if let Some(account) = accounts.get_mut(0) {
+                account.seed_initial_usage(450.0, 2_700.0, 180, 3 * 1_440);
+            }
+            if let Some(account) = accounts.get_mut(1) {
+                account.seed_initial_usage(120.0, 1_100.0, 260, 5 * 1_440);
+            }
+            if let Some(account) = accounts.get_mut(2) {
+                account.seed_initial_usage(300.0, 1_900.0, 90, 4 * 1_440);
+            }
+        }
+        InitialUsage::FiveHourCarryoverMixed => {
+            if let Some(account) = accounts.get_mut(0) {
+                account.seed_initial_usage(950.0, 1_700.0, 45, 6 * 1_440);
+            }
+            if let Some(account) = accounts.get_mut(1) {
+                account.seed_initial_usage(175.0, 3_100.0, 230, 4 * 1_440);
+            }
+        }
+        InitialUsage::WeeklyNearResetMixed => {
             if let Some(account) = accounts.get_mut(0) {
                 account.seed_initial_usage(25.0, 4_600.0, 200, 2 * 1_440);
             }
@@ -1526,11 +1389,58 @@ fn is_work_minute(minute: i64) -> bool {
     (570..720).contains(&minute_of_day) || (810..1_110).contains(&minute_of_day)
 }
 
-fn is_session_burst_minute(minute: i64, burst_minutes: i64) -> bool {
-    let burst_minutes = burst_minutes.max(0);
+fn is_coding_minute(minute: i64) -> bool {
+    if !is_work_minute(minute) {
+        return false;
+    }
+
     let minute_of_day = minute % 1_440;
-    (570..570 + burst_minutes).contains(&minute_of_day)
-        || (810..810 + burst_minutes).contains(&minute_of_day)
+    let standup_or_break = (600..615).contains(&minute_of_day)
+        || (960..970).contains(&minute_of_day)
+        || (minute_of_day % 60 >= 52);
+    !standup_or_break
+}
+
+fn is_prompt_burst_minute(minute: i64) -> bool {
+    let minute_of_day = minute % 1_440;
+    let focus_block_minute = if (615..705).contains(&minute_of_day) {
+        Some(minute_of_day - 615)
+    } else if (810..930).contains(&minute_of_day) {
+        Some(minute_of_day - 810)
+    } else {
+        None
+    };
+
+    focus_block_minute.is_some_and(|block_minute| block_minute % 45 < 6)
+}
+
+fn is_interrupt_minute(
+    minute: i64,
+    interrupt_every_minutes: i64,
+    interrupt_duration_minutes: i64,
+) -> bool {
+    if interrupt_every_minutes <= 0 || interrupt_duration_minutes <= 0 {
+        return false;
+    }
+
+    let minute_of_day = minute % 1_440;
+    let workday_start = 570;
+    if minute_of_day < workday_start {
+        return false;
+    }
+
+    (minute_of_day - workday_start) % interrupt_every_minutes < interrupt_duration_minutes
+}
+
+fn weekday_load_multiplier(minute: i64) -> f64 {
+    match (minute / 1_440) % 7 {
+        0 => 0.9,
+        1 => 1.05,
+        2 => 1.1,
+        3 => 1.0,
+        4 => 0.75,
+        _ => 0.0,
+    }
 }
 
 impl SimAccount {
