@@ -12,6 +12,7 @@ mod store_lock;
 mod switcher;
 mod token;
 mod types;
+mod update;
 mod usage;
 
 use std::collections::HashMap;
@@ -111,6 +112,10 @@ async fn run() -> Result<()> {
             if !status.success() {
                 std::process::exit(status.code().unwrap_or(1));
             }
+        }
+        Command::Update { check, version } => {
+            let outcome = update::update(update::UpdateOptions { check, version }).await?;
+            print_update_outcome(outcome);
         }
         Command::Usage { all, account } => {
             if all {
@@ -215,6 +220,50 @@ fn print_auto_switch_result(result: auto_switch::AutoSwitchResult) {
                     to.name,
                     store::short_id(&to.id),
                     reason
+                );
+            }
+        }
+    }
+}
+
+fn print_update_outcome(outcome: update::UpdateOutcome) {
+    match outcome {
+        update::UpdateOutcome::UpToDate {
+            current_version,
+            release_version,
+        } => {
+            println!(
+                "codex-switch is up to date (current {current_version}, release {release_version})."
+            );
+        }
+        update::UpdateOutcome::UpdateAvailable {
+            current_version,
+            release_version,
+        } => {
+            println!("Update available: {current_version} -> {release_version}");
+        }
+        update::UpdateOutcome::CurrentNewer {
+            current_version,
+            release_version,
+        } => {
+            println!(
+                "Current codex-switch version {current_version} is newer than release {release_version}."
+            );
+        }
+        update::UpdateOutcome::Updated {
+            previous_version,
+            installed_version,
+            executable_path,
+        } => {
+            if previous_version == installed_version {
+                println!(
+                    "Installed codex-switch {installed_version} at {}",
+                    executable_path.display()
+                );
+            } else {
+                println!(
+                    "Updated codex-switch {previous_version} -> {installed_version} at {}",
+                    executable_path.display()
                 );
             }
         }
