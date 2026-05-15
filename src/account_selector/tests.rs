@@ -158,6 +158,253 @@ const REPLACEMENT_MAX_SWITCH_INCREASE_ABSOLUTE: u32 = 25;
 const REPLACEMENT_FAILED_CREDITS_RELATIVE_TOLERANCE: f64 = 0.01;
 const REPLACEMENT_FAILED_CREDITS_ABSOLUTE_TOLERANCE: f64 = 0.000_001;
 
+#[derive(Debug, Clone, Copy)]
+struct ReplacementGate {
+    min_unavailable_reduction_minutes: u32,
+    min_unavailable_reduction_ratio: f64,
+    max_switch_increase_ratio: f64,
+    max_switch_increase_absolute: u32,
+    failed_credits_relative_tolerance: f64,
+    failed_credits_absolute_tolerance: f64,
+}
+
+impl Default for ReplacementGate {
+    fn default() -> Self {
+        Self {
+            min_unavailable_reduction_minutes: REPLACEMENT_MIN_UNAVAILABLE_REDUCTION_MINUTES,
+            min_unavailable_reduction_ratio: REPLACEMENT_MIN_UNAVAILABLE_REDUCTION_RATIO,
+            max_switch_increase_ratio: REPLACEMENT_MAX_SWITCH_INCREASE_RATIO,
+            max_switch_increase_absolute: REPLACEMENT_MAX_SWITCH_INCREASE_ABSOLUTE,
+            failed_credits_relative_tolerance: REPLACEMENT_FAILED_CREDITS_RELATIVE_TOLERANCE,
+            failed_credits_absolute_tolerance: REPLACEMENT_FAILED_CREDITS_ABSOLUTE_TOLERANCE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ReplacementGateDecision {
+    Pass,
+    Fail(ReplacementGateFailure),
+}
+
+impl ReplacementGateDecision {
+    fn is_pass(&self) -> bool {
+        matches!(self, Self::Pass)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ReplacementGateFailure {
+    kind: ReplacementGateFailureKind,
+    reason: String,
+}
+
+impl ReplacementGateFailure {
+    fn new(kind: ReplacementGateFailureKind, reason: String) -> Self {
+        Self { kind, reason }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplacementGateFailureKind {
+    PreventableFailuresPresent,
+    MaxContiguousUnavailableRegressed,
+    FailedCreditsExceeded,
+    SwitchesExceeded,
+    UnavailableRegressed,
+    UnavailableReductionTooSmall,
+    ScenarioRegressed,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ReplacementGateSummaryScope {
+    Aggregate,
+    Scenario,
+}
+
+impl ReplacementGateSummaryScope {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Aggregate => "aggregate",
+            Self::Scenario => "scenario",
+        }
+    }
+}
+
+impl ReplacementGate {
+    fn evaluate_candidate(
+        &self,
+        evaluation: &PolicyEvaluation,
+        candidate_name: &str,
+    ) -> ReplacementGateDecision {
+        let default_aggregate = find_policy_stats(&evaluation.aggregate_stats, DEFAULT_POLICY_NAME);
+        let candidate_aggregate = find_policy_stats(&evaluation.aggregate_stats, candidate_name);
+        if let Some(failure) =
+            self.guardrail_failure(&default_aggregate.stats, &candidate_aggregate.stats)
+        {
+            return ReplacementGateDecision::Fail(failure);
+        }
+
+        for scenario in &evaluation.scenarios {
+            let default_stats = find_policy_stats(&scenario.policy_stats, DEFAULT_POLICY_NAME);
+            let candidate_stats = find_policy_stats(&scenario.policy_stats, candidate_name);
+            if let ReplacementGateDecision::Fail(failure) =
+                self.evaluate_scenario(&default_stats.stats, &candidate_stats.stats)
+            {
+                return ReplacementGateDecision::Fail(ReplacementGateFailure::new(
+                    ReplacementGateFailureKind::ScenarioRegressed,
+                    format!("{}: {}", scenario.scenario_name, failure.reason),
+                ));
+            }
+        }
+
+        let aggregate_decision = self
+            .evaluate_unavailable_improvement(&default_aggregate.stats, &candidate_aggregate.stats);
+        if !aggregate_decision.is_pass() {
+            return aggregate_decision;
+        }
+
+        ReplacementGateDecision::Pass
+    }
+
+    fn evaluate_aggregate(
+        &self,
+        default: &SimStats,
+        candidate: &SimStats,
+    ) -> ReplacementGateDecision {
+        if let Some(failure) = self.guardrail_failure(default, candidate) {
+            return ReplacementGateDecision::Fail(failure);
+        }
+
+        self.evaluate_unavailable_improvement(default, candidate)
+    }
+
+    fn evaluate_unavailable_improvement(
+        &self,
+        default: &SimStats,
+        candidate: &SimStats,
+    ) -> ReplacementGateDecision {
+        let default_unavailable = default.user_unavailable_minutes();
+        let candidate_unavailable = candidate.user_unavailable_minutes();
+        if candidate_unavailable > default_unavailable {
+            return ReplacementGateDecision::Fail(ReplacementGateFailure::new(
+                ReplacementGateFailureKind::UnavailableRegressed,
+                format!(
+                    "unavailable regressed from {default_unavailable} to {candidate_unavailable}"
+                ),
+            ));
+        }
+
+        let actual_reduction = default_unavailable.saturating_sub(candidate_unavailable);
+        let required_reduction = self.min_unavailable_reduction(default_unavailable);
+        if actual_reduction < required_reduction {
+            return ReplacementGateDecision::Fail(ReplacementGateFailure::new(
+                ReplacementGateFailureKind::UnavailableReductionTooSmall,
+                format!(
+                    "unavailable reduction {actual_reduction} is below required {required_reduction}"
+                ),
+            ));
+        }
+
+        ReplacementGateDecision::Pass
+    }
+
+    fn evaluate_scenario(
+        &self,
+        default: &SimStats,
+        candidate: &SimStats,
+    ) -> ReplacementGateDecision {
+        if let Some(failure) = self.guardrail_failure(default, candidate) {
+            return ReplacementGateDecision::Fail(failure);
+        }
+
+        if candidate.user_unavailable_minutes() > default.user_unavailable_minutes() {
+            return ReplacementGateDecision::Fail(ReplacementGateFailure::new(
+                ReplacementGateFailureKind::UnavailableRegressed,
+                format!(
+                    "unavailable regressed from {} to {}",
+                    default.user_unavailable_minutes(),
+                    candidate.user_unavailable_minutes()
+                ),
+            ));
+        }
+
+        ReplacementGateDecision::Pass
+    }
+
+    fn guardrail_failure(
+        &self,
+        default: &SimStats,
+        candidate: &SimStats,
+    ) -> Option<ReplacementGateFailure> {
+        if candidate.preventable_failures > 0 {
+            return Some(ReplacementGateFailure::new(
+                ReplacementGateFailureKind::PreventableFailuresPresent,
+                format!(
+                    "preventable failures must stay zero, got {}",
+                    candidate.preventable_failures
+                ),
+            ));
+        }
+
+        if candidate.max_contiguous_unavailable_minutes > default.max_contiguous_unavailable_minutes
+        {
+            return Some(ReplacementGateFailure::new(
+                ReplacementGateFailureKind::MaxContiguousUnavailableRegressed,
+                format!(
+                    "max contiguous unavailable regressed from {} to {}",
+                    default.max_contiguous_unavailable_minutes,
+                    candidate.max_contiguous_unavailable_minutes
+                ),
+            ));
+        }
+
+        let failed_credits_budget = self.failed_credits_budget(default.failed_credits);
+        if candidate.failed_credits > failed_credits_budget {
+            return Some(ReplacementGateFailure::new(
+                ReplacementGateFailureKind::FailedCreditsExceeded,
+                format!(
+                    "failed credits {:.1} exceed budget {:.1}",
+                    candidate.failed_credits, failed_credits_budget
+                ),
+            ));
+        }
+
+        let switch_budget = self.switch_budget(default.account_switches);
+        if candidate.account_switches > switch_budget {
+            return Some(ReplacementGateFailure::new(
+                ReplacementGateFailureKind::SwitchesExceeded,
+                format!(
+                    "switches {} exceed budget {}",
+                    candidate.account_switches, switch_budget
+                ),
+            ));
+        }
+
+        None
+    }
+
+    fn min_unavailable_reduction(&self, default_unavailable: u32) -> u32 {
+        let ratio_reduction =
+            (f64::from(default_unavailable) * self.min_unavailable_reduction_ratio).ceil() as u32;
+        self.min_unavailable_reduction_minutes.max(ratio_reduction)
+    }
+
+    fn switch_budget(&self, default_switches: u32) -> u32 {
+        (f64::from(default_switches) * self.max_switch_increase_ratio).ceil() as u32
+            + self.max_switch_increase_absolute
+    }
+
+    fn failed_credits_budget(&self, default_failed: f64) -> f64 {
+        default_failed * (1.0 + self.failed_credits_relative_tolerance)
+            + self.failed_credits_absolute_tolerance
+    }
+
+    fn compare_passing_candidates(left: &PolicyStats, right: &PolicyStats) -> Ordering {
+        compare_policy_outcome(&left.stats, &right.stats)
+    }
+}
+
 #[test]
 fn excludes_hard_unavailable_accounts() {
     let api_key = api_key_account("api-key");
@@ -574,6 +821,356 @@ fn default_policy_replacement_requires_clear_availability_win() {
 }
 
 #[test]
+fn runtime_replacement_candidates_are_explicit_simulated_non_default_policies() {
+    let mut candidate_names = Vec::new();
+    for candidate in RUNTIME_REPLACEMENT_CANDIDATES {
+        let policy_name = policy_name_for_kind(*candidate);
+        assert_ne!(
+            policy_name, DEFAULT_POLICY_NAME,
+            "default policy should not be a replacement candidate",
+        );
+        assert!(
+            SIMULATED_POLICY_NAMES.contains(&policy_name),
+            "{policy_name} must be included in simulated policy names",
+        );
+        assert!(
+            !candidate_names.contains(&policy_name),
+            "{policy_name} is duplicated in runtime replacement candidates",
+        );
+        candidate_names.push(policy_name);
+    }
+}
+
+#[test]
+fn default_replacement_ignores_non_runtime_policy_even_when_it_passes_gate() {
+    let evaluation = PolicyEvaluation {
+        aggregate_stats: [
+            PolicyStats {
+                policy_name: DEFAULT_POLICY_NAME,
+                stats: gate_stats(1_000, 80, 500.0, 100, 0),
+            },
+            PolicyStats {
+                policy_name: DRAIN_FIRST_POLICY_NAME,
+                stats: gate_stats(900, 70, 500.0, 120, 0),
+            },
+            filler_policy_stats(MAX_HEADROOM_POLICY_NAME),
+            filler_policy_stats(RESET_FIRST_POLICY_NAME),
+            PolicyStats {
+                policy_name: SHADOW_PRICE_POLICY_NAME,
+                stats: gate_stats(1_000, 80, 500.0, 100, 0),
+            },
+            PolicyStats {
+                policy_name: RESET_WEIGHTED_MINIMAX_POLICY_NAME,
+                stats: gate_stats(1_000, 80, 500.0, 100, 0),
+            },
+        ],
+        scenarios: vec![ScenarioPolicyStats {
+            scenario_name: "non-runtime-policy-wins",
+            policy_stats: [
+                PolicyStats {
+                    policy_name: DEFAULT_POLICY_NAME,
+                    stats: gate_stats(100, 20, 50.0, 10, 0),
+                },
+                PolicyStats {
+                    policy_name: DRAIN_FIRST_POLICY_NAME,
+                    stats: gate_stats(90, 20, 50.0, 10, 0),
+                },
+                filler_policy_stats(MAX_HEADROOM_POLICY_NAME),
+                filler_policy_stats(RESET_FIRST_POLICY_NAME),
+                PolicyStats {
+                    policy_name: SHADOW_PRICE_POLICY_NAME,
+                    stats: gate_stats(100, 20, 50.0, 10, 0),
+                },
+                PolicyStats {
+                    policy_name: RESET_WEIGHTED_MINIMAX_POLICY_NAME,
+                    stats: gate_stats(100, 20, 50.0, 10, 0),
+                },
+            ],
+        }],
+    };
+
+    let default_stats = find_policy_stats(&evaluation.aggregate_stats, DEFAULT_POLICY_NAME);
+    let drain_first = find_policy_stats(&evaluation.aggregate_stats, DRAIN_FIRST_POLICY_NAME);
+    assert!(
+        ReplacementGate::default()
+            .evaluate_aggregate(&default_stats.stats, &drain_first.stats)
+            .is_pass()
+    );
+    assert_eq!(clear_default_replacement_candidate(&evaluation), None);
+}
+
+#[test]
+fn replacement_gate_rejects_unavailable_improvement_with_preventable_failures() {
+    let gate = ReplacementGate::default();
+    let default = gate_stats(1_000, 80, 500.0, 100, 0);
+    let candidate = gate_stats(900, 70, 500.0, 120, 1);
+
+    assert_gate_failure_kind(
+        gate.evaluate_aggregate(&default, &candidate),
+        ReplacementGateFailureKind::PreventableFailuresPresent,
+    );
+}
+
+#[test]
+fn replacement_gate_rejects_unavailable_improvement_with_excessive_switches() {
+    let gate = ReplacementGate::default();
+    let default = gate_stats(1_000, 80, 500.0, 100, 0);
+    let candidate = gate_stats(900, 70, 500.0, gate.switch_budget(100) + 1, 0);
+
+    assert_gate_failure_kind(
+        gate.evaluate_aggregate(&default, &candidate),
+        ReplacementGateFailureKind::SwitchesExceeded,
+    );
+}
+
+#[test]
+fn replacement_gate_rejects_unavailable_improvement_with_longer_outage() {
+    let gate = ReplacementGate::default();
+    let default = gate_stats(1_000, 80, 500.0, 100, 0);
+    let candidate = gate_stats(900, 81, 500.0, 120, 0);
+
+    assert_gate_failure_kind(
+        gate.evaluate_aggregate(&default, &candidate),
+        ReplacementGateFailureKind::MaxContiguousUnavailableRegressed,
+    );
+}
+
+#[test]
+fn replacement_gate_rejects_unavailable_improvement_with_excessive_failed_credits() {
+    let gate = ReplacementGate::default();
+    let default = gate_stats(1_000, 80, 500.0, 100, 0);
+    let candidate = gate_stats(900, 70, gate.failed_credits_budget(500.0) + 0.1, 120, 0);
+
+    assert_gate_failure_kind(
+        gate.evaluate_aggregate(&default, &candidate),
+        ReplacementGateFailureKind::FailedCreditsExceeded,
+    );
+}
+
+#[test]
+fn replacement_gate_accepts_clear_improvement_with_guardrails() {
+    let gate = ReplacementGate::default();
+    let default = gate_stats(1_000, 80, 500.0, 100, 0);
+    let candidate = gate_stats(900, 70, 500.0, 120, 0);
+
+    assert_eq!(
+        gate.evaluate_aggregate(&default, &candidate),
+        ReplacementGateDecision::Pass
+    );
+}
+
+#[test]
+fn replacement_gate_allows_scenario_without_clear_improvement() {
+    let gate = ReplacementGate::default();
+    let default = gate_stats(1_000, 80, 500.0, 100, 0);
+    let candidate = gate_stats(1_000, 70, 500.0, 120, 0);
+
+    assert_eq!(
+        gate.evaluate_scenario(&default, &candidate),
+        ReplacementGateDecision::Pass
+    );
+    assert_gate_failure_kind(
+        gate.evaluate_aggregate(&default, &candidate),
+        ReplacementGateFailureKind::UnavailableReductionTooSmall,
+    );
+}
+
+#[test]
+fn replacement_gate_reports_aggregate_unavailable_regression() {
+    let gate = ReplacementGate::default();
+    let default = gate_stats(1_000, 80, 500.0, 100, 0);
+    let candidate = gate_stats(1_001, 70, 500.0, 120, 0);
+
+    assert_gate_failure_kind(
+        gate.evaluate_aggregate(&default, &candidate),
+        ReplacementGateFailureKind::UnavailableRegressed,
+    );
+}
+
+#[test]
+fn replacement_gate_summary_distinguishes_aggregate_and_scenario_pass() {
+    let gate = ReplacementGate::default();
+    let default = PolicyStats {
+        policy_name: DEFAULT_POLICY_NAME,
+        stats: gate_stats(1_000, 80, 500.0, 100, 0),
+    };
+    let aggregate_candidate = PolicyStats {
+        policy_name: SHADOW_PRICE_POLICY_NAME,
+        stats: gate_stats(900, 70, 500.0, 120, 0),
+    };
+    let scenario_candidate = PolicyStats {
+        policy_name: SHADOW_PRICE_POLICY_NAME,
+        stats: gate_stats(1_000, 70, 500.0, 120, 0),
+    };
+
+    assert_eq!(
+        replacement_gate_summary(
+            Some(&default),
+            &aggregate_candidate,
+            gate,
+            ReplacementGateSummaryScope::Aggregate,
+        ),
+        "replacement_gate=pass scope=aggregate reason=unavailable reduction 100 meets required 50, guardrails passed"
+    );
+    assert_eq!(
+        replacement_gate_summary(
+            Some(&default),
+            &scenario_candidate,
+            gate,
+            ReplacementGateSummaryScope::Scenario,
+        ),
+        "replacement_gate=pass scope=scenario reason=scenario guardrails passed"
+    );
+}
+
+#[test]
+fn replacement_gate_summary_includes_failure_scope() {
+    let gate = ReplacementGate::default();
+    let default = PolicyStats {
+        policy_name: DEFAULT_POLICY_NAME,
+        stats: gate_stats(1_000, 80, 500.0, 100, 0),
+    };
+    let candidate = PolicyStats {
+        policy_name: SHADOW_PRICE_POLICY_NAME,
+        stats: gate_stats(1_001, 80, 500.0, 100, 0),
+    };
+
+    assert_eq!(
+        replacement_gate_summary(
+            Some(&default),
+            &candidate,
+            gate,
+            ReplacementGateSummaryScope::Aggregate,
+        ),
+        "replacement_gate=fail scope=aggregate reason=unavailable regressed from 1000 to 1001"
+    );
+    assert_eq!(
+        replacement_gate_summary(
+            Some(&default),
+            &candidate,
+            gate,
+            ReplacementGateSummaryScope::Scenario,
+        ),
+        "replacement_gate=fail scope=scenario reason=unavailable regressed from 1000 to 1001"
+    );
+}
+
+#[test]
+fn replacement_gate_summary_includes_scope_for_non_decision_statuses() {
+    let gate = ReplacementGate::default();
+    let default = PolicyStats {
+        policy_name: DEFAULT_POLICY_NAME,
+        stats: gate_stats(1_000, 80, 500.0, 100, 0),
+    };
+    let baseline = PolicyStats {
+        policy_name: DRAIN_FIRST_POLICY_NAME,
+        stats: gate_stats(900, 70, 500.0, 120, 0),
+    };
+
+    assert_eq!(
+        replacement_gate_summary(
+            Some(&default),
+            &default,
+            gate,
+            ReplacementGateSummaryScope::Aggregate,
+        ),
+        "replacement_gate=default scope=aggregate reason=current default policy"
+    );
+    assert_eq!(
+        replacement_gate_summary(
+            Some(&default),
+            &baseline,
+            gate,
+            ReplacementGateSummaryScope::Scenario,
+        ),
+        "replacement_gate=not-candidate scope=scenario reason=not in runtime replacement candidates"
+    );
+    assert_eq!(
+        replacement_gate_summary(
+            None,
+            &PolicyStats {
+                policy_name: SHADOW_PRICE_POLICY_NAME,
+                stats: gate_stats(900, 70, 500.0, 120, 0),
+            },
+            gate,
+            ReplacementGateSummaryScope::Aggregate,
+        ),
+        "replacement_gate=unknown scope=aggregate reason=missing default policy"
+    );
+}
+
+#[test]
+fn replacement_gate_rejects_candidate_when_any_scenario_regresses() {
+    let evaluation = PolicyEvaluation {
+        aggregate_stats: [
+            PolicyStats {
+                policy_name: DEFAULT_POLICY_NAME,
+                stats: gate_stats(1_000, 80, 500.0, 100, 0),
+            },
+            PolicyStats {
+                policy_name: SHADOW_PRICE_POLICY_NAME,
+                stats: gate_stats(900, 70, 500.0, 120, 0),
+            },
+            filler_policy_stats(DRAIN_FIRST_POLICY_NAME),
+            filler_policy_stats(MAX_HEADROOM_POLICY_NAME),
+            filler_policy_stats(RESET_FIRST_POLICY_NAME),
+            filler_policy_stats(RESET_WEIGHTED_MINIMAX_POLICY_NAME),
+        ],
+        scenarios: vec![ScenarioPolicyStats {
+            scenario_name: "regressed-scenario",
+            policy_stats: [
+                PolicyStats {
+                    policy_name: DEFAULT_POLICY_NAME,
+                    stats: gate_stats(100, 20, 50.0, 10, 0),
+                },
+                PolicyStats {
+                    policy_name: SHADOW_PRICE_POLICY_NAME,
+                    stats: gate_stats(101, 20, 50.0, 10, 0),
+                },
+                filler_policy_stats(DRAIN_FIRST_POLICY_NAME),
+                filler_policy_stats(MAX_HEADROOM_POLICY_NAME),
+                filler_policy_stats(RESET_FIRST_POLICY_NAME),
+                filler_policy_stats(RESET_WEIGHTED_MINIMAX_POLICY_NAME),
+            ],
+        }],
+    };
+
+    match ReplacementGate::default().evaluate_candidate(&evaluation, SHADOW_PRICE_POLICY_NAME) {
+        ReplacementGateDecision::Fail(failure) => {
+            assert_eq!(failure.kind, ReplacementGateFailureKind::ScenarioRegressed);
+            assert_eq!(
+                failure.reason,
+                "regressed-scenario: unavailable regressed from 100 to 101"
+            );
+        }
+        ReplacementGateDecision::Pass => panic!("replacement gate should fail on scenario regress"),
+    }
+}
+
+#[test]
+fn replacement_gate_tie_breaks_between_passing_candidates() {
+    let gate = ReplacementGate::default();
+    let default = gate_stats(1_000, 80, 500.0, 100, 0);
+    let better = PolicyStats {
+        policy_name: "better",
+        stats: gate_stats(880, 75, 500.0, 120, 0),
+    };
+    let worse = PolicyStats {
+        policy_name: "worse",
+        stats: gate_stats(900, 70, 500.0, 120, 0),
+    };
+    assert!(gate.evaluate_aggregate(&default, &better.stats).is_pass());
+    assert!(gate.evaluate_aggregate(&default, &worse.stats).is_pass());
+
+    let selected = [worse, better]
+        .into_iter()
+        .min_by(ReplacementGate::compare_passing_candidates)
+        .expect("passing candidate list should not be empty");
+
+    assert_eq!(selected.policy_name, "better");
+}
+
+#[test]
 fn simulator_staggers_initial_reset_times_across_five_hour_and_weekly_windows() {
     let first = SimAccount::new("account-0", 0, 2);
     let second = SimAccount::new("account-1", 1, 2);
@@ -962,9 +1559,19 @@ struct PolicyEvaluationDiagnostics<'a>(&'a PolicyEvaluation);
 
 impl fmt::Display for PolicyEvaluationDiagnostics<'_> {
     fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_policy_stats_table(output, "aggregate", &self.0.aggregate_stats)?;
+        write_policy_stats_table(
+            output,
+            "aggregate",
+            &self.0.aggregate_stats,
+            ReplacementGateSummaryScope::Aggregate,
+        )?;
         for scenario in &self.0.scenarios {
-            write_policy_stats_table(output, scenario.scenario_name, &scenario.policy_stats)?;
+            write_policy_stats_table(
+                output,
+                scenario.scenario_name,
+                &scenario.policy_stats,
+                ReplacementGateSummaryScope::Scenario,
+            )?;
         }
         Ok(())
     }
@@ -1565,82 +2172,18 @@ fn assert_availability_policy_invariants(
 }
 
 fn clear_default_replacement_candidate(evaluation: &PolicyEvaluation) -> Option<&'static str> {
+    let gate = ReplacementGate::default();
     evaluation
         .aggregate_stats
         .iter()
+        .filter(|stats| is_runtime_replacement_candidate(stats.policy_name))
+        .copied()
         .filter(|stats| {
-            RUNTIME_REPLACEMENT_CANDIDATES
-                .iter()
-                .any(|candidate| policy_name_for_kind(*candidate) == stats.policy_name)
+            gate.evaluate_candidate(evaluation, stats.policy_name)
+                .is_pass()
         })
-        .filter(|stats| clears_default_replacement_gate(evaluation, stats.policy_name))
-        .min_by(|left, right| compare_policy_outcome(&left.stats, &right.stats))
+        .min_by(ReplacementGate::compare_passing_candidates)
         .map(|stats| stats.policy_name)
-}
-
-fn clears_default_replacement_gate(evaluation: &PolicyEvaluation, candidate_name: &str) -> bool {
-    let default_aggregate = find_policy_stats(&evaluation.aggregate_stats, DEFAULT_POLICY_NAME);
-    let candidate_aggregate = find_policy_stats(&evaluation.aggregate_stats, candidate_name);
-    let default_unavailable = default_aggregate.stats.user_unavailable_minutes();
-    let candidate_unavailable = candidate_aggregate.stats.user_unavailable_minutes();
-    let min_reduction = replacement_min_unavailable_reduction(default_unavailable);
-
-    if candidate_aggregate.stats.preventable_failures > 0 {
-        return false;
-    }
-    if default_unavailable.saturating_sub(candidate_unavailable) < min_reduction {
-        return false;
-    }
-    if candidate_aggregate.stats.max_contiguous_unavailable_minutes
-        > default_aggregate.stats.max_contiguous_unavailable_minutes
-    {
-        return false;
-    }
-    if !failed_credits_within_replacement_budget(
-        candidate_aggregate.stats.failed_credits,
-        default_aggregate.stats.failed_credits,
-    ) {
-        return false;
-    }
-    if candidate_aggregate.stats.account_switches
-        > replacement_switch_budget(default_aggregate.stats.account_switches)
-    {
-        return false;
-    }
-
-    evaluation.scenarios.iter().all(|scenario| {
-        let default_stats = find_policy_stats(&scenario.policy_stats, DEFAULT_POLICY_NAME);
-        let candidate_stats = find_policy_stats(&scenario.policy_stats, candidate_name);
-        candidate_stats.stats.preventable_failures == 0
-            && candidate_stats.stats.user_unavailable_minutes()
-                <= default_stats.stats.user_unavailable_minutes()
-            && candidate_stats.stats.max_contiguous_unavailable_minutes
-                <= default_stats.stats.max_contiguous_unavailable_minutes
-            && failed_credits_within_replacement_budget(
-                candidate_stats.stats.failed_credits,
-                default_stats.stats.failed_credits,
-            )
-            && candidate_stats.stats.account_switches
-                <= replacement_switch_budget(default_stats.stats.account_switches)
-    })
-}
-
-fn replacement_min_unavailable_reduction(default_unavailable: u32) -> u32 {
-    let ratio_reduction = (f64::from(default_unavailable)
-        * REPLACEMENT_MIN_UNAVAILABLE_REDUCTION_RATIO)
-        .ceil() as u32;
-    REPLACEMENT_MIN_UNAVAILABLE_REDUCTION_MINUTES.max(ratio_reduction)
-}
-
-fn replacement_switch_budget(default_switches: u32) -> u32 {
-    (f64::from(default_switches) * REPLACEMENT_MAX_SWITCH_INCREASE_RATIO).ceil() as u32
-        + REPLACEMENT_MAX_SWITCH_INCREASE_ABSOLUTE
-}
-
-fn failed_credits_within_replacement_budget(candidate_failed: f64, default_failed: f64) -> bool {
-    let allowed_failed = default_failed * (1.0 + REPLACEMENT_FAILED_CREDITS_RELATIVE_TOLERANCE)
-        + REPLACEMENT_FAILED_CREDITS_ABSOLUTE_TOLERANCE;
-    candidate_failed <= allowed_failed
 }
 
 fn compare_policy_outcome(left: &SimStats, right: &SimStats) -> Ordering {
@@ -1659,12 +2202,18 @@ fn write_policy_stats_table(
     output: &mut fmt::Formatter<'_>,
     label: &str,
     policy_stats: &[PolicyStats],
+    gate_scope: ReplacementGateSummaryScope,
 ) -> fmt::Result {
+    let gate = ReplacementGate::default();
+    let default_stats = policy_stats
+        .iter()
+        .find(|stats| stats.policy_name == DEFAULT_POLICY_NAME);
     writeln!(output, "{label}:")?;
     for stats in policy_stats {
+        let gate_summary = replacement_gate_summary(default_stats, stats, gate, gate_scope);
         writeln!(
             output,
-            "  {}: unavailable={} max_unavailable={} failed={:.1} switches={} preventable={} min_5h={:.1} min_weekly={:.1}",
+            "  {}: unavailable={} max_unavailable={} failed={:.1} switches={} preventable={} min_5h={:.1} min_weekly={:.1} {}",
             stats.policy_name,
             stats.stats.user_unavailable_minutes(),
             stats.stats.max_contiguous_unavailable_minutes,
@@ -1673,9 +2222,68 @@ fn write_policy_stats_table(
             stats.stats.preventable_failures,
             stats.stats.min_five_hour_remaining,
             stats.stats.min_weekly_remaining,
+            gate_summary,
         )?;
     }
     Ok(())
+}
+
+fn replacement_gate_summary(
+    default_stats: Option<&PolicyStats>,
+    stats: &PolicyStats,
+    gate: ReplacementGate,
+    gate_scope: ReplacementGateSummaryScope,
+) -> String {
+    if stats.policy_name == DEFAULT_POLICY_NAME {
+        return format!(
+            "replacement_gate=default scope={} reason=current default policy",
+            gate_scope.label()
+        );
+    }
+    if !is_runtime_replacement_candidate(stats.policy_name) {
+        return format!(
+            "replacement_gate=not-candidate scope={} reason=not in runtime replacement candidates",
+            gate_scope.label()
+        );
+    }
+
+    let Some(default_stats) = default_stats else {
+        return format!(
+            "replacement_gate=unknown scope={} reason=missing default policy",
+            gate_scope.label()
+        );
+    };
+
+    let decision = match gate_scope {
+        ReplacementGateSummaryScope::Aggregate => {
+            gate.evaluate_aggregate(&default_stats.stats, &stats.stats)
+        }
+        ReplacementGateSummaryScope::Scenario => {
+            gate.evaluate_scenario(&default_stats.stats, &stats.stats)
+        }
+    };
+
+    match (decision, gate_scope) {
+        (ReplacementGateDecision::Pass, ReplacementGateSummaryScope::Aggregate) => {
+            let default_unavailable = default_stats.stats.user_unavailable_minutes();
+            let reduction =
+                default_unavailable.saturating_sub(stats.stats.user_unavailable_minutes());
+            let required = gate.min_unavailable_reduction(default_unavailable);
+            format!(
+                "replacement_gate=pass scope=aggregate reason=unavailable reduction {reduction} meets required {required}, guardrails passed"
+            )
+        }
+        (ReplacementGateDecision::Pass, ReplacementGateSummaryScope::Scenario) => {
+            "replacement_gate=pass scope=scenario reason=scenario guardrails passed".to_string()
+        }
+        (ReplacementGateDecision::Fail(failure), _) => {
+            format!(
+                "replacement_gate=fail scope={} reason={}",
+                gate_scope.label(),
+                failure.reason
+            )
+        }
+    }
 }
 
 fn policy_name_for_kind(kind: SelectionPolicyKind) -> &'static str {
@@ -1684,6 +2292,12 @@ fn policy_name_for_kind(kind: SelectionPolicyKind) -> &'static str {
         SelectionPolicyKind::ShadowPrice => SHADOW_PRICE_POLICY_NAME,
         SelectionPolicyKind::ResetWeightedMinimax => RESET_WEIGHTED_MINIMAX_POLICY_NAME,
     }
+}
+
+fn is_runtime_replacement_candidate(policy_name: &str) -> bool {
+    RUNTIME_REPLACEMENT_CANDIDATES
+        .iter()
+        .any(|candidate| policy_name_for_kind(*candidate) == policy_name)
 }
 
 // Offline upper bound for small deterministic traces. This is a test oracle,
@@ -2308,6 +2922,42 @@ fn used_percent(used: f64, limit: f64) -> f64 {
 
 fn candidate<'a>(account: &'a StoredAccount, usage: &'a UsageInfo) -> AccountUsageCandidate<'a> {
     AccountUsageCandidate { account, usage }
+}
+
+fn gate_stats(
+    unavailable_minutes: u32,
+    max_contiguous_unavailable_minutes: u32,
+    failed_credits: f64,
+    account_switches: u32,
+    preventable_failures: u32,
+) -> SimStats {
+    SimStats {
+        served_credits: 10_000.0,
+        failed_credits,
+        preventable_failures,
+        unavailable_minutes,
+        max_contiguous_unavailable_minutes,
+        account_switches,
+        min_five_hour_remaining: 0.0,
+        min_weekly_remaining: 0.0,
+    }
+}
+
+fn filler_policy_stats(policy_name: &'static str) -> PolicyStats {
+    PolicyStats {
+        policy_name,
+        stats: gate_stats(0, 0, 0.0, 0, 0),
+    }
+}
+
+fn assert_gate_failure_kind(
+    decision: ReplacementGateDecision,
+    expected: ReplacementGateFailureKind,
+) {
+    match decision {
+        ReplacementGateDecision::Fail(failure) => assert_eq!(failure.kind, expected),
+        ReplacementGateDecision::Pass => panic!("replacement gate should fail with {expected:?}"),
+    }
 }
 
 fn chatgpt_account(id: &str, last_used_at: Option<chrono::DateTime<Utc>>) -> StoredAccount {
