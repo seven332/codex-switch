@@ -56,11 +56,30 @@ impl Drop for TokenRefreshFileLock {
 }
 
 pub async fn ensure_chatgpt_tokens_fresh(account: &StoredAccount) -> Result<StoredAccount> {
+    ensure_chatgpt_tokens_fresh_with_options(account, TokenRefreshOptions::default()).await
+}
+
+pub async fn ensure_chatgpt_tokens_fresh_without_auth_write(
+    account: &StoredAccount,
+) -> Result<StoredAccount> {
+    ensure_chatgpt_tokens_fresh_with_options(
+        account,
+        TokenRefreshOptions {
+            write_current_auth: false,
+        },
+    )
+    .await
+}
+
+async fn ensure_chatgpt_tokens_fresh_with_options(
+    account: &StoredAccount,
+    options: TokenRefreshOptions,
+) -> Result<StoredAccount> {
     match &account.auth_data {
         AuthData::ApiKey { .. } => Ok(account.clone()),
         AuthData::ChatGPT { access_token, .. } => {
             if auth_expired_or_needs_refresh(account, access_token.expose_secret()) {
-                refresh_chatgpt_tokens(account).await
+                refresh_chatgpt_tokens_with_options(account, options).await
             } else {
                 Ok(account.clone())
             }
@@ -69,6 +88,38 @@ pub async fn ensure_chatgpt_tokens_fresh(account: &StoredAccount) -> Result<Stor
 }
 
 pub async fn refresh_chatgpt_tokens(account: &StoredAccount) -> Result<StoredAccount> {
+    refresh_chatgpt_tokens_with_options(account, TokenRefreshOptions::default()).await
+}
+
+pub async fn refresh_chatgpt_tokens_without_auth_write(
+    account: &StoredAccount,
+) -> Result<StoredAccount> {
+    refresh_chatgpt_tokens_with_options(
+        account,
+        TokenRefreshOptions {
+            write_current_auth: false,
+        },
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TokenRefreshOptions {
+    write_current_auth: bool,
+}
+
+impl Default for TokenRefreshOptions {
+    fn default() -> Self {
+        Self {
+            write_current_auth: true,
+        }
+    }
+}
+
+async fn refresh_chatgpt_tokens_with_options(
+    account: &StoredAccount,
+    options: TokenRefreshOptions,
+) -> Result<StoredAccount> {
     if matches!(account.auth_data, AuthData::ApiKey { .. }) {
         return Ok(account.clone());
     }
@@ -80,13 +131,17 @@ pub async fn refresh_chatgpt_tokens(account: &StoredAccount) -> Result<StoredAcc
     if chatgpt_auth_changed(account, &latest_account)
         && !chatgpt_account_needs_refresh(&latest_account)
     {
+        write_current_auth_if_requested(&latest_account, options)?;
         return Ok(latest_account);
     }
 
-    refresh_chatgpt_tokens_locked(&latest_account).await
+    refresh_chatgpt_tokens_locked(&latest_account, options).await
 }
 
-async fn refresh_chatgpt_tokens_locked(account: &StoredAccount) -> Result<StoredAccount> {
+async fn refresh_chatgpt_tokens_locked(
+    account: &StoredAccount,
+    options: TokenRefreshOptions,
+) -> Result<StoredAccount> {
     let (current_refresh_token, current_account_id) = match &account.auth_data {
         AuthData::ApiKey { .. } => return Ok(account.clone()),
         AuthData::ChatGPT {
@@ -133,11 +188,28 @@ async fn refresh_chatgpt_tokens_locked(account: &StoredAccount) -> Result<Stored
         },
     )?;
 
-    if is_current {
+    if options.write_current_auth && is_current {
         auth_json::write_account_auth(&updated)?;
     }
 
     Ok(updated)
+}
+
+fn write_current_auth_if_requested(
+    account: &StoredAccount,
+    options: TokenRefreshOptions,
+) -> Result<()> {
+    if !options.write_current_auth {
+        return Ok(());
+    }
+
+    let accounts_store = store::load_accounts()?;
+    if auth_json::current_stored_account_best_effort(&accounts_store)
+        .is_some_and(|current_account| current_account.id == account.id)
+    {
+        auth_json::write_account_auth(account)?;
+    }
+    Ok(())
 }
 
 fn latest_account_for_refresh(account: &StoredAccount) -> Result<StoredAccount> {
