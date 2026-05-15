@@ -27,6 +27,23 @@ pub enum AutoSwitchResult {
     },
 }
 
+#[derive(Debug)]
+pub enum AutoSwitchPlan {
+    CurrentKept {
+        account: Box<StoredAccount>,
+        reason: String,
+    },
+    CurrentUnsupported {
+        account: Box<StoredAccount>,
+        reason: String,
+    },
+    Switch {
+        from: Option<Box<StoredAccount>>,
+        to: Box<StoredAccount>,
+        reason: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum UsageDecision {
     Usable(String),
@@ -37,18 +54,50 @@ enum UsageDecision {
 
 pub async fn auto_switch() -> Result<AutoSwitchResult> {
     process::ensure_can_switch()?;
-    auto_switch_inner(false).await
+    let plan = plan_auto_switch(true).await?;
+    commit_auto_switch_plan(plan, false).await
 }
 
 pub async fn auto_switch_allow_running() -> Result<AutoSwitchResult> {
-    auto_switch_inner(true).await
+    let plan = plan_auto_switch(true).await?;
+    commit_auto_switch_plan(plan, true).await
+}
+
+pub async fn plan_auto_switch_for_runtime() -> Result<AutoSwitchPlan> {
+    plan_auto_switch(false).await
+}
+
+pub async fn commit_auto_switch_plan(
+    plan: AutoSwitchPlan,
+    allow_running: bool,
+) -> Result<AutoSwitchResult> {
+    match plan {
+        AutoSwitchPlan::CurrentKept { account, reason } => {
+            Ok(AutoSwitchResult::CurrentKept { account, reason })
+        }
+        AutoSwitchPlan::CurrentUnsupported { account, reason } => {
+            Ok(AutoSwitchResult::CurrentUnsupported { account, reason })
+        }
+        AutoSwitchPlan::Switch { from, to, reason } => {
+            let switched = if allow_running {
+                switcher::switch_to_account_unchecked(&to.id).await?
+            } else {
+                switcher::switch_to_account(&to.id).await?
+            };
+            Ok(AutoSwitchResult::Switched {
+                from,
+                to: Box::new(switched),
+                reason,
+            })
+        }
+    }
 }
 
 pub fn usage_requires_switch(info: &UsageInfo) -> bool {
     matches!(assess_usage(info), UsageDecision::Unavailable(_))
 }
 
-async fn auto_switch_inner(allow_running: bool) -> Result<AutoSwitchResult> {
+async fn plan_auto_switch(write_current_auth_on_refresh: bool) -> Result<AutoSwitchPlan> {
     let store = store::load_accounts()?;
     if store.accounts.is_empty() {
         anyhow::bail!("No accounts stored.");
@@ -65,7 +114,7 @@ async fn auto_switch_inner(allow_running: bool) -> Result<AutoSwitchResult> {
 
     if let Some(index) = current_index {
         let account = &store.accounts[index];
-        let info = match usage::get_account_usage(account).await {
+        let info = match get_account_usage_for_plan(account, write_current_auth_on_refresh).await {
             Ok(info) => info,
             Err(err) => {
                 anyhow::bail!("Failed to get usage for {}: {err}", account.name);
@@ -78,8 +127,12 @@ async fn auto_switch_inner(allow_running: bool) -> Result<AutoSwitchResult> {
         }
     }
 
-    let replacement_results =
-        usage::collect_replacement_account_usage(&store.accounts, current_id).await;
+    let replacement_results = collect_replacement_account_usage_for_plan(
+        &store.accounts,
+        current_id,
+        write_current_auth_on_refresh,
+    )
+    .await;
     apply_replacement_usage_results(
         &store.accounts,
         replacement_results,
@@ -95,7 +148,7 @@ async fn auto_switch_inner(allow_running: bool) -> Result<AutoSwitchResult> {
                 Some(UsageDecision::Usable(reason)) => reason,
                 _ => "usage policy kept current account".to_string(),
             };
-            return Ok(AutoSwitchResult::CurrentKept {
+            return Ok(AutoSwitchPlan::CurrentKept {
                 account: Box::new(selected_account.clone()),
                 reason,
             });
@@ -110,14 +163,9 @@ async fn auto_switch_inner(allow_running: bool) -> Result<AutoSwitchResult> {
             None => "no current account".to_string(),
             Some(UsageDecision::Unsupported(reason) | UsageDecision::Error(reason)) => reason,
         };
-        let switched = if allow_running {
-            switcher::switch_to_account_unchecked(&selected_account.id).await?
-        } else {
-            switcher::switch_to_account(&selected_account.id).await?
-        };
-        return Ok(AutoSwitchResult::Switched {
+        return Ok(AutoSwitchPlan::Switch {
             from: current.map(Box::new),
-            to: Box::new(switched),
+            to: Box::new(selected_account.clone()),
             reason: switch_reason,
         });
     }
@@ -125,7 +173,7 @@ async fn auto_switch_inner(allow_running: bool) -> Result<AutoSwitchResult> {
     if let (Some(account), Some(UsageDecision::Usable(reason))) =
         (&current, current_decision.clone())
     {
-        return Ok(AutoSwitchResult::CurrentKept {
+        return Ok(AutoSwitchPlan::CurrentKept {
             account: Box::new(account.clone()),
             reason,
         });
@@ -149,9 +197,32 @@ async fn auto_switch_inner(allow_running: bool) -> Result<AutoSwitchResult> {
     anyhow::bail!("{switch_reason}");
 }
 
+async fn get_account_usage_for_plan(
+    account: &StoredAccount,
+    write_current_auth_on_refresh: bool,
+) -> Result<UsageInfo> {
+    if write_current_auth_on_refresh {
+        usage::get_account_usage(account).await
+    } else {
+        usage::get_account_usage_without_auth_write(account).await
+    }
+}
+
+async fn collect_replacement_account_usage_for_plan(
+    accounts: &[StoredAccount],
+    current_id: Option<&str>,
+    write_current_auth_on_refresh: bool,
+) -> Vec<usage::AccountUsageFetch> {
+    if write_current_auth_on_refresh {
+        usage::collect_replacement_account_usage(accounts, current_id).await
+    } else {
+        usage::collect_replacement_account_usage_without_auth_write(accounts, current_id).await
+    }
+}
+
 #[derive(Debug)]
 enum CurrentUsageOutcome {
-    Terminal(AutoSwitchResult),
+    Terminal(AutoSwitchPlan),
     Continue(UsageDecision),
 }
 
@@ -165,7 +236,7 @@ fn apply_current_usage_result(
     match &decision {
         UsageDecision::Unsupported(reason) => {
             return Ok(CurrentUsageOutcome::Terminal(
-                AutoSwitchResult::CurrentUnsupported {
+                AutoSwitchPlan::CurrentUnsupported {
                     account: Box::new(account.clone()),
                     reason: reason.clone(),
                 },
@@ -353,7 +424,7 @@ mod tests {
     use chrono::Utc;
 
     use super::{
-        AccountUsageEvaluation, AutoSwitchResult, CurrentUsageOutcome, UsageDecision,
+        AccountUsageEvaluation, AutoSwitchPlan, CurrentUsageOutcome, UsageDecision,
         apply_current_usage_result, apply_replacement_usage_results, assess_usage,
         empty_evaluation_slots, ordered_evaluations, select_usable_account_by_policy,
     };
@@ -475,7 +546,7 @@ mod tests {
         .expect("current unsupported usage should be handled");
 
         match outcome {
-            CurrentUsageOutcome::Terminal(AutoSwitchResult::CurrentUnsupported {
+            CurrentUsageOutcome::Terminal(AutoSwitchPlan::CurrentUnsupported {
                 account,
                 reason,
             }) => {

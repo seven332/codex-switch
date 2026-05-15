@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::future::Future;
+use std::future::pending;
 use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant, sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use crate::account_selector::{self, SelectionConfig};
 use crate::auth_json;
-use crate::auto_switch::{self, AutoSwitchResult};
+use crate::auto_switch::{self, AutoSwitchPlan, AutoSwitchResult};
 use crate::codex_http;
 use crate::store;
 use crate::token;
@@ -61,15 +61,28 @@ enum RuntimeCommand {
 struct RuntimeLoginCommand {
     prepared: PreparedAccountLogin,
     expected_snapshot: Option<CurrentAccountSnapshot>,
+    generation: Option<u64>,
     completion: Option<oneshot::Sender<RuntimeLoginResult>>,
 }
 
 impl RuntimeLoginCommand {
+    #[cfg(test)]
     fn fire_and_forget(prepared: PreparedAccountLogin) -> Self {
         let expected_snapshot = prepared.current_snapshot.clone();
         Self {
             prepared,
             expected_snapshot,
+            generation: None,
+            completion: None,
+        }
+    }
+
+    fn auto_switch(prepared: PreparedAccountLogin, generation: u64) -> Self {
+        let expected_snapshot = prepared.current_snapshot.clone();
+        Self {
+            prepared,
+            expected_snapshot,
+            generation: Some(generation),
             completion: None,
         }
     }
@@ -82,6 +95,7 @@ impl RuntimeLoginCommand {
         Self {
             prepared,
             expected_snapshot: Some(expected_snapshot),
+            generation: None,
             completion: Some(completion),
         }
     }
@@ -98,7 +112,17 @@ enum RuntimeLoginResult {
 
 #[derive(Debug)]
 enum BackgroundRuntimeRequest {
-    AutoSwitch,
+    AutoSwitch {
+        priority: RuntimeAutoSwitchPriority,
+        generation: u64,
+        mode: AutoSwitchLoginMode,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeAutoSwitchPriority {
+    Soft,
+    Hard,
 }
 
 pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<ExitStatus> {
@@ -455,15 +479,24 @@ fn shared_runtime_auto_switch_coordinator() -> SharedRuntimeAutoSwitchCoordinato
 
 struct RuntimeAutoSwitchCoordinator {
     schedule: StdMutex<RuntimeAutoSwitchSchedule>,
-    execution: AsyncMutex<()>,
 }
 
 impl RuntimeAutoSwitchCoordinator {
     fn new(cooldown: Duration) -> Self {
         Self {
             schedule: StdMutex::new(RuntimeAutoSwitchSchedule::new(cooldown)),
-            execution: AsyncMutex::new(()),
         }
+    }
+
+    fn current_generation(&self) -> u64 {
+        self.schedule
+            .lock()
+            .map(|schedule| schedule.generation)
+            .unwrap_or_default()
+    }
+
+    fn is_current_generation(&self, generation: u64) -> bool {
+        self.current_generation() == generation
     }
 }
 
@@ -472,6 +505,7 @@ struct RuntimeAutoSwitchSchedule {
     cooldown: Duration,
     last_attempt: Option<Instant>,
     in_flight: bool,
+    generation: u64,
 }
 
 impl RuntimeAutoSwitchSchedule {
@@ -480,22 +514,23 @@ impl RuntimeAutoSwitchSchedule {
             cooldown,
             last_attempt: None,
             in_flight: false,
+            generation: 0,
         }
     }
 
-    fn try_start_background(&mut self, now: Instant) -> BackgroundAutoSwitchQueueStatus {
+    fn try_start_background(&mut self, now: Instant) -> (BackgroundAutoSwitchQueueStatus, u64) {
         if self.in_flight {
-            return BackgroundAutoSwitchQueueStatus::InFlight;
+            return (BackgroundAutoSwitchQueueStatus::InFlight, self.generation);
         }
         if let Some(last_attempt) = self.last_attempt
             && now < last_attempt + self.cooldown
         {
-            return BackgroundAutoSwitchQueueStatus::Cooldown;
+            return (BackgroundAutoSwitchQueueStatus::Cooldown, self.generation);
         }
 
         self.last_attempt = Some(now);
         self.in_flight = true;
-        BackgroundAutoSwitchQueueStatus::Queued
+        (BackgroundAutoSwitchQueueStatus::Queued, self.generation)
     }
 
     fn finish(&mut self) {
@@ -522,12 +557,16 @@ fn queue_background_auto_switch(
     };
 
     let previous_last_attempt = schedule.last_attempt;
-    let status = schedule.try_start_background(now);
+    let (status, generation) = schedule.try_start_background(now);
     if status != BackgroundAutoSwitchQueueStatus::Queued {
         return status;
     }
 
-    match requests.try_send(BackgroundRuntimeRequest::AutoSwitch) {
+    match requests.try_send(BackgroundRuntimeRequest::AutoSwitch {
+        priority: RuntimeAutoSwitchPriority::Soft,
+        generation,
+        mode: AutoSwitchLoginMode::SwitchedOnly,
+    }) {
         Ok(()) => BackgroundAutoSwitchQueueStatus::Queued,
         Err(mpsc::error::TrySendError::Full(_)) => {
             schedule.last_attempt = previous_last_attempt;
@@ -542,22 +581,34 @@ fn queue_background_auto_switch(
     }
 }
 
+fn queue_hard_auto_switch(
+    requests: &mpsc::Sender<BackgroundRuntimeRequest>,
+    coordinator: &SharedRuntimeAutoSwitchCoordinator,
+    mode: AutoSwitchLoginMode,
+) -> BackgroundAutoSwitchQueueStatus {
+    let Ok(mut schedule) = coordinator.schedule.lock() else {
+        return BackgroundAutoSwitchQueueStatus::Closed;
+    };
+    let generation = schedule.generation.saturating_add(1);
+
+    match requests.try_send(BackgroundRuntimeRequest::AutoSwitch {
+        priority: RuntimeAutoSwitchPriority::Hard,
+        generation,
+        mode,
+    }) {
+        Ok(()) => {
+            schedule.generation = generation;
+            BackgroundAutoSwitchQueueStatus::Queued
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => BackgroundAutoSwitchQueueStatus::Full,
+        Err(mpsc::error::TrySendError::Closed(_)) => BackgroundAutoSwitchQueueStatus::Closed,
+    }
+}
+
 fn finish_background_auto_switch(coordinator: &SharedRuntimeAutoSwitchCoordinator) {
     if let Ok(mut schedule) = coordinator.schedule.lock() {
         schedule.finish();
     }
-}
-
-async fn run_serialized_auto_switch_operation<T, F, Fut>(
-    coordinator: &SharedRuntimeAutoSwitchCoordinator,
-    operation: F,
-) -> T
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = T>,
-{
-    let _guard = coordinator.execution.lock().await;
-    operation().await
 }
 
 async fn run_background_runtime_worker(
@@ -566,34 +617,147 @@ async fn run_background_runtime_worker(
     coordinator: SharedRuntimeAutoSwitchCoordinator,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let mut in_flight: Option<RuntimeAutoSwitchInFlight> = None;
+
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_ok() && *shutdown.borrow() {
+                    if let Some(in_flight) = in_flight.take() {
+                        in_flight.handle.abort();
+                    }
                     return;
                 }
             }
             request = requests.recv() => {
                 let Some(request) = request else {
+                    if let Some(in_flight) = in_flight.take() {
+                        in_flight.handle.abort();
+                    }
                     return;
                 };
 
-                let command = match request {
-                    BackgroundRuntimeRequest::AutoSwitch => {
-                        let command = background_auto_switch_login_command(&coordinator).await;
+                handle_runtime_auto_switch_request(request, &mut in_flight, &coordinator);
+            }
+            result = next_runtime_auto_switch_result(&mut in_flight), if in_flight.is_some() => {
+                if let Some(result) = result {
+                    if result.priority == RuntimeAutoSwitchPriority::Soft {
                         finish_background_auto_switch(&coordinator);
-                        command
                     }
-                };
-                if let Some(command) = command
-                    && try_send_background_runtime_command(&runtime_commands, command)
-                        == RuntimeCommandSendStatus::Closed
-                {
-                    return;
+                    if runtime_auto_switch_result_is_current(&result, &coordinator) {
+                        let command = runtime_auto_switch_command_from_work(
+                            result.work,
+                            result.generation,
+                            &coordinator,
+                        )
+                        .await;
+                        if let Some(command) = command
+                            && try_send_background_runtime_command(&runtime_commands, command)
+                                == RuntimeCommandSendStatus::Closed
+                        {
+                            return;
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+fn handle_runtime_auto_switch_request(
+    request: BackgroundRuntimeRequest,
+    in_flight: &mut Option<RuntimeAutoSwitchInFlight>,
+    coordinator: &SharedRuntimeAutoSwitchCoordinator,
+) {
+    let BackgroundRuntimeRequest::AutoSwitch {
+        priority,
+        generation,
+        mode,
+    } = request;
+
+    if !coordinator.is_current_generation(generation) {
+        if priority == RuntimeAutoSwitchPriority::Soft {
+            finish_background_auto_switch(coordinator);
+        }
+        return;
+    }
+
+    if let Some(current) = in_flight.take() {
+        match (priority, current.priority) {
+            (RuntimeAutoSwitchPriority::Hard, RuntimeAutoSwitchPriority::Soft) => {
+                current.handle.abort();
+                finish_background_auto_switch(coordinator);
+            }
+            (RuntimeAutoSwitchPriority::Hard, RuntimeAutoSwitchPriority::Hard) => {
+                current.handle.abort();
+            }
+            (RuntimeAutoSwitchPriority::Soft, _) => {
+                *in_flight = Some(current);
+                finish_background_auto_switch(coordinator);
+                return;
+            }
+        }
+    }
+
+    *in_flight = Some(RuntimeAutoSwitchInFlight {
+        priority,
+        handle: tokio::spawn(async move {
+            let expected_snapshot = current_account_snapshot().ok();
+            let work = runtime_auto_switch_work(mode).await.ok().flatten();
+            RuntimeAutoSwitchTaskResult {
+                priority,
+                generation,
+                expected_snapshot,
+                work,
+            }
+        }),
+    });
+}
+
+struct RuntimeAutoSwitchInFlight {
+    priority: RuntimeAutoSwitchPriority,
+    handle: JoinHandle<RuntimeAutoSwitchTaskResult>,
+}
+
+struct RuntimeAutoSwitchTaskResult {
+    priority: RuntimeAutoSwitchPriority,
+    generation: u64,
+    expected_snapshot: Option<CurrentAccountSnapshot>,
+    work: Option<RuntimeAutoSwitchWork>,
+}
+
+enum RuntimeAutoSwitchWork {
+    Switch(AutoSwitchPlan),
+    KeepCurrent(Box<StoredAccount>),
+    LoginCurrent(Box<StoredAccount>),
+}
+
+fn runtime_auto_switch_result_is_current(
+    result: &RuntimeAutoSwitchTaskResult,
+    coordinator: &SharedRuntimeAutoSwitchCoordinator,
+) -> bool {
+    if !coordinator.is_current_generation(result.generation) {
+        return false;
+    }
+
+    match &result.expected_snapshot {
+        Some(snapshot) => current_snapshot_matches(snapshot).unwrap_or(false),
+        None => current_account_snapshot()
+            .map(|snapshot| snapshot.current_account_id.is_none())
+            .unwrap_or(false),
+    }
+}
+
+async fn next_runtime_auto_switch_result(
+    in_flight: &mut Option<RuntimeAutoSwitchInFlight>,
+) -> Option<RuntimeAutoSwitchTaskResult> {
+    let Some(current) = in_flight else {
+        pending().await
+    };
+
+    let result = (&mut current.handle).await.ok();
+    *in_flight = None;
+    result
 }
 
 fn try_send_background_runtime_command(
@@ -614,18 +778,11 @@ enum RuntimeCommandSendStatus {
     Closed,
 }
 
-async fn background_auto_switch_login_command(
-    coordinator: &SharedRuntimeAutoSwitchCoordinator,
-) -> Option<RuntimeCommand> {
-    match serialized_auto_switch_prepared_login(coordinator, AutoSwitchLoginMode::SwitchedOnly)
-        .await
-    {
-        Ok(Some(prepared)) => Some(RuntimeCommand::LoginPreparedAccount(
-            RuntimeLoginCommand::fire_and_forget(prepared),
-        )),
-        Ok(None) => None,
-        Err(_) => None,
-    }
+async fn runtime_auto_switch_work(
+    mode: AutoSwitchLoginMode,
+) -> Result<Option<RuntimeAutoSwitchWork>> {
+    let plan = auto_switch::plan_auto_switch_for_runtime().await?;
+    auto_switch_plan_work(plan, &mode)
 }
 
 #[derive(Debug, Clone)]
@@ -637,50 +794,84 @@ enum AutoSwitchLoginMode {
     },
 }
 
-async fn serialized_auto_switch_prepared_login(
+fn auto_switch_plan_work(
+    plan: AutoSwitchPlan,
+    mode: &AutoSwitchLoginMode,
+) -> Result<Option<RuntimeAutoSwitchWork>> {
+    match plan {
+        AutoSwitchPlan::Switch { .. } => Ok(Some(RuntimeAutoSwitchWork::Switch(plan))),
+        AutoSwitchPlan::CurrentKept { account, .. } => match mode {
+            AutoSwitchLoginMode::SwitchedOnly => {
+                Ok(Some(RuntimeAutoSwitchWork::KeepCurrent(account)))
+            }
+            AutoSwitchLoginMode::EnsureCurrentLogged {
+                app_server_account_id,
+                app_server_snapshot,
+            } => {
+                let (account, current_snapshot) = latest_current_account_snapshot(*account)?;
+                let login_account = select_current_kept_login_account(
+                    account.clone(),
+                    current_snapshot,
+                    app_server_account_id.as_deref(),
+                    app_server_snapshot.as_ref(),
+                );
+                Ok(Some(match login_account {
+                    Some(account) => RuntimeAutoSwitchWork::LoginCurrent(Box::new(account)),
+                    None => RuntimeAutoSwitchWork::KeepCurrent(Box::new(account)),
+                }))
+            }
+        },
+        AutoSwitchPlan::CurrentUnsupported { .. } => Ok(None),
+    }
+}
+
+async fn runtime_auto_switch_command_from_work(
+    work: Option<RuntimeAutoSwitchWork>,
+    generation: u64,
     coordinator: &SharedRuntimeAutoSwitchCoordinator,
-    mode: AutoSwitchLoginMode,
-) -> Result<Option<PreparedAccountLogin>> {
-    run_serialized_auto_switch_operation(coordinator, || async move {
-        let result = auto_switch::auto_switch_allow_running().await?;
-        let account = auto_switch_login_account(result, &mode)?;
-        match account {
-            Some(account) => prepare_login(account).await.map(Some),
-            None => Ok(None),
+) -> Option<RuntimeCommand> {
+    if !coordinator.is_current_generation(generation) {
+        return None;
+    }
+
+    let account = match work? {
+        RuntimeAutoSwitchWork::Switch(plan) => {
+            match auto_switch::commit_auto_switch_plan(plan, true)
+                .await
+                .ok()?
+            {
+                AutoSwitchResult::Switched { to, .. } => *to,
+                AutoSwitchResult::CurrentKept { account, .. } => *account,
+                AutoSwitchResult::CurrentUnsupported { .. } => return None,
+            }
         }
-    })
-    .await
+        RuntimeAutoSwitchWork::KeepCurrent(account) => {
+            sync_current_account_auth(*account).ok().flatten()?;
+            return None;
+        }
+        RuntimeAutoSwitchWork::LoginCurrent(account) => {
+            sync_current_account_auth(*account).ok().flatten()?
+        }
+    };
+
+    if !coordinator.is_current_generation(generation) {
+        return None;
+    }
+
+    let prepared = prepare_login(account).await.ok()?;
+    if !coordinator.is_current_generation(generation) {
+        return None;
+    }
+
+    Some(RuntimeCommand::LoginPreparedAccount(
+        RuntimeLoginCommand::auto_switch(prepared, generation),
+    ))
 }
 
 fn current_account_snapshot_for_account(account: &StoredAccount) -> CurrentAccountSnapshot {
     CurrentAccountSnapshot {
         current_account_id: Some(account.id.clone()),
         auth_marker: Some(current_account_auth_marker(account)),
-    }
-}
-
-fn auto_switch_login_account(
-    result: AutoSwitchResult,
-    mode: &AutoSwitchLoginMode,
-) -> Result<Option<StoredAccount>> {
-    match result {
-        AutoSwitchResult::Switched { to, .. } => Ok(Some(*to)),
-        AutoSwitchResult::CurrentKept { account, .. } => match mode {
-            AutoSwitchLoginMode::SwitchedOnly => Ok(None),
-            AutoSwitchLoginMode::EnsureCurrentLogged {
-                app_server_account_id,
-                app_server_snapshot,
-            } => {
-                let (account, current_snapshot) = latest_current_account_snapshot(*account)?;
-                Ok(select_current_kept_login_account(
-                    account,
-                    current_snapshot,
-                    app_server_account_id.as_deref(),
-                    app_server_snapshot.as_ref(),
-                ))
-            }
-        },
-        AutoSwitchResult::CurrentUnsupported { .. } => Ok(None),
     }
 }
 
@@ -710,6 +901,62 @@ fn latest_current_account_snapshot(
         .unwrap_or(fallback_account);
     let snapshot = current_account_snapshot_for_account(&account);
     Ok((account, snapshot))
+}
+
+fn sync_current_account_auth(account: StoredAccount) -> Result<Option<StoredAccount>> {
+    let store = store::load_accounts()?;
+    let account = store
+        .accounts
+        .iter()
+        .find(|stored| stored.id == account.id)
+        .cloned()
+        .unwrap_or(account);
+    let Some(current_auth_account) = auth_json::current_auth_account()? else {
+        return Ok(None);
+    };
+    let Some(current_account) = store::find_matching_account(&store, &current_auth_account) else {
+        return Ok(None);
+    };
+    if current_account.id != account.id {
+        return Ok(None);
+    }
+
+    if !auth_serialized_credentials_match(&current_auth_account, &account) {
+        auth_json::write_account_auth(&account)?;
+    }
+    Ok(Some(account))
+}
+
+fn auth_serialized_credentials_match(left: &StoredAccount, right: &StoredAccount) -> bool {
+    if left.token_last_refresh_at != right.token_last_refresh_at {
+        return false;
+    }
+
+    match (&left.auth_data, &right.auth_data) {
+        (AuthData::ApiKey { key: left_key }, AuthData::ApiKey { key: right_key }) => {
+            left_key == right_key
+        }
+        (
+            AuthData::ChatGPT {
+                id_token: left_id_token,
+                access_token: left_access_token,
+                refresh_token: left_refresh_token,
+                account_id: left_account_id,
+            },
+            AuthData::ChatGPT {
+                id_token: right_id_token,
+                access_token: right_access_token,
+                refresh_token: right_refresh_token,
+                account_id: right_account_id,
+            },
+        ) => {
+            left_id_token == right_id_token
+                && left_access_token == right_access_token
+                && left_refresh_token == right_refresh_token
+                && left_account_id == right_account_id
+        }
+        _ => false,
+    }
 }
 
 async fn run_auto_switch_maintenance(
@@ -1041,9 +1288,14 @@ struct CurrentAccountSnapshot {
 
 fn current_account_snapshot() -> Result<CurrentAccountSnapshot> {
     let store = store::load_accounts()?;
-    let current_account = auth_json::current_stored_account(&store)?;
-    let current_account_id = current_account.as_ref().map(|account| account.id.clone());
-    let auth_marker = current_account.as_ref().map(current_account_auth_marker);
+    let current_auth_account = auth_json::current_auth_account()?;
+    let current_account_id = current_auth_account
+        .as_ref()
+        .and_then(|account| store::find_matching_account(&store, account))
+        .map(|account| account.id.clone());
+    let auth_marker = current_auth_account
+        .as_ref()
+        .map(current_account_auth_marker);
 
     Ok(CurrentAccountSnapshot {
         current_account_id,
@@ -1056,22 +1308,17 @@ fn current_snapshot_matches(expected: &CurrentAccountSnapshot) -> Result<bool> {
 }
 
 fn current_account_auth_marker(account: &StoredAccount) -> String {
-    let last_used_at = account
-        .last_used_at
-        .map(|value| value.timestamp_millis())
-        .unwrap_or_default();
     match &account.auth_data {
         AuthData::ChatGPT { account_id, .. } => format!(
-            "chatgpt:{}:{}:{}:{}",
+            "chatgpt:{}:{}:{}",
             account_id.as_deref().unwrap_or_default(),
             account
                 .token_last_refresh_at
                 .map(|value| value.timestamp_millis())
                 .unwrap_or_default(),
-            last_used_at,
             account.plan_type.as_deref().unwrap_or_default()
         ),
-        AuthData::ApiKey { .. } => format!("api_key:{last_used_at}"),
+        AuthData::ApiKey { .. } => "api_key".to_string(),
     }
 }
 
@@ -1189,6 +1436,7 @@ enum PendingInternalRequest {
         account_id: String,
         started_at: Instant,
         expected_snapshot: Option<CurrentAccountSnapshot>,
+        generation: Option<u64>,
         completion: Option<oneshot::Sender<RuntimeLoginResult>>,
     },
 }
@@ -1222,26 +1470,15 @@ impl ProxyState {
         ));
     }
 
-    async fn auto_switch_and_login(
-        &mut self,
-        app_server_write: &mut SplitSink<WsStream, Message>,
-    ) -> Result<()> {
-        if let Some(prepared) = serialized_auto_switch_prepared_login(
+    fn queue_hard_auto_switch(&self) -> BackgroundAutoSwitchQueueStatus {
+        queue_hard_auto_switch(
+            &self.background_requests,
             &self.runtime_auto_switch_coordinator,
             AutoSwitchLoginMode::EnsureCurrentLogged {
                 app_server_account_id: self.app_server_account_id.clone(),
                 app_server_snapshot: self.app_server_snapshot.clone(),
             },
         )
-        .await?
-        {
-            self.login_prepared_chatgpt_account(
-                app_server_write,
-                RuntimeLoginCommand::fire_and_forget(prepared),
-            )
-            .await?;
-        }
-        Ok(())
     }
 
     async fn login_prepared_chatgpt_account(
@@ -1252,9 +1489,19 @@ impl ProxyState {
         let RuntimeLoginCommand {
             prepared,
             expected_snapshot,
+            generation,
             completion,
         } = command;
         self.clear_expired_pending_logins(Instant::now());
+
+        if let Some(generation) = generation
+            && !self
+                .runtime_auto_switch_coordinator
+                .is_current_generation(generation)
+        {
+            complete_runtime_login(completion, RuntimeLoginResult::Stale);
+            return Ok(());
+        }
 
         let snapshot_matches = match &expected_snapshot {
             Some(snapshot) => match current_snapshot_matches(snapshot) {
@@ -1317,6 +1564,7 @@ impl ProxyState {
                 account_id: prepared.account_id.clone(),
                 started_at: Instant::now(),
                 expected_snapshot,
+                generation,
                 completion,
             },
         );
@@ -1391,24 +1639,33 @@ impl ProxyState {
                 account_id,
                 started_at: _,
                 expected_snapshot,
+                generation,
                 completion,
             } => {
                 if self.pending_login_account_id.as_deref() == Some(account_id.as_str()) {
                     self.pending_login_account_id = None;
                 }
-                let result = match &expected_snapshot {
-                    Some(snapshot) => match current_snapshot_matches(snapshot) {
-                        Ok(true) => match response_to_result(value) {
+                let result = if generation.is_some_and(|generation| {
+                    !self
+                        .runtime_auto_switch_coordinator
+                        .is_current_generation(generation)
+                }) {
+                    RuntimeLoginResult::Stale
+                } else {
+                    match &expected_snapshot {
+                        Some(snapshot) => match current_snapshot_matches(snapshot) {
+                            Ok(true) => match response_to_result(value) {
+                                Ok(()) => RuntimeLoginResult::Success,
+                                Err(err) => classify_runtime_login_error(&err.to_string()),
+                            },
+                            Ok(false) => RuntimeLoginResult::Stale,
+                            Err(err) => RuntimeLoginResult::Transient(err.to_string()),
+                        },
+                        None => match response_to_result(value) {
                             Ok(()) => RuntimeLoginResult::Success,
                             Err(err) => classify_runtime_login_error(&err.to_string()),
                         },
-                        Ok(false) => RuntimeLoginResult::Stale,
-                        Err(err) => RuntimeLoginResult::Transient(err.to_string()),
-                    },
-                    None => match response_to_result(value) {
-                        Ok(()) => RuntimeLoginResult::Success,
-                        Err(err) => classify_runtime_login_error(&err.to_string()),
-                    },
+                    }
                 };
                 if result == RuntimeLoginResult::Success {
                     self.app_server_account_id = Some(account_id);
@@ -1521,7 +1778,7 @@ async fn handle_app_server_proxy_message(
     }
     match auto_switch_trigger {
         RateLimitAutoSwitchTrigger::Hard => {
-            let _ = state.auto_switch_and_login(app_server_write).await;
+            let _ = state.queue_hard_auto_switch();
         }
         RateLimitAutoSwitchTrigger::Soft => {
             let _ = state.queue_background_auto_switch();
@@ -1984,22 +2241,23 @@ mod tests {
     use chrono::Utc;
     use serde_json::json;
     use tokio::sync::{mpsc, oneshot};
-    use tokio::time::{Instant, timeout};
+    use tokio::time::Instant;
 
     use super::{
         ACTIVE_ACCOUNT_MAX_ATTEMPTS, ACTIVE_ACCOUNT_RETRY_DELAYS, ACTIVE_ACCOUNT_WATCH_INTERVAL,
         APP_SERVER_REQUEST_TIMEOUT, ActiveAccountReconcileAction, ActiveAccountReconcileOutcome,
-        ActiveAccountReconcileState, BackgroundAutoSwitchQueueStatus, BackgroundRuntimeRequest,
-        CurrentAccountSnapshot, ExternalAuthPayload, PendingInternalRequest, PendingLoginStatus,
-        PreparedAccountLogin, ProxyState, RateLimitAutoSwitchTrigger, RuntimeCommand,
+        ActiveAccountReconcileState, AutoSwitchLoginMode, BackgroundAutoSwitchQueueStatus,
+        BackgroundRuntimeRequest, CurrentAccountSnapshot, ExternalAuthPayload,
+        PendingInternalRequest, PendingLoginStatus, PreparedAccountLogin, ProxyState,
+        RateLimitAutoSwitchTrigger, RuntimeAutoSwitchPriority, RuntimeCommand,
         RuntimeCommandSendStatus, RuntimeLoginCommand, RuntimeLoginResult,
         classify_rate_limit_notification, classify_runtime_login_error,
         codex_args_with_default_cwd, current_account_snapshot_for_account,
         finish_background_auto_switch, has_cwd_arg, initialize_app_server_request,
-        queue_background_auto_switch, random_duration_between,
-        run_serialized_auto_switch_operation, select_current_kept_login_account,
-        shared_runtime_auto_switch_coordinator, try_send_background_runtime_command,
-        usage_limit_error_requires_switch, validate_remote_capable_codex_args,
+        queue_background_auto_switch, queue_hard_auto_switch, random_duration_between,
+        select_current_kept_login_account, shared_runtime_auto_switch_coordinator,
+        try_send_background_runtime_command, usage_limit_error_requires_switch,
+        validate_remote_capable_codex_args,
     };
     use crate::types::{NewChatGptAccount, StoredAccount};
 
@@ -2153,56 +2411,39 @@ mod tests {
         })));
     }
 
-    #[tokio::test]
-    async fn runtime_auto_switch_operations_are_serialized() {
+    #[test]
+    fn hard_auto_switch_queue_supersedes_soft_generation() {
         let coordinator = shared_runtime_auto_switch_coordinator();
-        let (background_entered_tx, mut background_entered_rx) = mpsc::channel(1);
-        let (release_background_tx, release_background_rx) = oneshot::channel();
-        let (hard_entered_tx, mut hard_entered_rx) = mpsc::channel(1);
+        let (sender, mut receiver) = mpsc::channel(2);
 
-        let background_coordinator = coordinator.clone();
-        let background_task = tokio::spawn(async move {
-            run_serialized_auto_switch_operation(&background_coordinator, || async move {
-                background_entered_tx
-                    .send(())
-                    .await
-                    .expect("background entered signal should be received");
-                let _ = release_background_rx.await;
-            })
-            .await;
-        });
-
-        assert!(background_entered_rx.recv().await.is_some());
-
-        let hard_coordinator = coordinator.clone();
-        let hard_task = tokio::spawn(async move {
-            run_serialized_auto_switch_operation(&hard_coordinator, || async move {
-                hard_entered_tx
-                    .send(())
-                    .await
-                    .expect("hard entered signal should be received");
-            })
-            .await;
-        });
-
-        assert!(matches!(
-            hard_entered_rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
-        release_background_tx
-            .send(())
-            .expect("background task should still be waiting");
-        assert!(
-            timeout(Duration::from_secs(1), hard_entered_rx.recv())
-                .await
-                .expect("hard operation should enter after background releases")
-                .is_some()
+        assert_eq!(
+            queue_background_auto_switch(&sender, &coordinator, Instant::now()),
+            BackgroundAutoSwitchQueueStatus::Queued
         );
+        let soft = receiver.try_recv().expect("soft request should be queued");
 
-        background_task
-            .await
-            .expect("background task should finish");
-        hard_task.await.expect("hard task should finish");
+        assert_eq!(
+            queue_hard_auto_switch(&sender, &coordinator, AutoSwitchLoginMode::SwitchedOnly),
+            BackgroundAutoSwitchQueueStatus::Queued
+        );
+        let hard = receiver.try_recv().expect("hard request should be queued");
+
+        let BackgroundRuntimeRequest::AutoSwitch {
+            priority: soft_priority,
+            generation: soft_generation,
+            ..
+        } = soft;
+        let BackgroundRuntimeRequest::AutoSwitch {
+            priority: hard_priority,
+            generation: hard_generation,
+            ..
+        } = hard;
+
+        assert_eq!(soft_priority, RuntimeAutoSwitchPriority::Soft);
+        assert_eq!(hard_priority, RuntimeAutoSwitchPriority::Hard);
+        assert!(hard_generation > soft_generation);
+        assert!(!coordinator.is_current_generation(soft_generation));
+        assert!(coordinator.is_current_generation(hard_generation));
     }
 
     #[test]
@@ -2252,7 +2493,7 @@ mod tests {
         let coordinator = shared_runtime_auto_switch_coordinator();
         let now = Instant::now();
         sender
-            .try_send(BackgroundRuntimeRequest::AutoSwitch)
+            .try_send(test_auto_switch_request(RuntimeAutoSwitchPriority::Soft, 0))
             .expect("test queue has room for the first request");
 
         assert_eq!(
@@ -2264,6 +2505,28 @@ mod tests {
             queue_background_auto_switch(&sender, &coordinator, now),
             BackgroundAutoSwitchQueueStatus::Queued
         );
+    }
+
+    #[test]
+    fn hard_auto_switch_queue_keeps_generation_when_full() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let coordinator = shared_runtime_auto_switch_coordinator();
+
+        assert_eq!(
+            queue_hard_auto_switch(&sender, &coordinator, AutoSwitchLoginMode::SwitchedOnly),
+            BackgroundAutoSwitchQueueStatus::Queued
+        );
+        let queued_generation = coordinator.current_generation();
+        assert_eq!(
+            queue_hard_auto_switch(&sender, &coordinator, AutoSwitchLoginMode::SwitchedOnly),
+            BackgroundAutoSwitchQueueStatus::Full
+        );
+        assert_eq!(coordinator.current_generation(), queued_generation);
+
+        let BackgroundRuntimeRequest::AutoSwitch { generation, .. } = receiver
+            .try_recv()
+            .expect("queued hard request should remain runnable");
+        assert_eq!(generation, queued_generation);
     }
 
     #[test]
@@ -2523,7 +2786,7 @@ mod tests {
         let mut state = ProxyState::new(background_tx, shared_runtime_auto_switch_coordinator());
         let older_snapshot = current_snapshot("account-a");
         let mut refreshed_snapshot = current_snapshot("account-a");
-        refreshed_snapshot.auth_marker = Some("chatgpt:account-a:2:1:pro".to_string());
+        refreshed_snapshot.auth_marker = Some("chatgpt:account-a:2:pro".to_string());
         state.app_server_account_id = Some("account-a".to_string());
         state.app_server_snapshot = Some(older_snapshot);
 
@@ -2537,13 +2800,14 @@ mod tests {
         let mut state = ProxyState::new(background_tx, shared_runtime_auto_switch_coordinator());
         let older_snapshot = current_snapshot("account-a");
         let mut refreshed_snapshot = current_snapshot("account-a");
-        refreshed_snapshot.auth_marker = Some("chatgpt:account-a:2:1:pro".to_string());
+        refreshed_snapshot.auth_marker = Some("chatgpt:account-a:2:pro".to_string());
         state.pending_internal.insert(
             "request-id".to_string(),
             PendingInternalRequest::Login {
                 account_id: "account-a".to_string(),
                 started_at: Instant::now(),
                 expected_snapshot: Some(older_snapshot.clone()),
+                generation: None,
                 completion: None,
             },
         );
@@ -2571,7 +2835,7 @@ mod tests {
         let account = chatgpt_account("account-a");
         let matching_snapshot = current_account_snapshot_for_account(&account);
         let mut stale_snapshot = matching_snapshot.clone();
-        stale_snapshot.auth_marker = Some("chatgpt:account-a:0:0:free".to_string());
+        stale_snapshot.auth_marker = Some("chatgpt:account-a:0:free".to_string());
 
         let stale_selection = select_current_kept_login_account(
             account.clone(),
@@ -2616,6 +2880,7 @@ mod tests {
                 account_id: "account-a".to_string(),
                 started_at: Instant::now(),
                 expected_snapshot: None,
+                generation: None,
                 completion: Some(completion_tx),
             },
         );
@@ -2637,6 +2902,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proxy_internal_login_success_with_stale_generation_is_ignored() {
+        let (background_tx, mut background_rx) = mpsc::channel(2);
+        let coordinator = shared_runtime_auto_switch_coordinator();
+        assert_eq!(
+            queue_hard_auto_switch(
+                &background_tx,
+                &coordinator,
+                AutoSwitchLoginMode::SwitchedOnly,
+            ),
+            BackgroundAutoSwitchQueueStatus::Queued
+        );
+        let stale_generation = coordinator.current_generation();
+        assert!(background_rx.try_recv().is_ok());
+        assert_eq!(
+            queue_hard_auto_switch(
+                &background_tx,
+                &coordinator,
+                AutoSwitchLoginMode::SwitchedOnly,
+            ),
+            BackgroundAutoSwitchQueueStatus::Queued
+        );
+
+        let mut state = ProxyState::new(background_tx, coordinator);
+        let (completion_tx, completion_rx) = oneshot::channel();
+        state.pending_login_account_id = Some("account-a".to_string());
+        state.pending_internal.insert(
+            "request-id".to_string(),
+            PendingInternalRequest::Login {
+                account_id: "account-a".to_string(),
+                started_at: Instant::now(),
+                expected_snapshot: None,
+                generation: Some(stale_generation),
+                completion: Some(completion_tx),
+            },
+        );
+
+        assert!(state.handle_internal_response(&json!({
+            "id": "request-id",
+            "result": null
+        })));
+
+        assert_eq!(
+            completion_rx
+                .await
+                .expect("login completion should be sent"),
+            RuntimeLoginResult::Stale
+        );
+        assert_eq!(state.app_server_account_id, None);
+        assert_eq!(state.app_server_snapshot, None);
+        assert_eq!(state.pending_login_account_id, None);
+    }
+
+    #[tokio::test]
     async fn proxy_internal_login_rejection_does_not_mark_runtime_account() {
         let (background_tx, _background_rx) = mpsc::channel(1);
         let mut state = ProxyState::new(background_tx, shared_runtime_auto_switch_coordinator());
@@ -2648,6 +2966,7 @@ mod tests {
                 account_id: "account-a".to_string(),
                 started_at: Instant::now(),
                 expected_snapshot: None,
+                generation: None,
                 completion: Some(completion_tx),
             },
         );
@@ -2682,6 +3001,7 @@ mod tests {
                 account_id: "account-a".to_string(),
                 started_at: Instant::now() - APP_SERVER_REQUEST_TIMEOUT - Duration::from_secs(1),
                 expected_snapshot: None,
+                generation: None,
                 completion: Some(completion_tx),
             },
         );
@@ -2716,6 +3036,7 @@ mod tests {
                 account_id: "account-a".to_string(),
                 started_at: Instant::now(),
                 expected_snapshot: None,
+                generation: None,
                 completion: Some(completion_tx),
             },
         );
@@ -2796,7 +3117,7 @@ mod tests {
     fn current_snapshot(account_id: &str) -> CurrentAccountSnapshot {
         CurrentAccountSnapshot {
             current_account_id: Some(account_id.to_string()),
-            auth_marker: Some(format!("chatgpt:{account_id}:1:1:pro")),
+            auth_marker: Some(format!("chatgpt:{account_id}:1:pro")),
         }
     }
 
@@ -2823,6 +3144,17 @@ mod tests {
             account_id,
             current_snapshot,
         )))
+    }
+
+    fn test_auto_switch_request(
+        priority: RuntimeAutoSwitchPriority,
+        generation: u64,
+    ) -> BackgroundRuntimeRequest {
+        BackgroundRuntimeRequest::AutoSwitch {
+            priority,
+            generation,
+            mode: AutoSwitchLoginMode::SwitchedOnly,
+        }
     }
 
     fn chatgpt_account(account_id: &str) -> StoredAccount {

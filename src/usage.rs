@@ -35,11 +35,22 @@ impl AccountUsageFetch {
 }
 
 pub async fn get_account_usage(account: &StoredAccount) -> Result<UsageInfo> {
+    get_account_usage_inner(account, true).await
+}
+
+pub async fn get_account_usage_without_auth_write(account: &StoredAccount) -> Result<UsageInfo> {
+    get_account_usage_inner(account, false).await
+}
+
+async fn get_account_usage_inner(
+    account: &StoredAccount,
+    write_current_auth_on_refresh: bool,
+) -> Result<UsageInfo> {
     match &account.auth_data {
         AuthData::ApiKey { .. } => Ok(UsageInfo::unsupported(account.id.clone())),
         AuthData::ChatGPT { .. } => {
             let client = usage_http_client()?;
-            get_usage_with_chatgpt_auth(account, &client).await
+            get_usage_with_chatgpt_auth(account, &client, write_current_auth_on_refresh).await
         }
     }
 }
@@ -56,23 +67,39 @@ pub async fn collect_replacement_account_usage(
     accounts: &[StoredAccount],
     current_account_id: Option<&str>,
 ) -> Vec<AccountUsageFetch> {
+    collect_replacement_account_usage_inner(accounts, current_account_id, true).await
+}
+
+pub async fn collect_replacement_account_usage_without_auth_write(
+    accounts: &[StoredAccount],
+    current_account_id: Option<&str>,
+) -> Vec<AccountUsageFetch> {
+    collect_replacement_account_usage_inner(accounts, current_account_id, false).await
+}
+
+async fn collect_replacement_account_usage_inner(
+    accounts: &[StoredAccount],
+    current_account_id: Option<&str>,
+    write_current_auth_on_refresh: bool,
+) -> Vec<AccountUsageFetch> {
     let indexed_accounts = accounts
         .iter()
         .enumerate()
         .filter(|(_, account)| Some(account.id.as_str()) != current_account_id)
         .collect::<Vec<_>>();
 
-    collect_indexed_account_usage(indexed_accounts).await
+    collect_indexed_account_usage(indexed_accounts, write_current_auth_on_refresh).await
 }
 
 async fn collect_account_usage(accounts: &[StoredAccount]) -> Vec<AccountUsageFetch> {
     let indexed_accounts = accounts.iter().enumerate().collect::<Vec<_>>();
 
-    collect_indexed_account_usage(indexed_accounts).await
+    collect_indexed_account_usage(indexed_accounts, true).await
 }
 
 async fn collect_indexed_account_usage(
     indexed_accounts: Vec<(usize, &StoredAccount)>,
+    write_current_auth_on_refresh: bool,
 ) -> Vec<AccountUsageFetch> {
     let mut results = Vec::with_capacity(indexed_accounts.len());
     let mut oauth_accounts = Vec::new();
@@ -108,7 +135,10 @@ async fn collect_indexed_account_usage(
         .into_iter()
         .map(|(index, account)| (index, account.clone()))
         .collect::<Vec<_>>();
-    results.extend(collect_oauth_account_usage(owned_oauth_accounts, client).await);
+    results.extend(
+        collect_oauth_account_usage(owned_oauth_accounts, client, write_current_auth_on_refresh)
+            .await,
+    );
     results.sort_by_key(|result| result.index);
     results
 }
@@ -116,6 +146,7 @@ async fn collect_indexed_account_usage(
 async fn collect_oauth_account_usage(
     indexed_accounts: Vec<(usize, StoredAccount)>,
     client: reqwest::Client,
+    write_current_auth_on_refresh: bool,
 ) -> Vec<AccountUsageFetch> {
     collect_indexed_account_usage_with(
         indexed_accounts,
@@ -123,7 +154,7 @@ async fn collect_oauth_account_usage(
         move |account| {
             let client = client.clone();
             async move {
-                get_account_usage_with_client(&account, &client)
+                get_account_usage_with_client(&account, &client, write_current_auth_on_refresh)
                     .await
                     .map_err(|err| err.to_string())
             }
@@ -165,10 +196,13 @@ where
 async fn get_account_usage_with_client(
     account: &StoredAccount,
     client: &reqwest::Client,
+    write_current_auth_on_refresh: bool,
 ) -> Result<UsageInfo> {
     match &account.auth_data {
         AuthData::ApiKey { .. } => Ok(UsageInfo::unsupported(account.id.clone())),
-        AuthData::ChatGPT { .. } => get_usage_with_chatgpt_auth(account, client).await,
+        AuthData::ChatGPT { .. } => {
+            get_usage_with_chatgpt_auth(account, client, write_current_auth_on_refresh).await
+        }
     }
 }
 
@@ -182,14 +216,23 @@ fn usage_http_client() -> Result<reqwest::Client> {
 async fn get_usage_with_chatgpt_auth(
     account: &StoredAccount,
     client: &reqwest::Client,
+    write_current_auth_on_refresh: bool,
 ) -> Result<UsageInfo> {
-    let fresh_account = token::ensure_chatgpt_tokens_fresh(account).await?;
+    let fresh_account = if write_current_auth_on_refresh {
+        token::ensure_chatgpt_tokens_fresh(account).await?
+    } else {
+        token::ensure_chatgpt_tokens_fresh_without_auth_write(account).await?
+    };
     let (access_token, account_id, account_is_fedramp) = extract_chatgpt_auth(&fresh_account)?;
 
     let response =
         send_chatgpt_usage_request(client, access_token, account_id, account_is_fedramp).await?;
     if response.status() == StatusCode::UNAUTHORIZED {
-        let refreshed_account = token::refresh_chatgpt_tokens(&fresh_account).await?;
+        let refreshed_account = if write_current_auth_on_refresh {
+            token::refresh_chatgpt_tokens(&fresh_account).await?
+        } else {
+            token::refresh_chatgpt_tokens_without_auth_write(&fresh_account).await?
+        };
         let (retry_token, retry_account_id, retry_is_fedramp) =
             extract_chatgpt_auth(&refreshed_account)?;
         let retry_response =
