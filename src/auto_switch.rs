@@ -55,56 +55,38 @@ async fn auto_switch_inner(allow_running: bool) -> Result<AutoSwitchResult> {
     }
 
     let current = auth_json::current_stored_account_best_effort(&store);
-
-    let current_id = current.as_ref().map(|account| account.id.as_str());
-    let mut evaluations = Vec::with_capacity(store.accounts.len());
+    let current_account_id = current.as_ref().map(|account| account.id.clone());
+    let current_id = current_account_id.as_deref();
+    let current_index =
+        current_id.and_then(|id| store.accounts.iter().position(|account| account.id == id));
+    let mut evaluations = empty_evaluation_slots(store.accounts.len());
     let mut current_decision = None;
     let mut skipped = Vec::new();
 
-    for account in &store.accounts {
-        let is_current = Some(account.id.as_str()) == current_id;
+    if let Some(index) = current_index {
+        let account = &store.accounts[index];
         let info = match usage::get_account_usage(account).await {
             Ok(info) => info,
             Err(err) => {
-                if is_current {
-                    anyhow::bail!("Failed to get usage for {}: {err}", account.name);
-                }
-                skipped.push(format!("{}: {err}", account.name));
-                continue;
+                anyhow::bail!("Failed to get usage for {}: {err}", account.name);
             }
         };
 
-        let decision = assess_usage(&info);
-        if is_current {
-            current_decision = Some(decision.clone());
-            match &decision {
-                UsageDecision::Unsupported(reason) => {
-                    return Ok(AutoSwitchResult::CurrentUnsupported {
-                        account: Box::new(account.clone()),
-                        reason: reason.clone(),
-                    });
-                }
-                UsageDecision::Error(reason) => {
-                    anyhow::bail!(
-                        "Could not evaluate current account {}: {reason}",
-                        account.name
-                    );
-                }
-                UsageDecision::Usable(_) | UsageDecision::Unavailable(_) => {}
-            }
-        } else if let UsageDecision::Unavailable(reason)
-        | UsageDecision::Unsupported(reason)
-        | UsageDecision::Error(reason) = &decision
-        {
-            skipped.push(format!("{}: {reason}", account.name));
+        match apply_current_usage_result(account, index, info, &mut evaluations)? {
+            CurrentUsageOutcome::Terminal(result) => return Ok(result),
+            CurrentUsageOutcome::Continue(decision) => current_decision = Some(decision),
         }
-
-        evaluations.push(AccountUsageEvaluation {
-            account: account.clone(),
-            usage: info,
-            decision,
-        });
     }
+
+    let replacement_results =
+        usage::collect_replacement_account_usage(&store.accounts, current_id).await;
+    apply_replacement_usage_results(
+        &store.accounts,
+        replacement_results,
+        &mut evaluations,
+        &mut skipped,
+    );
+    let evaluations = ordered_evaluations(evaluations);
 
     if let Some(selection) = select_usable_account_by_policy(&evaluations) {
         let selected_account = selection.account;
@@ -165,6 +147,98 @@ async fn auto_switch_inner(allow_running: bool) -> Result<AutoSwitchResult> {
     }
 
     anyhow::bail!("{switch_reason}");
+}
+
+#[derive(Debug)]
+enum CurrentUsageOutcome {
+    Terminal(AutoSwitchResult),
+    Continue(UsageDecision),
+}
+
+fn apply_current_usage_result(
+    account: &StoredAccount,
+    index: usize,
+    info: UsageInfo,
+    evaluations: &mut [Option<AccountUsageEvaluation>],
+) -> Result<CurrentUsageOutcome> {
+    let decision = assess_usage(&info);
+    match &decision {
+        UsageDecision::Unsupported(reason) => {
+            return Ok(CurrentUsageOutcome::Terminal(
+                AutoSwitchResult::CurrentUnsupported {
+                    account: Box::new(account.clone()),
+                    reason: reason.clone(),
+                },
+            ));
+        }
+        UsageDecision::Error(reason) => {
+            anyhow::bail!(
+                "Could not evaluate current account {}: {reason}",
+                account.name
+            );
+        }
+        UsageDecision::Usable(_) | UsageDecision::Unavailable(_) => {}
+    }
+
+    let Some(slot) = evaluations.get_mut(index) else {
+        anyhow::bail!("Current account index is out of range");
+    };
+    *slot = Some(AccountUsageEvaluation {
+        account: account.clone(),
+        usage: info,
+        decision: decision.clone(),
+    });
+    Ok(CurrentUsageOutcome::Continue(decision))
+}
+
+fn empty_evaluation_slots(len: usize) -> Vec<Option<AccountUsageEvaluation>> {
+    (0..len).map(|_| None).collect()
+}
+
+fn ordered_evaluations(
+    evaluations: Vec<Option<AccountUsageEvaluation>>,
+) -> Vec<AccountUsageEvaluation> {
+    evaluations.into_iter().flatten().collect()
+}
+
+fn apply_replacement_usage_results(
+    accounts: &[StoredAccount],
+    results: Vec<usage::AccountUsageFetch>,
+    evaluations: &mut [Option<AccountUsageEvaluation>],
+    skipped: &mut Vec<String>,
+) {
+    for result in results {
+        let Some(account) = accounts.get(result.index) else {
+            skipped.push(format!("{}: account not found", result.account_id));
+            continue;
+        };
+
+        let info = match result.result {
+            Ok(info) => info,
+            Err(err) => {
+                skipped.push(format!("{}: {err}", account.name));
+                continue;
+            }
+        };
+
+        let decision = assess_usage(&info);
+        if let UsageDecision::Unavailable(reason)
+        | UsageDecision::Unsupported(reason)
+        | UsageDecision::Error(reason) = &decision
+        {
+            skipped.push(format!("{}: {reason}", account.name));
+        }
+
+        if let Some(slot) = evaluations.get_mut(result.index) {
+            *slot = Some(AccountUsageEvaluation {
+                account: account.clone(),
+                usage: info,
+                decision,
+            });
+        } else {
+            skipped.push(format!("{}: account not found", account.name));
+        }
+    }
 }
 
 fn select_usable_account_by_policy(
@@ -279,9 +353,12 @@ mod tests {
     use chrono::Utc;
 
     use super::{
-        AccountUsageEvaluation, UsageDecision, assess_usage, select_usable_account_by_policy,
+        AccountUsageEvaluation, AutoSwitchResult, CurrentUsageOutcome, UsageDecision,
+        apply_current_usage_result, apply_replacement_usage_results, assess_usage,
+        empty_evaluation_slots, ordered_evaluations, select_usable_account_by_policy,
     };
     use crate::types::{AuthData, AuthMode, StoredAccount, UsageInfo};
+    use crate::usage::AccountUsageFetch;
 
     #[test]
     fn usage_is_unavailable_when_credits_are_depleted() {
@@ -384,6 +461,135 @@ mod tests {
         assert_eq!(selected.account.id, "active");
     }
 
+    #[test]
+    fn current_unsupported_usage_short_circuits_without_recording_candidate() {
+        let current = chatgpt_account("current");
+        let mut evaluations = empty_evaluation_slots(1);
+
+        let outcome = apply_current_usage_result(
+            &current,
+            0,
+            UsageInfo::unsupported(current.id.clone()),
+            &mut evaluations,
+        )
+        .expect("current unsupported usage should be handled");
+
+        match outcome {
+            CurrentUsageOutcome::Terminal(AutoSwitchResult::CurrentUnsupported {
+                account,
+                reason,
+            }) => {
+                assert_eq!(account.id, "current");
+                assert_eq!(reason, "usage unsupported");
+            }
+            _ => panic!("current unsupported usage should short-circuit"),
+        }
+        assert!(evaluations[0].is_none());
+    }
+
+    #[test]
+    fn current_usage_error_is_fatal() {
+        let current = chatgpt_account("current");
+        let mut evaluations = empty_evaluation_slots(1);
+
+        let err = apply_current_usage_result(
+            &current,
+            0,
+            UsageInfo::error(current.id.clone(), "parse failed".to_string()),
+            &mut evaluations,
+        )
+        .expect_err("current usage error should be fatal");
+
+        assert_eq!(
+            err.to_string(),
+            "Could not evaluate current account current: parse failed"
+        );
+        assert!(evaluations[0].is_none());
+    }
+
+    #[test]
+    fn current_usable_usage_is_recorded_for_policy() {
+        let current = chatgpt_account("current");
+        let mut evaluations = empty_evaluation_slots(1);
+
+        let outcome = apply_current_usage_result(
+            &current,
+            0,
+            usage_info_with_limits("current", 20.0, 20.0, 500, 1_000),
+            &mut evaluations,
+        )
+        .expect("current usable usage should continue");
+
+        match outcome {
+            CurrentUsageOutcome::Continue(UsageDecision::Usable(reason)) => {
+                assert_eq!(reason, "usage is available");
+            }
+            _ => panic!("current usable usage should continue"),
+        }
+        let evaluation = evaluations[0]
+            .as_ref()
+            .expect("current evaluation should be stored");
+        assert_eq!(evaluation.account.id, "current");
+        assert!(matches!(evaluation.decision, UsageDecision::Usable(_)));
+    }
+
+    #[test]
+    fn replacement_usage_results_preserve_account_order() {
+        let first = chatgpt_account("first");
+        let second = chatgpt_account("second");
+        let accounts = vec![first, second];
+        let mut evaluations = empty_evaluation_slots(accounts.len());
+        let mut skipped = Vec::new();
+        let results = vec![
+            usage_fetch(
+                1,
+                "second",
+                Ok(usage_info_with_limits("second", 20.0, 20.0, 500, 1_000)),
+            ),
+            usage_fetch(
+                0,
+                "first",
+                Ok(usage_info_with_limits("first", 20.0, 20.0, 500, 1_000)),
+            ),
+        ];
+
+        apply_replacement_usage_results(&accounts, results, &mut evaluations, &mut skipped);
+
+        assert!(skipped.is_empty());
+        assert_eq!(
+            ordered_evaluations(evaluations)
+                .iter()
+                .map(|evaluation| evaluation.account.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+    }
+
+    #[test]
+    fn replacement_fetch_errors_are_skipped_without_hiding_usable_candidates() {
+        let failed = chatgpt_account("failed");
+        let usable = chatgpt_account("usable");
+        let accounts = vec![failed, usable];
+        let mut evaluations = empty_evaluation_slots(accounts.len());
+        let mut skipped = Vec::new();
+        let results = vec![
+            usage_fetch(0, "failed", Err("network failed".to_string())),
+            usage_fetch(
+                1,
+                "usable",
+                Ok(usage_info_with_limits("usable", 20.0, 20.0, 500, 1_000)),
+            ),
+        ];
+
+        apply_replacement_usage_results(&accounts, results, &mut evaluations, &mut skipped);
+        let evaluations = ordered_evaluations(evaluations);
+        let selected = select_usable_account_by_policy(&evaluations)
+            .expect("policy should select the successful replacement");
+
+        assert_eq!(skipped, vec!["failed: network failed"]);
+        assert_eq!(selected.account.id, "usable");
+    }
+
     fn usage_info() -> UsageInfo {
         UsageInfo {
             account_id: "account-id".to_string(),
@@ -441,6 +647,18 @@ mod tests {
             },
             created_at: Utc::now(),
             last_used_at: None,
+        }
+    }
+
+    fn usage_fetch(
+        index: usize,
+        account_id: &str,
+        result: std::result::Result<UsageInfo, String>,
+    ) -> AccountUsageFetch {
+        AccountUsageFetch {
+            index,
+            account_id: account_id.to_string(),
+            result,
         }
     }
 }
