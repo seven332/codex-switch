@@ -5,10 +5,12 @@ use chrono::{DateTime, Utc};
 use crate::types::{AuthData, StoredAccount, UsageInfo};
 
 mod deadline_aware;
+mod demand_aware_hysteresis;
 mod reset_weighted_minimax;
 mod shadow_price;
 
 pub use deadline_aware::DeadlineAwarePolicy;
+pub use demand_aware_hysteresis::DemandAwareHysteresisPolicy;
 pub use reset_weighted_minimax::ResetWeightedMinimaxPolicy;
 pub use shadow_price::ShadowPricePolicy;
 
@@ -38,6 +40,7 @@ pub enum SelectionPolicyKind {
     DeadlineAware,
     ShadowPrice,
     ResetWeightedMinimax,
+    DemandAwareHysteresis,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -73,10 +76,6 @@ pub enum UsageWindow {
 #[derive(Debug, Clone, Copy)]
 pub struct SelectionContext<'a> {
     pub now: i64,
-    // Wired for follow-up current-account-aware selection policies. Existing
-    // policies intentionally ignore the current account id so their ordering
-    // stays unchanged.
-    #[cfg_attr(not(test), allow(dead_code))]
     current_account_id: Option<&'a str>,
 }
 
@@ -142,6 +141,9 @@ pub fn select_account_with_context<'a>(
         }
         SelectionPolicyKind::ResetWeightedMinimax => {
             ResetWeightedMinimaxPolicy::new(config).select_account_at(candidates, context)
+        }
+        SelectionPolicyKind::DemandAwareHysteresis => {
+            DemandAwareHysteresisPolicy::new(config).select_account_at(candidates, context)
         }
         SelectionPolicyKind::DeadlineAware => {
             DeadlineAwarePolicy::new(config).select_account_at(candidates, context)
