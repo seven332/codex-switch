@@ -71,20 +71,39 @@ pub enum UsageWindow {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct SelectionContext {
+pub struct SelectionContext<'a> {
     pub now: i64,
+    // Wired for follow-up current-account-aware selection policies. Existing
+    // policies intentionally ignore the current account id so their ordering
+    // stays unchanged.
+    #[cfg_attr(not(test), allow(dead_code))]
+    current_account_id: Option<&'a str>,
 }
 
-impl SelectionContext {
+impl<'a> SelectionContext<'a> {
     pub fn now() -> Self {
         Self {
             now: Utc::now().timestamp(),
+            current_account_id: None,
+        }
+    }
+
+    pub fn with_current_account_id<'b>(
+        self,
+        current_account_id: Option<&'b str>,
+    ) -> SelectionContext<'b> {
+        SelectionContext {
+            now: self.now,
+            current_account_id,
         }
     }
 
     #[cfg(test)]
     pub fn at(now: i64) -> Self {
-        Self { now }
+        Self {
+            now,
+            current_account_id: None,
+        }
     }
 }
 
@@ -99,32 +118,33 @@ pub trait AccountSelectionPolicy {
     fn select_account_at<'a>(
         &mut self,
         candidates: &[AccountUsageCandidate<'a>],
-        context: SelectionContext,
+        context: SelectionContext<'_>,
     ) -> Option<AccountSelection<'a>>;
-
-    fn select_account<'a>(
-        &mut self,
-        candidates: &[AccountUsageCandidate<'a>],
-    ) -> Option<AccountSelection<'a>> {
-        self.select_account_at(candidates, SelectionContext::now())
-    }
 }
 
 pub fn select_account<'a>(
     candidates: &[AccountUsageCandidate<'a>],
     config: SelectionConfig,
 ) -> Option<AccountSelection<'a>> {
+    select_account_with_context(candidates, config, SelectionContext::now())
+}
+
+pub fn select_account_with_context<'a>(
+    candidates: &[AccountUsageCandidate<'a>],
+    config: SelectionConfig,
+    context: SelectionContext<'_>,
+) -> Option<AccountSelection<'a>> {
     // Keep the runtime default on the proven policy until simulations show a
     // clear user-unavailable-time improvement from a replacement policy.
     match config.policy {
         SelectionPolicyKind::ShadowPrice => {
-            ShadowPricePolicy::new(config).select_account(candidates)
+            ShadowPricePolicy::new(config).select_account_at(candidates, context)
         }
         SelectionPolicyKind::ResetWeightedMinimax => {
-            ResetWeightedMinimaxPolicy::new(config).select_account(candidates)
+            ResetWeightedMinimaxPolicy::new(config).select_account_at(candidates, context)
         }
         SelectionPolicyKind::DeadlineAware => {
-            DeadlineAwarePolicy::new(config).select_account(candidates)
+            DeadlineAwarePolicy::new(config).select_account_at(candidates, context)
         }
     }
 }
@@ -252,7 +272,7 @@ fn headroom_from_used_percent(used_percent: f64) -> f64 {
 fn reset_delay_ratio(
     resets_at: Option<i64>,
     window_minutes: Option<i64>,
-    context: SelectionContext,
+    context: SelectionContext<'_>,
 ) -> f64 {
     let (Some(resets_at), Some(window_minutes)) = (resets_at, window_minutes) else {
         return 1.0;

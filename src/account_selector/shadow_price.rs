@@ -39,7 +39,7 @@ impl AccountSelectionPolicy for ShadowPricePolicy {
     fn select_account_at<'a>(
         &mut self,
         candidates: &[AccountUsageCandidate<'a>],
-        context: SelectionContext,
+        context: SelectionContext<'_>,
     ) -> Option<AccountSelection<'a>> {
         evaluated_candidates(candidates, self.config)
             .into_iter()
@@ -55,7 +55,7 @@ fn compare_shadow_price(
     left: &EvaluatedCandidate<'_>,
     right: &EvaluatedCandidate<'_>,
     config: SelectionConfig,
-    context: SelectionContext,
+    context: SelectionContext<'_>,
 ) -> Ordering {
     compare_bool_desc(
         left.metrics.safe_for_reset_priority,
@@ -84,7 +84,7 @@ fn compare_shadow_price_score(
     left: &EvaluatedCandidate<'_>,
     right: &EvaluatedCandidate<'_>,
     config: SelectionConfig,
-    context: SelectionContext,
+    context: SelectionContext<'_>,
 ) -> Ordering {
     shadow_price_score(left, config, context)
         .total_cmp(&shadow_price_score(right, config, context))
@@ -99,7 +99,7 @@ fn compare_shadow_price_score(
 fn shadow_price_score(
     candidate: &EvaluatedCandidate<'_>,
     config: SelectionConfig,
-    context: SelectionContext,
+    context: SelectionContext<'_>,
 ) -> f64 {
     let weekly_to_five_hour_ratio =
         normalized_weekly_to_five_hour_ratio(config.weekly_to_five_hour_ratio);
@@ -123,7 +123,7 @@ fn shadow_window_price(
     window_minutes: Option<i64>,
     resets_at: Option<i64>,
     capacity_weight: f64,
-    context: SelectionContext,
+    context: SelectionContext<'_>,
 ) -> f64 {
     let Some(used_percent) = used_percent.filter(|value| value.is_finite()) else {
         return f64::INFINITY;
@@ -146,7 +146,7 @@ fn shadow_window_price(
 fn shadow_reset_factor(
     resets_at: Option<i64>,
     window_minutes: Option<i64>,
-    context: SelectionContext,
+    context: SelectionContext<'_>,
 ) -> f64 {
     reset_delay_ratio(resets_at, window_minutes, context)
         .powf(SHADOW_PRICE_RESET_EXPONENT)

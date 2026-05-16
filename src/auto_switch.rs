@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::account_selector::{self, AccountUsageCandidate, SelectionConfig};
+use crate::account_selector::{self, AccountUsageCandidate, SelectionConfig, SelectionContext};
 use crate::auth_json;
 use crate::process;
 use crate::store;
@@ -141,7 +141,7 @@ async fn plan_auto_switch(write_current_auth_on_refresh: bool) -> Result<AutoSwi
     );
     let evaluations = ordered_evaluations(evaluations);
 
-    if let Some(selection) = select_usable_account_by_policy(&evaluations) {
+    if let Some(selection) = select_usable_account_by_policy(&evaluations, current_id) {
         let selected_account = selection.account;
         if Some(selected_account.id.as_str()) == current_id {
             let reason = match current_decision {
@@ -312,9 +312,10 @@ fn apply_replacement_usage_results(
     }
 }
 
-fn select_usable_account_by_policy(
-    evaluations: &[AccountUsageEvaluation],
-) -> Option<account_selector::AccountSelection<'_>> {
+fn select_usable_account_by_policy<'a>(
+    evaluations: &'a [AccountUsageEvaluation],
+    current_id: Option<&str>,
+) -> Option<account_selector::AccountSelection<'a>> {
     let candidates = evaluations
         .iter()
         .filter_map(|evaluation| {
@@ -329,7 +330,14 @@ fn select_usable_account_by_policy(
         })
         .collect::<Vec<_>>();
 
-    account_selector::select_account(&candidates, SelectionConfig::default())
+    match current_id {
+        Some(_) => account_selector::select_account_with_context(
+            &candidates,
+            SelectionConfig::default(),
+            SelectionContext::now().with_current_account_id(current_id),
+        ),
+        None => account_selector::select_account(&candidates, SelectionConfig::default()),
+    }
 }
 
 struct AccountUsageEvaluation {
@@ -503,10 +511,33 @@ mod tests {
             },
         ];
 
-        let selected = select_usable_account_by_policy(&evaluations)
+        let selected = select_usable_account_by_policy(&evaluations, Some("active"))
             .expect("policy should select a usable account");
 
         assert_eq!(selected.account.id, "soon-reset");
+    }
+
+    #[test]
+    fn policy_selection_ignores_missing_current_account_context() {
+        let first = chatgpt_account("first");
+        let second = chatgpt_account("second");
+        let evaluations = vec![
+            AccountUsageEvaluation {
+                account: first,
+                usage: usage_info_with_limits("first", 50.0, 50.0, 500, 1_000),
+                decision: UsageDecision::Usable("usage is available".to_string()),
+            },
+            AccountUsageEvaluation {
+                account: second,
+                usage: usage_info_with_limits("second", 50.0, 50.0, 500, 1_000),
+                decision: UsageDecision::Usable("usage is available".to_string()),
+            },
+        ];
+
+        let selected = select_usable_account_by_policy(&evaluations, Some("missing"))
+            .expect("policy should select a usable account");
+
+        assert_eq!(selected.account.id, "first");
     }
 
     #[test]
@@ -526,7 +557,7 @@ mod tests {
             },
         ];
 
-        let selected = select_usable_account_by_policy(&evaluations)
+        let selected = select_usable_account_by_policy(&evaluations, Some("active"))
             .expect("policy should select the remaining usable account");
 
         assert_eq!(selected.account.id, "active");
@@ -654,7 +685,7 @@ mod tests {
 
         apply_replacement_usage_results(&accounts, results, &mut evaluations, &mut skipped);
         let evaluations = ordered_evaluations(evaluations);
-        let selected = select_usable_account_by_policy(&evaluations)
+        let selected = select_usable_account_by_policy(&evaluations, None)
             .expect("policy should select the successful replacement");
 
         assert_eq!(skipped, vec!["failed: network failed"]);
