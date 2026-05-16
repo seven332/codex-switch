@@ -133,7 +133,7 @@ async fn run() -> Result<()> {
                 )?;
                 let is_current = current_account_id.as_deref() == Some(account.id.as_str());
                 let info = usage::get_account_usage(&account).await?;
-                print_usage(&account, &info, is_current);
+                print_usage(&account, &info, is_current, Utc::now().timestamp());
             }
         }
         Command::Delete { account } => {
@@ -283,6 +283,7 @@ async fn print_all_usage() -> Result<()> {
         .into_iter()
         .map(|info| (info.account_id.clone(), info))
         .collect();
+    let now = Utc::now().timestamp();
 
     for (index, account) in store.accounts.iter().enumerate() {
         if index > 0 {
@@ -290,7 +291,7 @@ async fn print_all_usage() -> Result<()> {
         }
         if let Some(info) = by_id.get(&account.id) {
             let is_current = current_account_id.as_deref() == Some(account.id.as_str());
-            print_usage(account, info, is_current);
+            print_usage(account, info, is_current, now);
         }
     }
 
@@ -326,7 +327,7 @@ fn print_accounts(store: &AccountsStore, current_account_id: Option<&str>) {
     }
 }
 
-fn print_usage(account: &StoredAccount, info: &UsageInfo, is_current: bool) {
+fn print_usage(account: &StoredAccount, info: &UsageInfo, is_current: bool, now: i64) {
     println!("{}", format_usage_account_header(account, is_current));
 
     if matches!(info.error.as_deref(), Some("usage unsupported")) {
@@ -345,18 +346,20 @@ fn print_usage(account: &StoredAccount, info: &UsageInfo, is_current: bool) {
         info.primary_used_percent,
         info.primary_window_minutes,
         info.primary_resets_at,
+        now,
     );
     print_limit_window(
         "weekly",
         info.secondary_used_percent,
         info.secondary_window_minutes,
         info.secondary_resets_at,
+        now,
     );
     print_credits(info);
     if let Some(kind) = &info.rate_limit_reached_type {
         println!("rate limit reached: {kind}");
     }
-    print_additional_limits(info);
+    print_additional_limits(info, now);
 }
 
 fn format_usage_account_header(account: &StoredAccount, is_current: bool) -> String {
@@ -373,13 +376,12 @@ fn print_limit_window(
     used_percent: Option<f64>,
     window_minutes: Option<i64>,
     resets_at: Option<i64>,
+    now: i64,
 ) {
     let percent = used_percent
         .map(|value| format!("{value:.1}% used"))
         .unwrap_or_else(|| "-".to_string());
-    let reset = resets_at
-        .map(format_unix_timestamp)
-        .unwrap_or_else(|| "-".to_string());
+    let reset = format_reset_timestamp_option(resets_at, now);
 
     match window_minutes {
         Some(minutes) => println!("{label}: {percent}, window {minutes}m, resets {reset}"),
@@ -408,7 +410,7 @@ fn print_credits(info: &UsageInfo) {
     println!("credits: {credits}");
 }
 
-fn print_additional_limits(info: &UsageInfo) {
+fn print_additional_limits(info: &UsageInfo, now: i64) {
     for limit in &info.additional_limits {
         let label = limit
             .limit_name
@@ -421,42 +423,186 @@ fn print_additional_limits(info: &UsageInfo) {
             limit.primary_used_percent,
             limit.primary_window_minutes,
             limit.primary_resets_at,
+            now,
         );
         print_limit_window(
             "  weekly",
             limit.secondary_used_percent,
             limit.secondary_window_minutes,
             limit.secondary_resets_at,
+            now,
         );
     }
 }
 
 fn format_datetime_option(value: Option<&DateTime<Utc>>) -> String {
     value
-        .map(|dt| {
-            dt.with_timezone(&Local)
-                .format("%Y-%m-%d %H:%M:%S %:z")
-                .to_string()
-        })
+        .map(format_local_datetime)
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn format_unix_timestamp(timestamp: i64) -> String {
-    Utc.timestamp_opt(timestamp, 0)
-        .single()
-        .map(|dt| {
-            dt.with_timezone(&Local)
-                .format("%Y-%m-%d %H:%M:%S %:z")
-                .to_string()
-        })
-        .unwrap_or_else(|| timestamp.to_string())
+fn format_local_datetime(dt: &DateTime<Utc>) -> String {
+    dt.with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M:%S %:z")
+        .to_string()
+}
+
+fn format_reset_timestamp_option(timestamp: Option<i64>, now: i64) -> String {
+    timestamp
+        .map(|timestamp| format_reset_timestamp(timestamp, now))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_reset_timestamp(timestamp: i64, now: i64) -> String {
+    let Some(dt) = Utc.timestamp_opt(timestamp, 0).single() else {
+        return timestamp.to_string();
+    };
+    let absolute = format_local_datetime(&dt);
+    format!(
+        "{absolute} ({})",
+        format_reset_relative_time(timestamp, now)
+    )
+}
+
+fn format_reset_relative_time(timestamp: i64, now: i64) -> String {
+    let delta = timestamp.saturating_sub(now);
+    if delta.unsigned_abs() < 60 {
+        return "now".to_string();
+    }
+
+    let duration = format_reset_duration(delta.unsigned_abs());
+    if delta > 0 {
+        format!("in {duration}")
+    } else {
+        format!("overdue by {duration}")
+    }
+}
+
+fn format_reset_duration(seconds: u64) -> String {
+    let minutes = (seconds / 60).max(1);
+    let days = minutes / 1_440;
+    let hours = (minutes % 1_440) / 60;
+    let minutes = minutes % 60;
+
+    if days > 0 {
+        if hours > 0 {
+            format!("{days}d {hours}h")
+        } else if minutes > 0 {
+            format!("{days}d {minutes}m")
+        } else {
+            format!("{days}d")
+        }
+    } else if hours > 0 {
+        if minutes > 0 {
+            format!("{hours}h {minutes}m")
+        } else {
+            format!("{hours}h")
+        }
+    } else {
+        format!("{minutes}m")
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{format_usage_account_header, usage_account_from_store};
+    use super::{
+        format_local_datetime, format_reset_timestamp_option, format_usage_account_header,
+        usage_account_from_store,
+    };
     use crate::store;
     use crate::types::{AccountsStore, StoredAccount};
+    use chrono::{TimeZone, Utc};
+
+    #[test]
+    fn reset_timestamp_includes_future_relative_time() {
+        let now = 1_800_000_000;
+        let reset = now + 2 * 60 * 60 + 15 * 60;
+
+        assert_eq!(
+            format_reset_timestamp_option(Some(reset), now),
+            expected_reset_timestamp(reset, "in 2h 15m")
+        );
+    }
+
+    #[test]
+    fn reset_timestamp_includes_day_relative_time() {
+        let now = 1_800_000_000;
+        let reset = now + 6 * 24 * 60 * 60 + 16 * 60 * 60 + 30 * 60;
+
+        assert_eq!(
+            format_reset_timestamp_option(Some(reset), now),
+            expected_reset_timestamp(reset, "in 6d 16h")
+        );
+    }
+
+    #[test]
+    fn reset_timestamp_keeps_minutes_when_days_have_no_hours() {
+        let now = 1_800_000_000;
+        let reset = now + 24 * 60 * 60 + 30 * 60;
+
+        assert_eq!(
+            format_reset_timestamp_option(Some(reset), now),
+            expected_reset_timestamp(reset, "in 1d 30m")
+        );
+    }
+
+    #[test]
+    fn reset_timestamp_uses_now_for_near_current_time() {
+        let now = 1_800_000_000;
+        let reset = now + 30;
+
+        assert_eq!(
+            format_reset_timestamp_option(Some(reset), now),
+            expected_reset_timestamp(reset, "now")
+        );
+    }
+
+    #[test]
+    fn reset_timestamp_uses_minutes_at_one_minute_boundary() {
+        let now = 1_800_000_000;
+        let future_reset = now + 60;
+        let past_reset = now - 60;
+
+        assert_eq!(
+            format_reset_timestamp_option(Some(future_reset), now),
+            expected_reset_timestamp(future_reset, "in 1m")
+        );
+        assert_eq!(
+            format_reset_timestamp_option(Some(past_reset), now),
+            expected_reset_timestamp(past_reset, "overdue by 1m")
+        );
+    }
+
+    #[test]
+    fn reset_timestamp_includes_past_relative_time() {
+        let now = 1_800_000_000;
+        let reset = now - 3 * 60;
+
+        assert_eq!(
+            format_reset_timestamp_option(Some(reset), now),
+            expected_reset_timestamp(reset, "overdue by 3m")
+        );
+    }
+
+    #[test]
+    fn reset_timestamp_preserves_missing_value() {
+        assert_eq!(format_reset_timestamp_option(None, 1_800_000_000), "-");
+    }
+
+    #[test]
+    fn reset_timestamp_preserves_invalid_value_without_relative_time() {
+        assert_eq!(
+            format_reset_timestamp_option(Some(i64::MAX), 1_800_000_000),
+            i64::MAX.to_string()
+        );
+    }
+
+    fn expected_reset_timestamp(timestamp: i64, relative: &str) -> String {
+        format!(
+            "{} ({relative})",
+            format_local_datetime(&Utc.timestamp_opt(timestamp, 0).unwrap())
+        )
+    }
 
     #[test]
     fn usage_header_marks_current_account() {
