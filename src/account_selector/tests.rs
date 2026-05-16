@@ -11,7 +11,7 @@ use super::{
     AccountSelection, AccountSelectionPolicy, AccountUsageCandidate, DeadlineAwarePolicy,
     ResetWeightedMinimaxPolicy, SelectionConfig, SelectionContext, SelectionPolicyKind,
     ShadowPricePolicy, UsageWindow, compare_headroom_desc, compare_last_used,
-    compare_optional_reset, evaluated_candidates, select_account,
+    compare_optional_reset, evaluated_candidates, select_account, select_account_with_context,
 };
 use crate::types::{AuthData, AuthMode, StoredAccount, UsageInfo};
 
@@ -34,7 +34,7 @@ impl AccountSelectionPolicy for DrainFirstPolicy {
     fn select_account_at<'a>(
         &mut self,
         candidates: &[AccountUsageCandidate<'a>],
-        _context: SelectionContext,
+        _context: SelectionContext<'_>,
     ) -> Option<AccountSelection<'a>> {
         let evaluated = evaluated_candidates(candidates, self.config);
         let selected = self
@@ -70,7 +70,7 @@ impl AccountSelectionPolicy for MaxHeadroomPolicy {
     fn select_account_at<'a>(
         &mut self,
         candidates: &[AccountUsageCandidate<'a>],
-        _context: SelectionContext,
+        _context: SelectionContext<'_>,
     ) -> Option<AccountSelection<'a>> {
         evaluated_candidates(candidates, self.config)
             .into_iter()
@@ -109,7 +109,7 @@ impl AccountSelectionPolicy for ResetFirstPolicy {
     fn select_account_at<'a>(
         &mut self,
         candidates: &[AccountUsageCandidate<'a>],
-        _context: SelectionContext,
+        _context: SelectionContext<'_>,
     ) -> Option<AccountSelection<'a>> {
         evaluated_candidates(candidates, self.config)
             .into_iter()
@@ -128,6 +128,34 @@ impl AccountSelectionPolicy for ResetFirstPolicy {
                 account: candidate.account,
                 metrics: candidate.metrics,
             })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CurrentFirstPolicy {
+    config: SelectionConfig,
+}
+
+impl AccountSelectionPolicy for CurrentFirstPolicy {
+    fn select_account_at<'a>(
+        &mut self,
+        candidates: &[AccountUsageCandidate<'a>],
+        context: SelectionContext<'_>,
+    ) -> Option<AccountSelection<'a>> {
+        let evaluated = evaluated_candidates(candidates, self.config);
+        let selected = context
+            .current_account_id
+            .and_then(|account_id| {
+                evaluated
+                    .iter()
+                    .find(|candidate| candidate.account.id == account_id)
+            })
+            .or_else(|| evaluated.first())?;
+
+        Some(AccountSelection {
+            account: selected.account,
+            metrics: selected.metrics,
+        })
     }
 }
 
@@ -350,6 +378,79 @@ fn stable_order_breaks_remaining_ties() {
         .expect("usable account should be selected");
 
     assert_eq!(selection.account.id, "first");
+}
+
+#[test]
+fn selection_context_carries_current_account_id_to_policy() {
+    let current = chatgpt_account("current", None);
+    let other = chatgpt_account("other", None);
+    let current_info = usage_info("current", 50.0, 50.0, 100, 200);
+    let other_info = usage_info("other", 50.0, 50.0, 100, 200);
+    let candidates = [
+        candidate(&other, &other_info),
+        candidate(&current, &current_info),
+    ];
+    let context = SelectionContext::at(0).with_current_account_id(Some("current"));
+
+    let selection = CurrentFirstPolicy::default()
+        .select_account_at(&candidates, context)
+        .expect("current account should be selected");
+
+    assert_eq!(selection.account.id, "current");
+}
+
+#[test]
+fn selection_context_current_account_preserves_time() {
+    let context = SelectionContext::at(12_345).with_current_account_id(Some("current"));
+
+    assert_eq!(context.now, 12_345);
+    assert_eq!(context.current_account_id, Some("current"));
+}
+
+#[test]
+fn select_account_with_context_treats_explicit_none_as_no_current_account() {
+    let first = chatgpt_account("first", None);
+    let second = chatgpt_account("second", None);
+    let first_info = usage_info("first", 20.0, 20.0, 500, 1_000);
+    let second_info = usage_info("second", 50.0, 50.0, 500, 1_000);
+    let candidates = [
+        candidate(&first, &first_info),
+        candidate(&second, &second_info),
+    ];
+    let context = SelectionContext::at(0);
+
+    let implicit_none_selection =
+        select_account_with_context(&candidates, SelectionConfig::default(), context)
+            .expect("usable account should be selected");
+    let explicit_none_selection = select_account_with_context(
+        &candidates,
+        SelectionConfig::default(),
+        context.with_current_account_id(None),
+    )
+    .expect("usable account should be selected");
+
+    assert_eq!(
+        explicit_none_selection.account.id,
+        implicit_none_selection.account.id
+    );
+}
+
+#[test]
+fn deadline_aware_ignores_current_account_context_for_now() {
+    let current = chatgpt_account("current", None);
+    let soon_reset = chatgpt_account("soon-reset", None);
+    let current_info = usage_info("current", 20.0, 20.0, 500, 1_000);
+    let soon_reset_info = usage_info("soon-reset", 95.0, 20.0, 10, 1_000);
+    let candidates = [
+        candidate(&current, &current_info),
+        candidate(&soon_reset, &soon_reset_info),
+    ];
+    let context = SelectionContext::at(0).with_current_account_id(Some("current"));
+
+    let selection = select_account_with_context(&candidates, SelectionConfig::default(), context)
+        .expect("usable account should be selected");
+
+    assert_eq!(selection.account.id, "soon-reset");
 }
 
 #[test]

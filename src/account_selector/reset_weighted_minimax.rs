@@ -36,7 +36,7 @@ impl AccountSelectionPolicy for ResetWeightedMinimaxPolicy {
     fn select_account_at<'a>(
         &mut self,
         candidates: &[AccountUsageCandidate<'a>],
-        context: SelectionContext,
+        context: SelectionContext<'_>,
     ) -> Option<AccountSelection<'a>> {
         evaluated_candidates(candidates, self.config)
             .into_iter()
@@ -51,7 +51,7 @@ impl AccountSelectionPolicy for ResetWeightedMinimaxPolicy {
 fn compare_reset_weighted_minimax(
     left: &EvaluatedCandidate<'_>,
     right: &EvaluatedCandidate<'_>,
-    context: SelectionContext,
+    context: SelectionContext<'_>,
 ) -> Ordering {
     compare_bool_desc(
         left.metrics.safe_for_reset_priority,
@@ -79,7 +79,7 @@ fn compare_reset_weighted_minimax(
 fn compare_reset_weighted_minimax_score(
     left: &EvaluatedCandidate<'_>,
     right: &EvaluatedCandidate<'_>,
-    context: SelectionContext,
+    context: SelectionContext<'_>,
 ) -> Ordering {
     reset_weighted_minimax_score(left, context)
         .total_cmp(&reset_weighted_minimax_score(right, context))
@@ -93,7 +93,7 @@ fn compare_reset_weighted_minimax_score(
 
 fn reset_weighted_minimax_score(
     candidate: &EvaluatedCandidate<'_>,
-    context: SelectionContext,
+    context: SelectionContext<'_>,
 ) -> f64 {
     let bottleneck_risk = (1.0 - candidate.metrics.bottleneck_headroom / 100.0).clamp(0.0, 1.0);
     let reset_factor = reset_weighted_minimax_reset_factor(
@@ -114,7 +114,7 @@ fn bottleneck_window_minutes(candidate: &EvaluatedCandidate<'_>) -> Option<i64> 
 fn reset_weighted_minimax_reset_factor(
     resets_at: Option<i64>,
     window_minutes: Option<i64>,
-    context: SelectionContext,
+    context: SelectionContext<'_>,
 ) -> f64 {
     reset_delay_ratio(resets_at, window_minutes, context)
         .powf(RESET_WEIGHTED_MINIMAX_RESET_EXPONENT)

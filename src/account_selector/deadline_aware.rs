@@ -26,7 +26,7 @@ impl AccountSelectionPolicy for DeadlineAwarePolicy {
     fn select_account_at<'a>(
         &mut self,
         candidates: &[AccountUsageCandidate<'a>],
-        _context: SelectionContext,
+        _context: SelectionContext<'_>,
     ) -> Option<AccountSelection<'a>> {
         evaluated_candidates(candidates, self.config)
             .into_iter()
