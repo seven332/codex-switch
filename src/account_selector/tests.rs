@@ -9,8 +9,8 @@ use chrono::{TimeZone, Utc};
 
 use super::{
     AccountSelection, AccountSelectionPolicy, AccountUsageCandidate, DeadlineAwarePolicy,
-    ResetWeightedMinimaxPolicy, SelectionConfig, SelectionContext, SelectionPolicyKind,
-    ShadowPricePolicy, UsageWindow, compare_headroom_desc, compare_last_used,
+    DemandAwareHysteresisPolicy, ResetWeightedMinimaxPolicy, SelectionConfig, SelectionContext,
+    SelectionPolicyKind, ShadowPricePolicy, UsageWindow, compare_headroom_desc, compare_last_used,
     compare_optional_reset, evaluated_candidates, select_account, select_account_with_context,
 };
 use crate::types::{AuthData, AuthMode, StoredAccount, UsageInfo};
@@ -165,6 +165,7 @@ const MAX_HEADROOM_POLICY_NAME: &str = "max-headroom";
 const RESET_FIRST_POLICY_NAME: &str = "reset-first";
 const SHADOW_PRICE_POLICY_NAME: &str = "shadow-price";
 const RESET_WEIGHTED_MINIMAX_POLICY_NAME: &str = "reset-weighted-minimax";
+const DEMAND_AWARE_HYSTERESIS_POLICY_NAME: &str = "demand-aware-hysteresis";
 const SIMULATED_POLICY_NAMES: &[&str] = &[
     DEADLINE_AWARE_POLICY_NAME,
     DRAIN_FIRST_POLICY_NAME,
@@ -172,12 +173,14 @@ const SIMULATED_POLICY_NAMES: &[&str] = &[
     RESET_FIRST_POLICY_NAME,
     SHADOW_PRICE_POLICY_NAME,
     RESET_WEIGHTED_MINIMAX_POLICY_NAME,
+    DEMAND_AWARE_HYSTERESIS_POLICY_NAME,
 ];
 const POLICY_COUNT: usize = SIMULATED_POLICY_NAMES.len();
 const DEFAULT_POLICY_NAME: &str = DEADLINE_AWARE_POLICY_NAME;
 const RUNTIME_REPLACEMENT_CANDIDATES: &[SelectionPolicyKind] = &[
     SelectionPolicyKind::ShadowPrice,
     SelectionPolicyKind::ResetWeightedMinimax,
+    SelectionPolicyKind::DemandAwareHysteresis,
 ];
 const REPLACEMENT_MIN_UNAVAILABLE_REDUCTION_MINUTES: u32 = 30;
 const REPLACEMENT_MIN_UNAVAILABLE_REDUCTION_RATIO: f64 = 0.05;
@@ -855,6 +858,100 @@ fn selection_config_can_select_reset_weighted_minimax_policy() {
 }
 
 #[test]
+fn demand_aware_hysteresis_keeps_healthy_active_for_tiny_improvement() {
+    let active = chatgpt_account("active", None);
+    let candidate_account = chatgpt_account("candidate", None);
+    let active_info = usage_info("active", 40.0, 20.0, 305, 604_800);
+    let candidate_info = usage_info("candidate", 40.0, 20.0, 300, 604_800);
+    let candidates = [
+        candidate(&candidate_account, &candidate_info),
+        candidate(&active, &active_info),
+    ];
+    let context = SelectionContext::at(0).with_current_account_id(Some("active"));
+
+    let selection = DemandAwareHysteresisPolicy::default()
+        .select_account_at(&candidates, context)
+        .expect("usable account should be selected");
+
+    assert_eq!(selection.account.id, "active");
+}
+
+#[test]
+fn demand_aware_hysteresis_replaces_unavailable_active() {
+    let active = chatgpt_account("active", None);
+    let replacement = chatgpt_account("replacement", None);
+    let active_info = usage_info("active", 100.0, 20.0, 10, 604_800);
+    let replacement_info = usage_info("replacement", 50.0, 20.0, 300, 604_800);
+    let candidates = [
+        candidate(&active, &active_info),
+        candidate(&replacement, &replacement_info),
+    ];
+    let context = SelectionContext::at(0).with_current_account_id(Some("active"));
+
+    let selection = DemandAwareHysteresisPolicy::default()
+        .select_account_at(&candidates, context)
+        .expect("replacement account should be selected");
+
+    assert_eq!(selection.account.id, "replacement");
+}
+
+#[test]
+fn demand_aware_hysteresis_replaces_active_for_materially_better_candidate() {
+    let active = chatgpt_account("active", None);
+    let candidate_account = chatgpt_account("candidate", None);
+    let active_info = usage_info("active", 90.0, 20.0, 18_000, 604_800);
+    let candidate_info = usage_info("candidate", 50.0, 20.0, 300, 604_800);
+    let candidates = [
+        candidate(&active, &active_info),
+        candidate(&candidate_account, &candidate_info),
+    ];
+    let context = SelectionContext::at(0).with_current_account_id(Some("active"));
+
+    let selection = DemandAwareHysteresisPolicy::default()
+        .select_account_at(&candidates, context)
+        .expect("materially better account should be selected");
+
+    assert_eq!(selection.account.id, "candidate");
+}
+
+#[test]
+fn demand_aware_hysteresis_protects_near_term_demand_margin() {
+    let soon = chatgpt_account("soon", None);
+    let safer = chatgpt_account("safer", None);
+    let soon_info = usage_info("soon", 96.0, 20.0, 60, 604_800);
+    let safer_info = usage_info("safer", 80.0, 20.0, 18_000, 604_800);
+    let candidates = [candidate(&soon, &soon_info), candidate(&safer, &safer_info)];
+
+    let selection = DemandAwareHysteresisPolicy::default()
+        .select_account_at(&candidates, SelectionContext::at(0))
+        .expect("usable account should be selected");
+
+    assert_eq!(selection.account.id, "safer");
+}
+
+#[test]
+fn selection_config_can_select_demand_aware_hysteresis_policy() {
+    let active = chatgpt_account("active", None);
+    let candidate_account = chatgpt_account("candidate", None);
+    let active_info = usage_info("active", 40.0, 20.0, 305, 604_800);
+    let candidate_info = usage_info("candidate", 40.0, 20.0, 300, 604_800);
+    let candidates = [
+        candidate(&candidate_account, &candidate_info),
+        candidate(&active, &active_info),
+    ];
+    let config = SelectionConfig {
+        policy: SelectionPolicyKind::DemandAwareHysteresis,
+        ..SelectionConfig::default()
+    };
+    let context = SelectionContext::at(0).with_current_account_id(Some("active"));
+
+    let selection = select_account_with_context(&candidates, config, context)
+        .expect("usable account should be selected");
+
+    assert_eq!(selection.account.id, "active");
+}
+
+#[test]
 fn simulator_evaluates_policies_across_realistic_usage_scenarios() {
     let evaluation = realistic_usage_evaluation();
     let diagnostics = PolicyEvaluationDiagnostics(evaluation);
@@ -864,6 +961,8 @@ fn simulator_evaluates_policies_across_realistic_usage_scenarios() {
     let shadow_price = find_policy_stats(aggregate_stats, SHADOW_PRICE_POLICY_NAME);
     let reset_weighted_minimax =
         find_policy_stats(aggregate_stats, RESET_WEIGHTED_MINIMAX_POLICY_NAME);
+    let demand_aware_hysteresis =
+        find_policy_stats(aggregate_stats, DEMAND_AWARE_HYSTERESIS_POLICY_NAME);
     let aggregate_demand_credits = aggregate_stats[0].stats.total_demand_credits();
 
     for scenario in &evaluation.scenarios {
@@ -899,6 +998,10 @@ fn simulator_evaluates_policies_across_realistic_usage_scenarios() {
     assert_eq!(
         reset_weighted_minimax.stats.preventable_failures, 0,
         "reset-weighted-minimax should not miss a serviceable account:\n{diagnostics}",
+    );
+    assert_eq!(
+        demand_aware_hysteresis.stats.preventable_failures, 0,
+        "demand-aware-hysteresis should not miss a serviceable account:\n{diagnostics}",
     );
 
     for candidate in RUNTIME_REPLACEMENT_CANDIDATES {
@@ -964,6 +1067,10 @@ fn default_replacement_ignores_non_runtime_policy_even_when_it_passes_gate() {
                 policy_name: RESET_WEIGHTED_MINIMAX_POLICY_NAME,
                 stats: gate_stats(1_000, 80, 500.0, 100, 0),
             },
+            PolicyStats {
+                policy_name: DEMAND_AWARE_HYSTERESIS_POLICY_NAME,
+                stats: gate_stats(1_000, 80, 500.0, 100, 0),
+            },
         ],
         scenarios: vec![ScenarioPolicyStats {
             scenario_name: "non-runtime-policy-wins",
@@ -984,6 +1091,10 @@ fn default_replacement_ignores_non_runtime_policy_even_when_it_passes_gate() {
                 },
                 PolicyStats {
                     policy_name: RESET_WEIGHTED_MINIMAX_POLICY_NAME,
+                    stats: gate_stats(100, 20, 50.0, 10, 0),
+                },
+                PolicyStats {
+                    policy_name: DEMAND_AWARE_HYSTERESIS_POLICY_NAME,
                     stats: gate_stats(100, 20, 50.0, 10, 0),
                 },
             ],
@@ -1216,6 +1327,7 @@ fn replacement_gate_rejects_candidate_when_any_scenario_regresses() {
             filler_policy_stats(MAX_HEADROOM_POLICY_NAME),
             filler_policy_stats(RESET_FIRST_POLICY_NAME),
             filler_policy_stats(RESET_WEIGHTED_MINIMAX_POLICY_NAME),
+            filler_policy_stats(DEMAND_AWARE_HYSTERESIS_POLICY_NAME),
         ],
         scenarios: vec![ScenarioPolicyStats {
             scenario_name: "regressed-scenario",
@@ -1232,6 +1344,7 @@ fn replacement_gate_rejects_candidate_when_any_scenario_regresses() {
                 filler_policy_stats(MAX_HEADROOM_POLICY_NAME),
                 filler_policy_stats(RESET_FIRST_POLICY_NAME),
                 filler_policy_stats(RESET_WEIGHTED_MINIMAX_POLICY_NAME),
+                filler_policy_stats(DEMAND_AWARE_HYSTERESIS_POLICY_NAME),
             ],
         }],
     };
@@ -1414,6 +1527,10 @@ fn offline_oracle_bounds_existing_online_policies_on_small_trace() {
         (
             "reset-weighted-minimax",
             simulate_policy_trace(&mut ResetWeightedMinimaxPolicy::default(), &trace, limits),
+        ),
+        (
+            "demand-aware-hysteresis",
+            simulate_policy_trace(&mut DemandAwareHysteresisPolicy::default(), &trace, limits),
         ),
     ];
 
@@ -1696,7 +1813,7 @@ fn simulate_policy_scenario<P: AccountSelectionPolicy>(
         min_five_hour_remaining: f64::INFINITY,
         min_weekly_remaining: f64::INFINITY,
     };
-    let mut last_account_index = None;
+    let mut last_account_index: Option<usize> = None;
     let mut contiguous_unavailable_minutes = 0;
 
     for minute in 0..SIMULATION_MINUTES {
@@ -2030,6 +2147,7 @@ fn policy_stats_for_scenario(scenario: SimScenario) -> [PolicyStats; POLICY_COUN
     let mut reset_first = ResetFirstPolicy::new(SelectionConfig::default());
     let mut shadow_price = ShadowPricePolicy::default();
     let mut reset_weighted_minimax = ResetWeightedMinimaxPolicy::default();
+    let mut demand_aware_hysteresis = DemandAwareHysteresisPolicy::default();
 
     let policy_stats = [
         PolicyStats {
@@ -2055,6 +2173,10 @@ fn policy_stats_for_scenario(scenario: SimScenario) -> [PolicyStats; POLICY_COUN
         PolicyStats {
             policy_name: RESET_WEIGHTED_MINIMAX_POLICY_NAME,
             stats: simulate_policy_scenario(&mut reset_weighted_minimax, scenario),
+        },
+        PolicyStats {
+            policy_name: DEMAND_AWARE_HYSTERESIS_POLICY_NAME,
+            stats: simulate_policy_scenario(&mut demand_aware_hysteresis, scenario),
         },
     ];
     assert_eq!(
@@ -2254,6 +2376,8 @@ fn assert_availability_policy_invariants(
     let shadow_price = find_policy_stats(&scenario.policy_stats, SHADOW_PRICE_POLICY_NAME);
     let reset_weighted_minimax =
         find_policy_stats(&scenario.policy_stats, RESET_WEIGHTED_MINIMAX_POLICY_NAME);
+    let demand_aware_hysteresis =
+        find_policy_stats(&scenario.policy_stats, DEMAND_AWARE_HYSTERESIS_POLICY_NAME);
 
     assert_eq!(
         deadline_aware.stats.preventable_failures, 0,
@@ -2268,6 +2392,11 @@ fn assert_availability_policy_invariants(
     assert_eq!(
         reset_weighted_minimax.stats.preventable_failures, 0,
         "reset-weighted-minimax should not miss a serviceable account in {}:\n{diagnostics}",
+        scenario.scenario_name
+    );
+    assert_eq!(
+        demand_aware_hysteresis.stats.preventable_failures, 0,
+        "demand-aware-hysteresis should not miss a serviceable account in {}:\n{diagnostics}",
         scenario.scenario_name
     );
 }
@@ -2392,6 +2521,7 @@ fn policy_name_for_kind(kind: SelectionPolicyKind) -> &'static str {
         SelectionPolicyKind::DeadlineAware => DEADLINE_AWARE_POLICY_NAME,
         SelectionPolicyKind::ShadowPrice => SHADOW_PRICE_POLICY_NAME,
         SelectionPolicyKind::ResetWeightedMinimax => RESET_WEIGHTED_MINIMAX_POLICY_NAME,
+        SelectionPolicyKind::DemandAwareHysteresis => DEMAND_AWARE_HYSTERESIS_POLICY_NAME,
     }
 }
 
@@ -2469,11 +2599,12 @@ fn simulate_policy_trace<P: AccountSelectionPolicy>(
     limits: TraceLimits,
 ) -> TraceOutcome {
     validate_trace_inputs(trace, limits);
-    let accounts = (0..limits.account_count)
+    let accounts: Vec<StoredAccount> = (0..limits.account_count)
         .map(|index| chatgpt_account(&format!("trace-account-{index}"), None))
         .collect::<Vec<_>>();
     let mut states = vec![TraceAccountState::default(); limits.account_count];
     let mut outcome = TraceOutcome::default();
+    let mut last_account_index: Option<usize> = None;
 
     for demand in trace {
         for state in &mut states {
@@ -2490,10 +2621,14 @@ fn simulate_policy_trace<P: AccountSelectionPolicy>(
             .zip(usages.iter())
             .map(|(account, usage)| candidate(account, usage))
             .collect::<Vec<_>>();
+        let current_account_id = last_account_index
+            .and_then(|index| accounts.get(index))
+            .map(|account| account.id.as_str());
         let selected_index = policy
             .select_account_at(
                 &candidates,
-                SelectionContext::at(i64::from(demand.minute) * 60),
+                SelectionContext::at(i64::from(demand.minute) * 60)
+                    .with_current_account_id(current_account_id),
             )
             .and_then(|selection| {
                 accounts
@@ -2511,6 +2646,7 @@ fn simulate_policy_trace<P: AccountSelectionPolicy>(
         if let Some(index) = serving_index {
             states[index].consume(*demand);
             outcome = outcome.with_served(demand.credits);
+            last_account_index = Some(index);
         } else {
             outcome = outcome.with_unavailable(demand.credits);
         }
@@ -2644,7 +2780,7 @@ fn serve_demand<P: AccountSelectionPolicy>(
             .max(*contiguous_unavailable_minutes);
     }
 
-    let selected_index = select_sim_account(policy, accounts, demand.minute);
+    let selected_index = select_sim_account(policy, accounts, demand.minute, *last_account_index);
     let serving_index = selected_index
         .filter(|index| accounts[*index].can_serve(demand.credits))
         .or_else(|| {
@@ -2680,6 +2816,7 @@ fn select_sim_account<P: AccountSelectionPolicy>(
     policy: &mut P,
     accounts: &[SimAccount],
     minute: i64,
+    current_account_index: Option<usize>,
 ) -> Option<usize> {
     let usages = accounts
         .iter()
@@ -2690,9 +2827,15 @@ fn select_sim_account<P: AccountSelectionPolicy>(
         .zip(usages.iter())
         .map(|(account, usage)| candidate(&account.account, usage))
         .collect::<Vec<_>>();
+    let current_account_id = current_account_index
+        .and_then(|index| accounts.get(index))
+        .map(|account| account.account.id.as_str());
 
     policy
-        .select_account_at(&candidates, SelectionContext::at(minute * 60))
+        .select_account_at(
+            &candidates,
+            SelectionContext::at(minute * 60).with_current_account_id(current_account_id),
+        )
         .and_then(|selection| {
             accounts
                 .iter()
