@@ -41,20 +41,33 @@ async fn run() -> Result<()> {
             let current_account_id = auth_json::current_stored_account_id_best_effort(&store);
             print_accounts(&store, current_account_id.as_deref());
         }
-        Command::Login { name, device_auth } => {
-            store::ensure_name_available(&name)?;
+        Command::Login {
+            name,
+            replace,
+            device_auth,
+        } => {
+            if replace {
+                store::ensure_chatgpt_replacement_target(&name)?;
+            } else {
+                store::ensure_name_available(&name)?;
+            }
             let flow = if device_auth {
                 oauth::LoginFlow::DeviceAuth
             } else {
                 oauth::LoginFlow::Browser
             };
-            let account = oauth::login(name, flow).await?;
-            let stored = store::add_account(account)?;
-            println!(
-                "Logged in {} ({})",
-                stored.name,
-                store::short_id(&stored.id)
-            );
+            let account = oauth::login(name.clone(), flow).await?;
+            let stored = if replace {
+                store::replace_chatgpt_account_by_name(&name, account)?
+            } else {
+                store::add_account(account)?
+            };
+            let action = if replace {
+                "Replaced login for"
+            } else {
+                "Logged in"
+            };
+            println!("{action} {} ({})", stored.name, store::short_id(&stored.id));
         }
         Command::Import { name, file } => {
             let file = match file {

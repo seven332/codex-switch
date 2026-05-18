@@ -18,7 +18,7 @@ cargo install --path .
 
 ```sh
 codex-switch list
-codex-switch login <name> [--device-auth]
+codex-switch login <name> [--replace] [--device-auth]
 codex-switch import <name> [--file <path>]
 codex-switch export <name-or-id> [--file <path>] [--force]
 codex-switch switch <name-or-id>
@@ -67,11 +67,13 @@ The browser callback server uses the same ports as Codex: `1455` by default, wit
 
 Use `codex-switch login <name> --device-auth` for device authorization. The CLI prints a verification URL and one-time code, then waits for authorization.
 
+Use `codex-switch login <name> --replace` to re-login an existing stored ChatGPT OAuth account after its credentials stop refreshing. The target name must already exist. Replacement happens only after OAuth succeeds, preserves the stored account ID and timestamps, and does not write Codex `auth.json`; run `codex-switch switch <name-or-id>` to apply the refreshed credentials to Codex. API key accounts cannot be replaced by `login --replace`.
+
 ## Import
 
 `import` reads an existing Codex `auth.json`. When `--file` is omitted, it imports from the current Codex auth file: `$CODEX_HOME/auth.json` when `CODEX_HOME` is set, otherwise `~/.codex/auth.json`.
 
-`login` and `import` reject accounts that match an already stored auth identity.
+`login` and `import` reject accounts that match an already stored auth identity. `login --replace` allows replacing the target account's own auth identity, but still rejects an identity that belongs to another stored account.
 
 ## Export
 
