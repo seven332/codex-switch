@@ -187,8 +187,21 @@ pub fn ensure_name_available(name: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn ensure_chatgpt_replacement_target(name: &str) -> Result<()> {
+    let store = load_accounts()?;
+    chatgpt_replacement_target_index(&store, name)?;
+    Ok(())
+}
+
 pub fn add_account(account: StoredAccount) -> Result<StoredAccount> {
     mutate_accounts(|store| add_account_to_store(store, account))
+}
+
+pub fn replace_chatgpt_account_by_name(
+    name: &str,
+    account: StoredAccount,
+) -> Result<StoredAccount> {
+    mutate_accounts(|store| replace_chatgpt_account_by_name_in_store(store, name, account))
 }
 
 pub fn find_matching_account<'a>(
@@ -349,6 +362,68 @@ fn add_account_to_store(
     let stored = account.clone();
     store.accounts.push(account);
     Ok(StoreUpdate::Changed(stored))
+}
+
+fn replace_chatgpt_account_by_name_in_store(
+    store: &mut AccountsStore,
+    name: &str,
+    account: StoredAccount,
+) -> Result<StoreUpdate<StoredAccount>> {
+    let index = chatgpt_replacement_target_index(store, name)?;
+    ensure_chatgpt_replacement_account(&account)?;
+
+    if let Some(existing) =
+        store
+            .accounts
+            .iter()
+            .enumerate()
+            .find_map(|(existing_index, existing)| {
+                (existing_index != index && has_same_auth_identity(existing, &account))
+                    .then_some(existing)
+            })
+    {
+        anyhow::bail!(
+            "account is already stored as {} ({})",
+            existing.name,
+            short_id(&existing.id)
+        );
+    }
+
+    let existing = &store.accounts[index];
+    let mut replacement = account;
+    replacement.id = existing.id.clone();
+    replacement.name = existing.name.clone();
+    replacement.created_at = existing.created_at;
+    replacement.last_used_at = existing.last_used_at;
+
+    let stored = replacement.clone();
+    store.accounts[index] = replacement;
+    Ok(StoreUpdate::Changed(stored))
+}
+
+fn ensure_chatgpt_replacement_account(account: &StoredAccount) -> Result<()> {
+    match &account.auth_data {
+        AuthData::ChatGPT { .. } => Ok(()),
+        AuthData::ApiKey { .. } => {
+            anyhow::bail!("Replacement login must be a ChatGPT OAuth account")
+        }
+    }
+}
+
+fn chatgpt_replacement_target_index(store: &AccountsStore, name: &str) -> Result<usize> {
+    let (index, account) = store
+        .accounts
+        .iter()
+        .enumerate()
+        .find(|(_, existing)| existing.name == name)
+        .with_context(|| format!("No account named '{name}' exists to replace"))?;
+
+    match &account.auth_data {
+        AuthData::ChatGPT { .. } => Ok(index),
+        AuthData::ApiKey { .. } => {
+            anyhow::bail!("Account '{name}' is an API key account and cannot be replaced by login")
+        }
+    }
 }
 
 fn touch_account_in_store(store: &mut AccountsStore, account_id: &str) -> Result<StoreUpdate<()>> {
@@ -677,6 +752,165 @@ mod tests {
         assert_eq!(final_store.accounts.len(), 1);
 
         fs::remove_dir_all(dir).expect("temp store should be removed");
+    }
+
+    #[test]
+    fn replace_account_preserves_local_identity_and_updates_login() {
+        let mut account = chatgpt_account("account", Some("old-account"), "old-refresh", "old-id");
+        account.email = Some("old@example.com".to_string());
+        account.plan_type = Some("free".to_string());
+        account.created_at = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("timestamp should parse")
+            .with_timezone(&Utc);
+        account.last_used_at = Some(
+            DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
+                .expect("timestamp should parse")
+                .with_timezone(&Utc),
+        );
+        let account_id = account.id.clone();
+        let created_at = account.created_at;
+        let last_used_at = account.last_used_at;
+        let mut store = store_with_accounts(vec![account]);
+
+        let mut replacement =
+            chatgpt_account("replacement", Some("new-account"), "new-refresh", "new-id");
+        replacement.email = Some("new@example.com".to_string());
+        replacement.plan_type = Some("pro".to_string());
+
+        let stored =
+            match replace_chatgpt_account_by_name_in_store(&mut store, "account", replacement)
+                .expect("replace should succeed")
+            {
+                StoreUpdate::Changed(stored) => stored,
+                StoreUpdate::Unchanged(_) => panic!("replace should save the store"),
+            };
+
+        assert_eq!(stored.id, account_id);
+        assert_eq!(stored.name, "account");
+        assert_eq!(stored.created_at, created_at);
+        assert_eq!(stored.last_used_at, last_used_at);
+        assert_eq!(stored.email.as_deref(), Some("new@example.com"));
+        assert_eq!(stored.plan_type.as_deref(), Some("pro"));
+        assert_eq!(store.accounts.len(), 1);
+
+        match &stored.auth_data {
+            AuthData::ChatGPT {
+                account_id,
+                refresh_token,
+                id_token,
+                ..
+            } => {
+                assert_eq!(account_id.as_deref(), Some("new-account"));
+                assert_eq!(refresh_token.expose_secret(), "new-refresh");
+                assert_eq!(id_token.expose_secret(), "new-id");
+            }
+            AuthData::ApiKey { .. } => panic!("replacement should remain ChatGPT auth"),
+        }
+    }
+
+    #[test]
+    fn replace_account_rejects_missing_name() {
+        let mut store = AccountsStore::default();
+        let replacement =
+            chatgpt_account("replacement", Some("new-account"), "new-refresh", "new-id");
+
+        let err = match replace_chatgpt_account_by_name_in_store(&mut store, "missing", replacement)
+        {
+            Ok(_) => panic!("missing replacement target should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("No account named 'missing'"));
+    }
+
+    #[test]
+    fn replace_account_rejects_api_key_target() {
+        let target = StoredAccount::new_api_key("target".to_string(), "sk-test".to_string());
+        let mut store = store_with_accounts(vec![target]);
+        let replacement =
+            chatgpt_account("replacement", Some("new-account"), "new-refresh", "new-id");
+
+        let err = match replace_chatgpt_account_by_name_in_store(&mut store, "target", replacement)
+        {
+            Ok(_) => panic!("API key target should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("API key account and cannot be replaced by login")
+        );
+        assert_eq!(store.accounts[0].auth_mode, crate::types::AuthMode::ApiKey);
+        match &store.accounts[0].auth_data {
+            AuthData::ApiKey { key } => assert_eq!(key.expose_secret(), "sk-test"),
+            AuthData::ChatGPT { .. } => panic!("target should remain API key auth"),
+        }
+    }
+
+    #[test]
+    fn replace_account_rejects_api_key_replacement() {
+        let target = chatgpt_account(
+            "target",
+            Some("target-account"),
+            "target-refresh",
+            "target-id",
+        );
+        let mut store = store_with_accounts(vec![target]);
+        let replacement =
+            StoredAccount::new_api_key("replacement".to_string(), "sk-test".to_string());
+
+        let err = match replace_chatgpt_account_by_name_in_store(&mut store, "target", replacement)
+        {
+            Ok(_) => panic!("API key replacement should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("Replacement login must be a ChatGPT OAuth account")
+        );
+        match &store.accounts[0].auth_data {
+            AuthData::ChatGPT { account_id, .. } => {
+                assert_eq!(account_id.as_deref(), Some("target-account"));
+            }
+            AuthData::ApiKey { .. } => panic!("target should remain ChatGPT auth"),
+        }
+    }
+
+    #[test]
+    fn replace_account_rejects_duplicate_auth_identity_from_another_account() {
+        let target = chatgpt_account(
+            "target",
+            Some("target-account"),
+            "target-refresh",
+            "target-id",
+        );
+        let other = chatgpt_account("other", Some("other-account"), "other-refresh", "other-id");
+        let mut store = store_with_accounts(vec![target, other]);
+        let replacement = chatgpt_account(
+            "replacement",
+            Some("other-account"),
+            "new-refresh",
+            "new-id",
+        );
+
+        let err = match replace_chatgpt_account_by_name_in_store(&mut store, "target", replacement)
+        {
+            Ok(_) => panic!("duplicate auth identity should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("account is already stored as other")
+        );
+        assert_eq!(store.accounts[0].name, "target");
+        match &store.accounts[0].auth_data {
+            AuthData::ChatGPT { account_id, .. } => {
+                assert_eq!(account_id.as_deref(), Some("target-account"));
+            }
+            AuthData::ApiKey { .. } => panic!("target should remain ChatGPT auth"),
+        }
     }
 
     fn chatgpt_account(

@@ -19,6 +19,9 @@ pub enum Command {
     Login {
         /// Account display name.
         name: String,
+        /// Replace an existing ChatGPT OAuth account with the same name after login succeeds.
+        #[arg(long)]
+        replace: bool,
         /// Use device authorization instead of browser OAuth.
         #[arg(long = "device-auth")]
         device_auth: bool,
