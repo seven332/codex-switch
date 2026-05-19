@@ -1,11 +1,9 @@
 use std::collections::HashMap;
-use std::env::VarError;
 use std::ffi::OsString;
 use std::future::pending;
 use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
-use std::sync::Once;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{Context, Result};
@@ -24,13 +22,13 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, accept_hdr_async, connect_async};
-use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use crate::account_selector::{self, SelectionConfig};
 use crate::auth_json;
 use crate::auto_switch::{self, AutoSwitchPlan, AutoSwitchResult};
 use crate::codex_http;
+use crate::runtime_log;
 use crate::store;
 use crate::token;
 use crate::types::{AuthData, StoredAccount};
@@ -53,12 +51,9 @@ const RUNTIME_BACKGROUND_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const RUNTIME_COMMAND_BUFFER: usize = 4;
 const BACKGROUND_RUNTIME_REQUEST_BUFFER: usize = 4;
 const INTERNAL_REQUEST_ID_PREFIX: &str = "codex-switch/";
-const STARTUP_LOG_ENV: &str = "CODEX_SWITCH_LOG";
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type ProxyClientStream = WebSocketStream<TcpStream>;
-
-static TRACING_INIT: Once = Once::new();
 
 enum RuntimeCommand {
     LoginPreparedAccount(RuntimeLoginCommand),
@@ -132,13 +127,17 @@ enum RuntimeAutoSwitchPriority {
 }
 
 pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<ExitStatus> {
-    init_runtime_tracing();
     codex_http::set_codex_bin_for_user_agent(codex_bin.clone());
     validate_remote_capable_codex_args(&codex_args)?;
     reject_remote_args(&codex_args)?;
     let current_dir = std::env::current_dir().context("Failed to read current directory")?;
     let codex_args_summary = format_codex_args_summary_for_log(&codex_args);
     let codex_args = codex_args_with_default_cwd(&codex_args, &current_dir);
+    let runtime_log = runtime_log::init_runtime_tracing()?;
+    startup_log(format_args!(
+        "runtime log: {}",
+        runtime_log.path().display()
+    ));
     startup_log(format_args!(
         "run start: codex-bin={codex_bin}, args={}",
         codex_args_summary
@@ -266,6 +265,7 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
     startup_log(format_args!(
         "codex tui: spawn start with proxy {proxy_url}"
     ));
+    runtime_log.disable_stderr();
     let mut codex_child = match spawn_remote_codex(&codex_bin, &codex_args, &proxy_url, &token)
         .context("Failed to start codex")
     {
@@ -278,6 +278,7 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
             child
         }
         Err(err) => {
+            runtime_log.enable_stderr();
             startup_log(format_args!(
                 "codex tui: spawn failed in {}: {err:#}",
                 format_elapsed(stage_start.elapsed())
@@ -315,6 +316,7 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
             }
         }
     };
+    runtime_log.enable_stderr();
 
     if !proxy_task_completed {
         proxy_task.abort();
@@ -336,41 +338,6 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
 fn startup_log(message: impl std::fmt::Display) {
     let message = sanitize_startup_log_message(&message.to_string());
     tracing::info!(target: "codex_switch", "{message}");
-}
-
-fn init_runtime_tracing() {
-    TRACING_INIT.call_once(|| {
-        let filter_spec = runtime_tracing_filter_spec(std::env::var(STARTUP_LOG_ENV));
-        let filter =
-            EnvFilter::try_new(filter_spec).unwrap_or_else(|_| EnvFilter::new("codex_switch=info"));
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(std::io::stderr)
-            .try_init();
-    });
-}
-
-fn runtime_tracing_filter_spec(value: Result<String, VarError>) -> String {
-    let Ok(value) = value else {
-        return "codex_switch=info".to_string();
-    };
-    let value = value.trim();
-    if value.is_empty() {
-        return "codex_switch=info".to_string();
-    }
-
-    if is_plain_tracing_level(value) {
-        return format!("codex_switch={}", value.to_ascii_lowercase());
-    }
-
-    value.to_string()
-}
-
-fn is_plain_tracing_level(value: &str) -> bool {
-    matches!(
-        value.to_ascii_lowercase().as_str(),
-        "trace" | "debug" | "info" | "warn" | "error" | "off"
-    )
 }
 
 fn sanitize_startup_log_message(message: &str) -> String {
@@ -2442,10 +2409,9 @@ mod tests {
         codex_args_with_default_cwd, current_account_snapshot_for_account,
         finish_background_auto_switch, format_codex_args_summary_for_log, has_cwd_arg,
         initialize_app_server_request, queue_background_auto_switch, queue_hard_auto_switch,
-        random_duration_between, runtime_tracing_filter_spec, sanitize_startup_log_message,
-        select_current_kept_login_account, shared_runtime_auto_switch_coordinator,
-        try_send_background_runtime_command, usage_limit_error_requires_switch,
-        validate_remote_capable_codex_args,
+        random_duration_between, sanitize_startup_log_message, select_current_kept_login_account,
+        shared_runtime_auto_switch_coordinator, try_send_background_runtime_command,
+        usage_limit_error_requires_switch, validate_remote_capable_codex_args,
     };
     use crate::types::{NewChatGptAccount, StoredAccount};
 
@@ -2497,30 +2463,6 @@ mod tests {
         assert_eq!(
             format_codex_args_summary_for_log(&["--model".to_string(), "gpt-test".to_string()]),
             "default (2 args)"
-        );
-    }
-
-    #[test]
-    fn runtime_tracing_filter_scopes_plain_levels_to_codex_switch() {
-        assert_eq!(
-            runtime_tracing_filter_spec(Err(std::env::VarError::NotPresent)),
-            "codex_switch=info"
-        );
-        assert_eq!(
-            runtime_tracing_filter_spec(Ok(String::new())),
-            "codex_switch=info"
-        );
-        assert_eq!(
-            runtime_tracing_filter_spec(Ok("debug".to_string())),
-            "codex_switch=debug"
-        );
-        assert_eq!(
-            runtime_tracing_filter_spec(Ok("WARN".to_string())),
-            "codex_switch=warn"
-        );
-        assert_eq!(
-            runtime_tracing_filter_spec(Ok("codex_switch=debug,tokio=warn".to_string())),
-            "codex_switch=debug,tokio=warn"
         );
     }
 

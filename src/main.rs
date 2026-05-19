@@ -7,6 +7,7 @@ mod oauth;
 mod process;
 mod redaction;
 mod runtime;
+mod runtime_log;
 mod store;
 mod store_lock;
 mod switcher;
