@@ -50,13 +50,7 @@ On Unix, both files are written with `0600` permissions.
 
 `run` is the runtime auto-switching entrypoint. It checks accounts before startup, starts `codex app-server`, launches Codex as a remote TUI through a local websocket proxy, and passes arguments after `--` to `codex`. During the managed session, the proxy watches Codex app-server `account/rateLimits/updated` notifications and usage-limit errors. It also performs best-effort background auto-switch checks every 15-45 minutes. Hard usage-limit signals trigger an immediate recovery attempt. Non-hard rate-limit updates only schedule a background re-check when the current Codex auth account is near the shared 5% bottleneck headroom threshold, so normal updates do not block the TUI on usage API calls. If another shell runs `codex-switch switch <name-or-id>`, managed `run` sessions detect the current Codex auth account change and hot-load it when the selected account is ChatGPT OAuth.
 
-Before handing the terminal to Codex, `run` writes startup diagnostics to stderr using the default tracing format, including timestamp, level, and target, so startup hangs can be traced to initial auto-switch, app-server startup, proxy binding, or remote TUI spawn. Set `CODEX_SWITCH_LOG` to a level such as `off` or `debug`, or to a full tracing filter, to control this output.
-
-To save startup diagnostics to a file:
-
-```sh
-codex-switch run -- resume 2> codex-switch.log
-```
+`run` writes diagnostics to a per-process log file under `~/.codex-switch/logs/`. Before handing the terminal to Codex, startup diagnostics are also written to stderr using the default tracing format, including timestamp, level, target, and the log path, so startup hangs can be traced to initial auto-switch, app-server startup, proxy binding, or remote TUI spawn. After Codex TUI starts, codex-switch background diagnostics only go to the log file so they do not corrupt the TUI. Set `CODEX_SWITCH_LOG` to a level such as `off` or `debug`, or to a full tracing filter, to control this output.
 
 ```sh
 codex-switch run
