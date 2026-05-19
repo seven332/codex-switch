@@ -103,6 +103,10 @@ pub async fn refresh_chatgpt_tokens_without_auth_write(
     .await
 }
 
+pub fn access_token_expires_at(access_token: &str) -> Option<DateTime<Utc>> {
+    parse_jwt_expiration(access_token)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct TokenRefreshOptions {
     write_current_auth: bool,

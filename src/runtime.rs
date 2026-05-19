@@ -7,6 +7,7 @@ use std::process::ExitStatus;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use futures_util::stream::SplitSink;
 use futures_util::{Sink, SinkExt, StreamExt};
 use rand::Rng as _;
@@ -28,7 +29,8 @@ use crate::account_selector::{self, SelectionConfig};
 use crate::auth_json;
 use crate::auto_switch::{self, AutoSwitchPlan, AutoSwitchResult};
 use crate::codex_http;
-use crate::runtime_log;
+use crate::redaction::redact_known_secrets;
+use crate::runtime_log as runtime_logging;
 use crate::store;
 use crate::token;
 use crate::types::{AuthData, StoredAccount};
@@ -50,6 +52,11 @@ const ACTIVE_ACCOUNT_RETRY_DELAYS: [Duration; ACTIVE_ACCOUNT_MAX_ATTEMPTS - 1] =
 const RUNTIME_BACKGROUND_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const RUNTIME_COMMAND_BUFFER: usize = 4;
 const BACKGROUND_RUNTIME_REQUEST_BUFFER: usize = 4;
+const RUNTIME_ACTIVITY_UPDATE_MIN_INTERVAL: Duration = Duration::from_secs(30);
+const TOKEN_PREWARM_MIN_WINDOW: Duration = Duration::from_secs(5 * 60);
+const TOKEN_PREWARM_MAX_WINDOW: Duration = Duration::from_secs(8 * 60);
+const TOKEN_PREWARM_IDLE_AFTER: Duration = Duration::from_secs(10 * 60);
+const TOKEN_PREWARM_RETRY_DELAY: Duration = Duration::from_secs(60);
 const INTERNAL_REQUEST_ID_PREFIX: &str = "codex-switch/";
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -100,6 +107,20 @@ impl RuntimeLoginCommand {
             completion: Some(completion),
         }
     }
+
+    fn prewarm(prepared: PreparedAccountLogin, expected_snapshot: CurrentAccountSnapshot) -> Self {
+        Self {
+            prepared,
+            expected_snapshot: Some(expected_snapshot),
+            generation: None,
+            completion: None,
+        }
+    }
+
+    fn with_completion(mut self, completion: oneshot::Sender<RuntimeLoginResult>) -> Self {
+        self.completion = Some(completion);
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +130,29 @@ enum RuntimeLoginResult {
     Deferred(String),
     Transient(String),
     Terminal(String),
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeAuthState {
+    loaded: Option<RuntimeLoadedAuth>,
+    last_activity_at: Instant,
+}
+
+impl RuntimeAuthState {
+    fn new(now: Instant) -> Self {
+        Self {
+            loaded: None,
+            last_activity_at: now,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeLoadedAuth {
+    account_id: String,
+    chatgpt_account_id: String,
+    access_token_expires_at: Option<DateTime<Utc>>,
+    current_snapshot: Option<CurrentAccountSnapshot>,
 }
 
 #[derive(Debug)]
@@ -133,7 +177,7 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
     let current_dir = std::env::current_dir().context("Failed to read current directory")?;
     let codex_args_summary = format_codex_args_summary_for_log(&codex_args);
     let codex_args = codex_args_with_default_cwd(&codex_args, &current_dir);
-    let runtime_log = runtime_log::init_runtime_tracing()?;
+    let runtime_log = runtime_logging::init_runtime_tracing()?;
     startup_log(format_args!(
         "runtime log: {}",
         runtime_log.path().display()
@@ -237,6 +281,7 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
         mpsc::channel(BACKGROUND_RUNTIME_REQUEST_BUFFER);
     let runtime_auto_switch_coordinator = shared_runtime_auto_switch_coordinator();
     let (maintenance_shutdown_tx, maintenance_shutdown_rx) = watch::channel(false);
+    let (runtime_auth_tx, runtime_auth_rx) = watch::channel(RuntimeAuthState::new(Instant::now()));
     let background_runtime_task = tokio::spawn(run_background_runtime_worker(
         background_runtime_rx,
         runtime_command_tx.clone(),
@@ -250,6 +295,11 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
     ));
     let current_account_reconcile_task = tokio::spawn(run_current_account_reconciler(
         runtime_command_tx.clone(),
+        maintenance_shutdown_rx.clone(),
+    ));
+    let token_prewarm_task = tokio::spawn(run_token_prewarm_maintenance(
+        runtime_auth_rx,
+        runtime_command_tx.clone(),
         maintenance_shutdown_rx,
     ));
     let mut proxy_task = tokio::spawn(run_websocket_proxy(
@@ -258,6 +308,7 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
         token.clone(),
         background_runtime_tx,
         runtime_auto_switch_coordinator,
+        runtime_auth_tx,
         runtime_command_rx,
     ));
 
@@ -290,6 +341,7 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
                 background_runtime_task,
                 maintenance_task,
                 current_account_reconcile_task,
+                token_prewarm_task,
             )
             .await;
             shutdown_child(&mut app_server).await;
@@ -327,6 +379,7 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
         background_runtime_task,
         maintenance_task,
         current_account_reconcile_task,
+        token_prewarm_task,
     )
     .await;
     shutdown_child(&mut app_server).await;
@@ -336,10 +389,24 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
 }
 
 fn startup_log(message: impl std::fmt::Display) {
+    runtime_log(message);
+}
+
+fn runtime_log(message: impl std::fmt::Display) {
     let message = sanitize_startup_log_message(&message.to_string());
     tracing::info!(target: "codex_switch", "{message}");
 }
 
+fn runtime_log_redacted(message: impl std::fmt::Display, secrets: &[String]) {
+    let message = redact_runtime_log_message(&message.to_string(), secrets);
+    tracing::info!(target: "codex_switch", "{message}");
+}
+
+fn redact_runtime_log_message(message: &str, secrets: &[String]) -> String {
+    let message = sanitize_startup_log_message(message);
+    let secrets = secrets.iter().map(String::as_str).collect::<Vec<_>>();
+    redact_known_secrets(message, &secrets)
+}
 fn sanitize_startup_log_message(message: &str) -> String {
     message
         .chars()
@@ -352,6 +419,23 @@ fn format_elapsed(duration: Duration) -> String {
         format!("{}ms", duration.as_millis())
     } else {
         format!("{:.1}s", duration.as_secs_f64())
+    }
+}
+
+fn format_runtime_account_label(account_id: &str) -> String {
+    match store::get_account_by_selector(account_id) {
+        Ok(account) => format!("{} ({})", account.name, store::short_id(&account.id)),
+        Err(_) => format!("unknown ({})", store::short_id(account_id)),
+    }
+}
+
+fn format_token_expiry_distance(expires_at: Option<DateTime<Utc>>) -> String {
+    match expires_at {
+        Some(expires_at) => format!(
+            "expires in {}",
+            format_elapsed(duration_until_utc(Utc::now(), expires_at))
+        ),
+        None => "expiry unknown".to_string(),
     }
 }
 
@@ -580,9 +664,14 @@ async fn run_websocket_proxy(
     token: String,
     background_requests: mpsc::Sender<BackgroundRuntimeRequest>,
     runtime_auto_switch_coordinator: SharedRuntimeAutoSwitchCoordinator,
+    runtime_auth: watch::Sender<RuntimeAuthState>,
     mut runtime_commands: mpsc::Receiver<RuntimeCommand>,
 ) -> Result<()> {
-    let mut state = ProxyState::new(background_requests, runtime_auto_switch_coordinator);
+    let mut state = ProxyState::new(
+        background_requests,
+        runtime_auto_switch_coordinator,
+        runtime_auth,
+    );
 
     loop {
         let (client_stream, _) = listener
@@ -608,11 +697,13 @@ async fn stop_runtime_background_tasks(
     background_runtime_task: JoinHandle<()>,
     maintenance_task: JoinHandle<()>,
     current_account_reconcile_task: JoinHandle<()>,
+    token_prewarm_task: JoinHandle<()>,
 ) {
     let _ = shutdown.send(true);
     stop_task_with_timeout(background_runtime_task).await;
     stop_task_with_timeout(maintenance_task).await;
     stop_task_with_timeout(current_account_reconcile_task).await;
+    stop_task_with_timeout(token_prewarm_task).await;
 }
 
 async fn stop_task_with_timeout(mut task: JoinHandle<()>) {
@@ -1134,6 +1225,437 @@ async fn run_auto_switch_maintenance(
     }
 }
 
+async fn run_token_prewarm_maintenance(
+    mut runtime_auth: watch::Receiver<RuntimeAuthState>,
+    runtime_commands: mpsc::Sender<RuntimeCommand>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut retry_after: Option<Instant> = None;
+    let mut suppressed_loaded_auth: Option<RuntimeLoadedAuth> = None;
+
+    loop {
+        let now = Instant::now();
+        if let Some(next_attempt) = retry_after
+            && now < next_attempt
+        {
+            if sleep_until_runtime_auth_change_or_shutdown(
+                next_attempt - now,
+                &mut runtime_auth,
+                &mut shutdown,
+            )
+            .await
+            {
+                return;
+            }
+            continue;
+        }
+        retry_after = None;
+
+        let state = runtime_auth.borrow().clone();
+        if token_prewarm_is_suppressed(&state, &suppressed_loaded_auth) {
+            if wait_for_runtime_auth_change_or_shutdown(&mut runtime_auth, &mut shutdown).await {
+                return;
+            }
+            continue;
+        }
+        suppressed_loaded_auth = None;
+
+        match token_prewarm_decision(&state, now, Utc::now(), random_token_prewarm_window()) {
+            TokenPrewarmDecision::WaitForRuntimeAuth => {
+                if wait_for_runtime_auth_change_or_shutdown(&mut runtime_auth, &mut shutdown).await
+                {
+                    return;
+                }
+            }
+            TokenPrewarmDecision::Wait(duration) => {
+                if sleep_until_runtime_auth_change_or_shutdown(
+                    duration,
+                    &mut runtime_auth,
+                    &mut shutdown,
+                )
+                .await
+                {
+                    return;
+                }
+            }
+            TokenPrewarmDecision::SkipIdle => {
+                runtime_log("token prewarm: skipped idle runtime");
+                if wait_for_runtime_auth_change_or_shutdown(&mut runtime_auth, &mut shutdown).await
+                {
+                    return;
+                }
+            }
+            TokenPrewarmDecision::Refresh(loaded_auth) => {
+                match run_token_prewarm_attempt(
+                    loaded_auth.clone(),
+                    &runtime_commands,
+                    &mut shutdown,
+                )
+                .await
+                {
+                    TokenPrewarmAttemptResult::RetryLater => {
+                        retry_after = Some(Instant::now() + TOKEN_PREWARM_RETRY_DELAY);
+                    }
+                    TokenPrewarmAttemptResult::SuppressUntilRuntimeAuthChanges => {
+                        suppressed_loaded_auth = Some(loaded_auth);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn token_prewarm_is_suppressed(
+    state: &RuntimeAuthState,
+    suppressed_loaded_auth: &Option<RuntimeLoadedAuth>,
+) -> bool {
+    suppressed_loaded_auth
+        .as_ref()
+        .is_some_and(|suppressed| state.loaded.as_ref() == Some(suppressed))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TokenPrewarmDecision {
+    WaitForRuntimeAuth,
+    Wait(Duration),
+    SkipIdle,
+    Refresh(RuntimeLoadedAuth),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenPrewarmAttemptResult {
+    RetryLater,
+    SuppressUntilRuntimeAuthChanges,
+}
+
+fn token_prewarm_decision(
+    state: &RuntimeAuthState,
+    now: Instant,
+    utc_now: DateTime<Utc>,
+    prewarm_window: Duration,
+) -> TokenPrewarmDecision {
+    let Some(loaded_auth) = state.loaded.clone() else {
+        return TokenPrewarmDecision::WaitForRuntimeAuth;
+    };
+    let Some(expires_at) = loaded_auth.access_token_expires_at else {
+        return TokenPrewarmDecision::WaitForRuntimeAuth;
+    };
+    let expires_in = duration_until_utc(utc_now, expires_at);
+    if expires_in > prewarm_window {
+        return TokenPrewarmDecision::Wait(expires_in - prewarm_window);
+    }
+    if now.saturating_duration_since(state.last_activity_at) >= TOKEN_PREWARM_IDLE_AFTER {
+        return TokenPrewarmDecision::SkipIdle;
+    }
+    TokenPrewarmDecision::Refresh(loaded_auth)
+}
+
+async fn run_token_prewarm_attempt(
+    loaded_auth: RuntimeLoadedAuth,
+    runtime_commands: &mpsc::Sender<RuntimeCommand>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> TokenPrewarmAttemptResult {
+    let stage_start = Instant::now();
+    let account_label = format_runtime_account_label(&loaded_auth.account_id);
+    let mut log_secrets = stored_account_secret_values(&loaded_auth.account_id);
+    runtime_log(format_args!(
+        "token prewarm: started for {account_label} ({})",
+        format_token_expiry_distance(loaded_auth.access_token_expires_at)
+    ));
+
+    let result = token_prewarm_login_command(&loaded_auth).await;
+    let command = match result {
+        Ok(Some(command)) => command,
+        Ok(None) => {
+            runtime_log(format_args!(
+                "token prewarm: stale for {account_label} in {}",
+                format_elapsed(stage_start.elapsed())
+            ));
+            return TokenPrewarmAttemptResult::RetryLater;
+        }
+        Err(err) => {
+            let result = classify_runtime_login_error(&err.to_string());
+            runtime_log_redacted(
+                format_args!(
+                    "token prewarm: failed for {account_label} in {}: {err:#}",
+                    format_elapsed(stage_start.elapsed())
+                ),
+                &log_secrets,
+            );
+            return token_prewarm_attempt_result_for_login_result(&result);
+        }
+    };
+    log_secrets.extend(runtime_login_command_secret_values(&command));
+
+    let (completion_tx, completion_rx) = oneshot::channel();
+    let command = command.with_completion(completion_tx);
+    match runtime_commands.try_send(RuntimeCommand::LoginPreparedAccount(command)) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            runtime_log_redacted(
+                format_args!(
+                    "token prewarm: deferred for {account_label} in {}: runtime command queue is full",
+                    format_elapsed(stage_start.elapsed())
+                ),
+                &log_secrets,
+            );
+            return TokenPrewarmAttemptResult::RetryLater;
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            return TokenPrewarmAttemptResult::RetryLater;
+        }
+    }
+
+    let result = wait_for_prewarm_login_completion(completion_rx, shutdown).await;
+    match &result {
+        Some(RuntimeLoginResult::Success) => {
+            runtime_log(format_args!(
+                "token prewarm: succeeded for {account_label} in {}",
+                format_elapsed(stage_start.elapsed())
+            ));
+        }
+        Some(RuntimeLoginResult::Stale) => {
+            runtime_log(format_args!(
+                "token prewarm: discarded stale result for {account_label} in {}",
+                format_elapsed(stage_start.elapsed())
+            ));
+        }
+        Some(RuntimeLoginResult::Deferred(reason)) => runtime_log_redacted(
+            format_args!(
+                "token prewarm: deferred for {account_label} in {}: {reason}",
+                format_elapsed(stage_start.elapsed())
+            ),
+            &log_secrets,
+        ),
+        Some(RuntimeLoginResult::Transient(reason) | RuntimeLoginResult::Terminal(reason)) => {
+            runtime_log_redacted(
+                format_args!(
+                    "token prewarm: failed for {account_label} in {}: {reason}",
+                    format_elapsed(stage_start.elapsed())
+                ),
+                &log_secrets,
+            );
+        }
+        None => {}
+    }
+
+    result
+        .as_ref()
+        .map(token_prewarm_attempt_result_for_login_result)
+        .unwrap_or(TokenPrewarmAttemptResult::RetryLater)
+}
+
+fn token_prewarm_attempt_result_for_login_result(
+    result: &RuntimeLoginResult,
+) -> TokenPrewarmAttemptResult {
+    match result {
+        RuntimeLoginResult::Success
+        | RuntimeLoginResult::Stale
+        | RuntimeLoginResult::Deferred(_)
+        | RuntimeLoginResult::Transient(_) => TokenPrewarmAttemptResult::RetryLater,
+        RuntimeLoginResult::Terminal(_) => {
+            TokenPrewarmAttemptResult::SuppressUntilRuntimeAuthChanges
+        }
+    }
+}
+
+async fn token_prewarm_login_command(
+    loaded_auth: &RuntimeLoadedAuth,
+) -> Result<Option<RuntimeLoginCommand>> {
+    let Some(account) = current_runtime_oauth_account(&loaded_auth.account_id)? else {
+        return Ok(None);
+    };
+    if !runtime_chatgpt_account_matches(&account, loaded_auth) {
+        return Ok(None);
+    }
+    let account = if current_account_has_newer_access_token(&account, loaded_auth) {
+        let Some(account) = sync_current_account_auth(account)? else {
+            return Ok(None);
+        };
+        account
+    } else {
+        token::refresh_chatgpt_tokens(&account).await?
+    };
+    if !runtime_chatgpt_account_matches(&account, loaded_auth) {
+        return Ok(None);
+    }
+    if !current_account_id_matches(&loaded_auth.account_id)? {
+        return Ok(None);
+    }
+    let Some(expected_snapshot) = current_prewarm_snapshot_for_account(&account)? else {
+        return Ok(None);
+    };
+    let prepared = prepare_login_from_fresh_account(account)?;
+    Ok(Some(RuntimeLoginCommand::prewarm(
+        prepared,
+        expected_snapshot,
+    )))
+}
+
+fn current_runtime_oauth_account(account_id: &str) -> Result<Option<StoredAccount>> {
+    let store = store::load_accounts()?;
+    let Some(account) = auth_json::current_stored_account(&store)? else {
+        return Ok(None);
+    };
+    if account.id != account_id {
+        return Ok(None);
+    }
+    if !matches!(account.auth_data, AuthData::ChatGPT { .. }) {
+        return Ok(None);
+    }
+    Ok(Some(account))
+}
+
+fn runtime_chatgpt_account_matches(
+    account: &StoredAccount,
+    loaded_auth: &RuntimeLoadedAuth,
+) -> bool {
+    chatgpt_account_id(account).as_deref() == Some(loaded_auth.chatgpt_account_id.as_str())
+}
+
+fn stored_account_secret_values(account_id: &str) -> Vec<String> {
+    store::get_account_by_selector(account_id)
+        .ok()
+        .map(|account| account_secret_values(&account))
+        .unwrap_or_default()
+}
+
+fn account_secret_values(account: &StoredAccount) -> Vec<String> {
+    match &account.auth_data {
+        AuthData::ChatGPT {
+            id_token,
+            access_token,
+            refresh_token,
+            ..
+        } => vec![
+            id_token.expose_secret().to_string(),
+            access_token.expose_secret().to_string(),
+            refresh_token.expose_secret().to_string(),
+        ],
+        AuthData::ApiKey { key } => vec![key.expose_secret().to_string()],
+    }
+}
+
+fn runtime_login_command_secret_values(command: &RuntimeLoginCommand) -> Vec<String> {
+    vec![command.prepared.payload.access_token.clone()]
+}
+
+fn current_account_has_newer_access_token(
+    account: &StoredAccount,
+    loaded_auth: &RuntimeLoadedAuth,
+) -> bool {
+    match &account.auth_data {
+        AuthData::ChatGPT { access_token, .. } => {
+            let Some(current_expires_at) =
+                token::access_token_expires_at(access_token.expose_secret())
+            else {
+                return false;
+            };
+            match loaded_auth.access_token_expires_at {
+                Some(loaded_expires_at) => current_expires_at > loaded_expires_at,
+                None => true,
+            }
+        }
+        AuthData::ApiKey { .. } => false,
+    }
+}
+
+fn current_prewarm_snapshot_for_account(
+    account: &StoredAccount,
+) -> Result<Option<CurrentAccountSnapshot>> {
+    let store = store::load_accounts()?;
+    let Some(current_auth_account) = auth_json::current_auth_account()? else {
+        return Ok(None);
+    };
+    let Some(current_account) = store::find_matching_account(&store, &current_auth_account) else {
+        return Ok(None);
+    };
+    Ok(prewarm_snapshot_for_matching_auth(
+        account,
+        &current_auth_account,
+        &current_account.id,
+    ))
+}
+
+fn prewarm_snapshot_for_matching_auth(
+    account: &StoredAccount,
+    current_auth_account: &StoredAccount,
+    current_account_id: &str,
+) -> Option<CurrentAccountSnapshot> {
+    if current_account_id != account.id {
+        return None;
+    }
+    if !auth_serialized_credentials_match(current_auth_account, account) {
+        return None;
+    }
+    Some(CurrentAccountSnapshot {
+        current_account_id: Some(account.id.clone()),
+        auth_marker: Some(current_account_auth_marker(current_auth_account)),
+    })
+}
+
+async fn wait_for_prewarm_login_completion(
+    mut completion: oneshot::Receiver<RuntimeLoginResult>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Option<RuntimeLoginResult> {
+    let deadline = Instant::now() + APP_SERVER_REQUEST_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Some(RuntimeLoginResult::Transient(
+                "Timed out waiting for Codex app-server login response".to_string(),
+            ));
+        }
+
+        tokio::select! {
+            result = &mut completion => {
+                return Some(result.unwrap_or_else(|_| {
+                    RuntimeLoginResult::Transient("Codex app-server login response was dropped".to_string())
+                }));
+            }
+            changed = shutdown.changed() => {
+                if changed.is_ok() && *shutdown.borrow() {
+                    return None;
+                }
+            }
+            _ = sleep(remaining.min(ACTIVE_ACCOUNT_WATCH_INTERVAL)) => {}
+        }
+    }
+}
+
+async fn sleep_until_runtime_auth_change_or_shutdown(
+    duration: Duration,
+    runtime_auth: &mut watch::Receiver<RuntimeAuthState>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> bool {
+    tokio::select! {
+        _ = sleep(duration) => false,
+        changed = runtime_auth.changed() => changed.is_err(),
+        changed = shutdown.changed() => changed.is_ok() && *shutdown.borrow(),
+    }
+}
+
+async fn wait_for_runtime_auth_change_or_shutdown(
+    runtime_auth: &mut watch::Receiver<RuntimeAuthState>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> bool {
+    tokio::select! {
+        changed = runtime_auth.changed() => changed.is_err(),
+        changed = shutdown.changed() => changed.is_ok() && *shutdown.borrow(),
+    }
+}
+
+fn duration_until_utc(now: DateTime<Utc>, target: DateTime<Utc>) -> Duration {
+    target
+        .signed_duration_since(now)
+        .to_std()
+        .unwrap_or(Duration::ZERO)
+}
+
+fn random_token_prewarm_window() -> Duration {
+    random_duration_between(TOKEN_PREWARM_MIN_WINDOW, TOKEN_PREWARM_MAX_WINDOW)
+}
+
 async fn sleep_until_shutdown(duration: Duration, shutdown: &mut watch::Receiver<bool>) -> bool {
     tokio::select! {
         _ = sleep(duration) => false,
@@ -1187,9 +1709,10 @@ struct ActiveAccountReconcileState {
 
 impl ActiveAccountReconcileState {
     fn new(initial_snapshot: Option<CurrentAccountSnapshot>, now: Instant) -> Self {
+        let settled = initial_snapshot.is_none();
         Self {
             desired_snapshot: initial_snapshot,
-            settled: true,
+            settled,
             attempts_started: 0,
             next_attempt_at: now,
         }
@@ -1550,6 +2073,7 @@ async fn proxy_websockets(
                     return Ok(());
                 };
                 let message = message.context("Failed to read Codex websocket client message")?;
+                state.mark_activity(Instant::now());
                 if !handle_client_proxy_message(message, &mut app_server_write).await? {
                     return Ok(());
                 }
@@ -1559,6 +2083,7 @@ async fn proxy_websockets(
                     return Ok(());
                 };
                 let message = message.context("Failed to read Codex app-server websocket message")?;
+                state.mark_activity(Instant::now());
                 if !handle_app_server_proxy_message(
                     message,
                     &mut client_write,
@@ -1581,6 +2106,8 @@ struct ProxyState {
     app_server_account_id: Option<String>,
     app_server_snapshot: Option<CurrentAccountSnapshot>,
     pending_login_account_id: Option<String>,
+    runtime_auth_state: RuntimeAuthState,
+    runtime_auth: watch::Sender<RuntimeAuthState>,
     background_requests: mpsc::Sender<BackgroundRuntimeRequest>,
     runtime_auto_switch_coordinator: SharedRuntimeAutoSwitchCoordinator,
 }
@@ -1591,6 +2118,7 @@ enum PendingInternalRequest {
         started_at: Instant,
         expected_snapshot: Option<CurrentAccountSnapshot>,
         generation: Option<u64>,
+        loaded_auth: RuntimeLoadedAuth,
         completion: Option<oneshot::Sender<RuntimeLoginResult>>,
     },
 }
@@ -1599,7 +2127,9 @@ impl ProxyState {
     fn new(
         background_requests: mpsc::Sender<BackgroundRuntimeRequest>,
         runtime_auto_switch_coordinator: SharedRuntimeAutoSwitchCoordinator,
+        runtime_auth: watch::Sender<RuntimeAuthState>,
     ) -> Self {
+        let runtime_auth_state = runtime_auth.borrow().clone();
         Self {
             request_prefix: format!("{INTERNAL_REQUEST_ID_PREFIX}{}", Uuid::new_v4()),
             next_request_id: 1,
@@ -1607,6 +2137,8 @@ impl ProxyState {
             app_server_account_id: None,
             app_server_snapshot: None,
             pending_login_account_id: None,
+            runtime_auth_state,
+            runtime_auth,
             background_requests,
             runtime_auto_switch_coordinator,
         }
@@ -1616,6 +2148,24 @@ impl ProxyState {
         let id = format!("{}/{}", self.request_prefix, self.next_request_id);
         self.next_request_id += 1;
         id
+    }
+
+    fn mark_activity(&mut self, now: Instant) {
+        if now.saturating_duration_since(self.runtime_auth_state.last_activity_at)
+            < RUNTIME_ACTIVITY_UPDATE_MIN_INTERVAL
+        {
+            return;
+        }
+        self.runtime_auth_state.last_activity_at = now;
+        let _ = self.runtime_auth.send(self.runtime_auth_state.clone());
+    }
+
+    fn set_runtime_loaded_auth(&mut self, loaded_auth: RuntimeLoadedAuth) {
+        self.app_server_account_id = Some(loaded_auth.account_id.clone());
+        self.app_server_snapshot = loaded_auth.current_snapshot.clone();
+        self.runtime_auth_state.loaded = Some(loaded_auth);
+        self.runtime_auth_state.last_activity_at = Instant::now();
+        let _ = self.runtime_auth.send(self.runtime_auth_state.clone());
     }
 
     fn clear_connection_pending(&mut self) {
@@ -1700,6 +2250,7 @@ impl ProxyState {
             return Ok(());
         }
 
+        let loaded_auth = runtime_loaded_auth_from_prepared(&prepared, expected_snapshot.clone());
         let request_id = self.next_internal_request_id();
         let request =
             login_request_from_payload(Value::String(request_id.clone()), &prepared.payload);
@@ -1719,6 +2270,7 @@ impl ProxyState {
                 started_at: Instant::now(),
                 expected_snapshot,
                 generation,
+                loaded_auth,
                 completion,
             },
         );
@@ -1794,6 +2346,7 @@ impl ProxyState {
                 started_at: _,
                 expected_snapshot,
                 generation,
+                loaded_auth,
                 completion,
             } => {
                 if self.pending_login_account_id.as_deref() == Some(account_id.as_str()) {
@@ -1822,8 +2375,7 @@ impl ProxyState {
                     }
                 };
                 if result == RuntimeLoginResult::Success {
-                    self.app_server_account_id = Some(account_id);
-                    self.app_server_snapshot = expected_snapshot;
+                    self.set_runtime_loaded_auth(loaded_auth);
                 }
                 complete_runtime_login(completion, result);
             }
@@ -1914,7 +2466,9 @@ async fn handle_app_server_proxy_message(
             && value.get("method").and_then(Value::as_str)
                 == Some("account/chatgptAuthTokens/refresh")
         {
-            handle_server_request(app_server_write, value).await?;
+            if let Some(loaded_auth) = handle_server_request(app_server_write, value).await? {
+                state.set_runtime_loaded_auth(loaded_auth);
+            }
             should_forward = false;
         } else if usage_limit_error_requires_switch(&value) {
             auto_switch_trigger = RateLimitAutoSwitchTrigger::Hard;
@@ -2172,7 +2726,10 @@ fn login_request_from_payload(request_id: Value, payload: &ExternalAuthPayload) 
     })
 }
 
-async fn handle_server_request<S>(websocket: &mut S, request: Value) -> Result<()>
+async fn handle_server_request<S>(
+    websocket: &mut S,
+    request: Value,
+) -> Result<Option<RuntimeLoadedAuth>>
 where
     S: Sink<Message> + Unpin,
     S::Error: std::error::Error + Send + Sync + 'static,
@@ -2187,7 +2744,10 @@ where
                 .and_then(Value::as_str)
                 .map(str::to_string);
             match refresh_external_auth(previous_account_id).await {
-                Ok(payload) => {
+                Ok(refreshed) => {
+                    let payload = refreshed.payload;
+                    let loaded_auth =
+                        runtime_loaded_auth_from_account_and_payload(&refreshed.account, &payload);
                     send_json(
                         websocket,
                         json!({
@@ -2199,18 +2759,34 @@ where
                             }
                         }),
                     )
-                    .await
+                    .await?;
+                    Ok(Some(loaded_auth))
                 }
-                Err(err) => send_error_response(websocket, id, &err.to_string()).await,
+                Err(err) => {
+                    send_error_response(websocket, id, &err.to_string()).await?;
+                    Ok(None)
+                }
             }
         }
-        _ => send_error_response(websocket, id, "unsupported request").await,
+        _ => {
+            send_error_response(websocket, id, "unsupported request").await?;
+            Ok(None)
+        }
     }
 }
 
-async fn refresh_external_auth(previous_account_id: Option<String>) -> Result<ExternalAuthPayload> {
+struct RefreshedExternalAuth {
+    account: StoredAccount,
+    payload: ExternalAuthPayload,
+}
+
+async fn refresh_external_auth(
+    previous_account_id: Option<String>,
+) -> Result<RefreshedExternalAuth> {
     let account = find_refresh_account(previous_account_id.as_deref())?;
-    external_auth_payload(&account).await
+    let account = token::ensure_chatgpt_tokens_fresh(&account).await?;
+    let payload = external_auth_payload_from_fresh_account(account.clone())?;
+    Ok(RefreshedExternalAuth { account, payload })
 }
 
 fn find_refresh_account(previous_account_id: Option<&str>) -> Result<StoredAccount> {
@@ -2251,6 +2827,10 @@ struct PreparedAccountLogin {
 
 async fn prepare_login(account: StoredAccount) -> Result<PreparedAccountLogin> {
     let account = token::ensure_chatgpt_tokens_fresh(&account).await?;
+    prepare_login_from_fresh_account(account)
+}
+
+fn prepare_login_from_fresh_account(account: StoredAccount) -> Result<PreparedAccountLogin> {
     let account_id = account.id.clone();
     let current_snapshot = prepared_current_account_snapshot(&account)?;
     let payload = external_auth_payload_from_fresh_account(account)?;
@@ -2265,11 +2845,6 @@ struct ExternalAuthPayload {
     access_token: String,
     chatgpt_account_id: String,
     chatgpt_plan_type: Option<String>,
-}
-
-async fn external_auth_payload(account: &StoredAccount) -> Result<ExternalAuthPayload> {
-    let account = token::ensure_chatgpt_tokens_fresh(account).await?;
-    external_auth_payload_from_fresh_account(account)
 }
 
 fn external_auth_payload_from_fresh_account(account: StoredAccount) -> Result<ExternalAuthPayload> {
@@ -2288,6 +2863,34 @@ fn external_auth_payload_from_fresh_account(account: StoredAccount) -> Result<Ex
         AuthData::ApiKey { .. } => {
             anyhow::bail!("API key accounts do not support runtime switching")
         }
+    }
+}
+
+fn runtime_loaded_auth_from_prepared(
+    prepared: &PreparedAccountLogin,
+    current_snapshot: Option<CurrentAccountSnapshot>,
+) -> RuntimeLoadedAuth {
+    RuntimeLoadedAuth {
+        account_id: prepared.account_id.clone(),
+        chatgpt_account_id: prepared.payload.chatgpt_account_id.clone(),
+        access_token_expires_at: token::access_token_expires_at(&prepared.payload.access_token),
+        current_snapshot,
+    }
+}
+
+fn runtime_loaded_auth_from_account_and_payload(
+    account: &StoredAccount,
+    payload: &ExternalAuthPayload,
+) -> RuntimeLoadedAuth {
+    let current_snapshot = current_account_id_matches(&account.id)
+        .ok()
+        .filter(|matches| *matches)
+        .map(|_| current_account_snapshot_for_account(account));
+    RuntimeLoadedAuth {
+        account_id: account.id.clone(),
+        chatgpt_account_id: payload.chatgpt_account_id.clone(),
+        access_token_expires_at: token::access_token_expires_at(&payload.access_token),
+        current_snapshot,
     }
 }
 
@@ -2392,9 +2995,10 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
+    use base64::Engine;
     use chrono::Utc;
     use serde_json::json;
-    use tokio::sync::{mpsc, oneshot};
+    use tokio::sync::{mpsc, oneshot, watch};
     use tokio::time::Instant;
 
     use super::{
@@ -2403,17 +3007,23 @@ mod tests {
         ActiveAccountReconcileState, AutoSwitchLoginMode, BackgroundAutoSwitchQueueStatus,
         BackgroundRuntimeRequest, CurrentAccountSnapshot, ExternalAuthPayload,
         PendingInternalRequest, PendingLoginStatus, PreparedAccountLogin, ProxyState,
-        RateLimitAutoSwitchTrigger, RuntimeAutoSwitchPriority, RuntimeCommand,
-        RuntimeCommandSendStatus, RuntimeLoginCommand, RuntimeLoginResult,
+        RateLimitAutoSwitchTrigger, RuntimeAuthState, RuntimeAutoSwitchPriority, RuntimeCommand,
+        RuntimeCommandSendStatus, RuntimeLoadedAuth, RuntimeLoginCommand, RuntimeLoginResult,
+        TOKEN_PREWARM_IDLE_AFTER, TokenPrewarmAttemptResult, TokenPrewarmDecision,
         classify_rate_limit_notification, classify_runtime_login_error,
-        codex_args_with_default_cwd, current_account_snapshot_for_account,
+        codex_args_with_default_cwd, current_account_auth_marker,
+        current_account_has_newer_access_token, current_account_snapshot_for_account,
+        duration_until_utc, external_auth_payload_from_fresh_account,
         finish_background_auto_switch, format_codex_args_summary_for_log, has_cwd_arg,
-        initialize_app_server_request, queue_background_auto_switch, queue_hard_auto_switch,
-        random_duration_between, sanitize_startup_log_message, select_current_kept_login_account,
-        shared_runtime_auto_switch_coordinator, try_send_background_runtime_command,
+        initialize_app_server_request, prewarm_snapshot_for_matching_auth,
+        queue_background_auto_switch, queue_hard_auto_switch, random_duration_between,
+        redact_runtime_log_message, runtime_chatgpt_account_matches, sanitize_startup_log_message,
+        select_current_kept_login_account, shared_runtime_auto_switch_coordinator,
+        token_prewarm_attempt_result_for_login_result, token_prewarm_decision,
+        token_prewarm_is_suppressed, try_send_background_runtime_command,
         usage_limit_error_requires_switch, validate_remote_capable_codex_args,
     };
-    use crate::types::{NewChatGptAccount, StoredAccount};
+    use crate::types::{AuthData, NewChatGptAccount, StoredAccount};
 
     #[test]
     fn app_server_probe_uses_codex_daemon_identity() {
@@ -2451,6 +3061,17 @@ mod tests {
             sanitize_startup_log_message("before\n\u{1b}[31mafter\tend"),
             "before??[31mafter?end"
         );
+    }
+
+    #[test]
+    fn runtime_log_redaction_sanitizes_known_secrets() {
+        let secret = "secret value/with-symbols".to_string();
+        let encoded = urlencoding::encode(&secret);
+        let message = format!("before\nraw={secret} encoded={encoded}");
+
+        let redacted = redact_runtime_log_message(&message, &[secret]);
+
+        assert_eq!(redacted, "before?raw=<redacted> encoded=<redacted>");
     }
 
     #[test]
@@ -2742,6 +3363,221 @@ mod tests {
     }
 
     #[test]
+    fn token_prewarm_waits_without_runtime_auth_or_expiry() {
+        let now = Instant::now();
+        let state = RuntimeAuthState::new(now);
+        assert_eq!(
+            token_prewarm_decision(&state, now, Utc::now(), Duration::from_secs(300)),
+            TokenPrewarmDecision::WaitForRuntimeAuth
+        );
+
+        let state = RuntimeAuthState {
+            loaded: Some(runtime_loaded_auth("account-a")),
+            last_activity_at: now,
+        };
+        assert_eq!(
+            token_prewarm_decision(&state, now, Utc::now(), Duration::from_secs(300)),
+            TokenPrewarmDecision::WaitForRuntimeAuth
+        );
+    }
+
+    #[test]
+    fn token_prewarm_waits_until_expiry_window() {
+        let now = Instant::now();
+        let utc_now = Utc::now();
+        let loaded = RuntimeLoadedAuth {
+            access_token_expires_at: Some(utc_now + chrono::Duration::minutes(30)),
+            ..runtime_loaded_auth("account-a")
+        };
+        let state = RuntimeAuthState {
+            loaded: Some(loaded),
+            last_activity_at: now,
+        };
+
+        assert_eq!(
+            token_prewarm_decision(&state, now, utc_now, Duration::from_secs(5 * 60)),
+            TokenPrewarmDecision::Wait(Duration::from_secs(25 * 60))
+        );
+    }
+
+    #[test]
+    fn token_prewarm_refreshes_near_expiry_when_active() {
+        let now = Instant::now();
+        let loaded = runtime_loaded_auth_expires_in("account-a", 4 * 60);
+        let state = RuntimeAuthState {
+            loaded: Some(loaded.clone()),
+            last_activity_at: now - Duration::from_secs(60),
+        };
+
+        assert_eq!(
+            token_prewarm_decision(&state, now, Utc::now(), Duration::from_secs(5 * 60)),
+            TokenPrewarmDecision::Refresh(loaded)
+        );
+    }
+
+    #[test]
+    fn token_prewarm_skips_idle_runtime() {
+        let now = Instant::now();
+        let state = RuntimeAuthState {
+            loaded: Some(runtime_loaded_auth_expires_in("account-a", 4 * 60)),
+            last_activity_at: now - TOKEN_PREWARM_IDLE_AFTER - Duration::from_secs(1),
+        };
+
+        assert_eq!(
+            token_prewarm_decision(&state, now, Utc::now(), Duration::from_secs(5 * 60)),
+            TokenPrewarmDecision::SkipIdle
+        );
+    }
+
+    #[test]
+    fn token_prewarm_suppression_only_matches_same_loaded_auth() {
+        let loaded = runtime_loaded_auth_expires_in("account-a", 4 * 60);
+        let same_state = RuntimeAuthState {
+            loaded: Some(loaded.clone()),
+            last_activity_at: Instant::now(),
+        };
+        let changed_state = RuntimeAuthState {
+            loaded: Some(RuntimeLoadedAuth {
+                access_token_expires_at: Some(Utc::now() + chrono::Duration::minutes(30)),
+                ..loaded.clone()
+            }),
+            last_activity_at: Instant::now(),
+        };
+
+        assert!(token_prewarm_is_suppressed(
+            &same_state,
+            &Some(loaded.clone())
+        ));
+        assert!(!token_prewarm_is_suppressed(&changed_state, &Some(loaded)));
+        assert!(!token_prewarm_is_suppressed(&same_state, &None));
+    }
+
+    #[test]
+    fn token_prewarm_terminal_result_suppresses_retries() {
+        assert_eq!(
+            token_prewarm_attempt_result_for_login_result(&RuntimeLoginResult::Terminal(
+                "invalid_grant".to_string()
+            )),
+            TokenPrewarmAttemptResult::SuppressUntilRuntimeAuthChanges
+        );
+        assert_eq!(
+            token_prewarm_attempt_result_for_login_result(&RuntimeLoginResult::Stale),
+            TokenPrewarmAttemptResult::RetryLater
+        );
+        assert_eq!(
+            token_prewarm_attempt_result_for_login_result(&RuntimeLoginResult::Transient(
+                "temporary failure".to_string()
+            )),
+            TokenPrewarmAttemptResult::RetryLater
+        );
+        assert_eq!(
+            token_prewarm_attempt_result_for_login_result(&RuntimeLoginResult::Success),
+            TokenPrewarmAttemptResult::RetryLater
+        );
+    }
+
+    #[test]
+    fn duration_until_utc_clamps_past_time_to_zero() {
+        let now = Utc::now();
+        assert_eq!(
+            duration_until_utc(now, now - chrono::Duration::seconds(10)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn current_account_newer_access_token_ignores_snapshot_change_without_later_expiry() {
+        let mut account = chatgpt_account("account-a");
+        let loaded = RuntimeLoadedAuth {
+            current_snapshot: Some(current_account_snapshot_for_account(&account)),
+            ..runtime_loaded_auth("account-a")
+        };
+        account.token_last_refresh_at = account
+            .token_last_refresh_at
+            .map(|value| value + chrono::Duration::seconds(1));
+
+        assert!(!current_account_has_newer_access_token(&account, &loaded));
+    }
+
+    #[test]
+    fn current_account_newer_access_token_detects_later_access_token_expiry() {
+        let exp = Utc::now().timestamp() + 30 * 60;
+        let mut account = chatgpt_account("account-a");
+        set_account_access_token(&mut account, test_jwt_with_exp(exp));
+        let loaded = RuntimeLoadedAuth {
+            access_token_expires_at: chrono::DateTime::from_timestamp(exp - 10 * 60, 0),
+            current_snapshot: Some(current_account_snapshot_for_account(&account)),
+            ..runtime_loaded_auth("account-a")
+        };
+
+        assert!(current_account_has_newer_access_token(&account, &loaded));
+    }
+
+    #[test]
+    fn current_account_newer_access_token_rejects_same_snapshot_and_expiry() {
+        let exp = Utc::now().timestamp() + 30 * 60;
+        let mut account = chatgpt_account("account-a");
+        set_account_access_token(&mut account, test_jwt_with_exp(exp));
+        let loaded = RuntimeLoadedAuth {
+            access_token_expires_at: chrono::DateTime::from_timestamp(exp, 0),
+            current_snapshot: Some(current_account_snapshot_for_account(&account)),
+            ..runtime_loaded_auth("account-a")
+        };
+
+        assert!(!current_account_has_newer_access_token(&account, &loaded));
+    }
+
+    #[test]
+    fn prewarm_snapshot_preserves_current_auth_marker_for_matching_credentials() {
+        let mut account = chatgpt_account("account-a");
+        account.plan_type = Some("new-plan".to_string());
+        let mut current_auth_account = account.clone();
+        current_auth_account.plan_type = Some("old-plan".to_string());
+
+        assert_eq!(
+            prewarm_snapshot_for_matching_auth(&account, &current_auth_account, "account-a"),
+            Some(CurrentAccountSnapshot {
+                current_account_id: Some("account-a".to_string()),
+                auth_marker: Some(current_account_auth_marker(&current_auth_account)),
+            })
+        );
+    }
+
+    #[test]
+    fn prewarm_snapshot_rejects_other_current_account() {
+        let account = chatgpt_account("account-a");
+        let current_auth_account = account.clone();
+
+        assert_eq!(
+            prewarm_snapshot_for_matching_auth(&account, &current_auth_account, "account-b"),
+            None
+        );
+    }
+
+    #[test]
+    fn prewarm_snapshot_rejects_credential_mismatch_for_same_account() {
+        let account = chatgpt_account("account-a");
+        let mut current_auth_account = account.clone();
+        set_account_access_token(&mut current_auth_account, "older-access-token".to_string());
+
+        assert_eq!(
+            prewarm_snapshot_for_matching_auth(&account, &current_auth_account, "account-a"),
+            None
+        );
+    }
+
+    #[test]
+    fn runtime_chatgpt_account_match_rejects_replaced_local_account() {
+        let account = chatgpt_account("account-a");
+        let loaded = RuntimeLoadedAuth {
+            chatgpt_account_id: "account-b".to_string(),
+            ..runtime_loaded_auth("account-a")
+        };
+
+        assert!(!runtime_chatgpt_account_matches(&account, &loaded));
+    }
+
+    #[test]
     fn active_account_reconciler_retries_transient_failure_then_settles_success() {
         let now = Instant::now();
         let initial_snapshot = current_snapshot("account-a");
@@ -2779,6 +3615,20 @@ mod tests {
         assert_eq!(
             state.next_action(changed_snapshot, retry_at + Duration::from_secs(60)),
             ActiveAccountReconcileAction::Wait
+        );
+    }
+
+    #[test]
+    fn active_account_reconciler_attempts_initial_snapshot() {
+        let now = Instant::now();
+        let initial_snapshot = current_snapshot("account-a");
+        let mut state = ActiveAccountReconcileState::new(Some(initial_snapshot.clone()), now);
+
+        assert_eq!(
+            state.next_action(initial_snapshot.clone(), now),
+            ActiveAccountReconcileAction::Attempt {
+                snapshot: initial_snapshot
+            }
         );
     }
 
@@ -2956,9 +3806,25 @@ mod tests {
     }
 
     #[test]
+    fn runtime_auth_payload_rejects_api_key_accounts() {
+        let result = external_auth_payload_from_fresh_account(StoredAccount::new_api_key(
+            "api-key".to_string(),
+            "sk-test".to_string(),
+        ));
+        let Err(err) = result else {
+            panic!("API key accounts cannot be loaded as ChatGPT runtime auth");
+        };
+
+        assert!(
+            err.to_string()
+                .contains("API key accounts do not support runtime switching")
+        );
+    }
+
+    #[test]
     fn proxy_reconciled_login_matches_snapshot_not_only_account_id() {
         let (background_tx, _background_rx) = mpsc::channel(1);
-        let mut state = ProxyState::new(background_tx, shared_runtime_auto_switch_coordinator());
+        let mut state = proxy_state(background_tx);
         let older_snapshot = current_snapshot("account-a");
         let mut refreshed_snapshot = current_snapshot("account-a");
         refreshed_snapshot.auth_marker = Some("chatgpt:account-a:2:pro".to_string());
@@ -2972,19 +3838,13 @@ mod tests {
     #[test]
     fn proxy_pending_login_status_matches_snapshot_not_only_account_id() {
         let (background_tx, _background_rx) = mpsc::channel(1);
-        let mut state = ProxyState::new(background_tx, shared_runtime_auto_switch_coordinator());
+        let mut state = proxy_state(background_tx);
         let older_snapshot = current_snapshot("account-a");
         let mut refreshed_snapshot = current_snapshot("account-a");
         refreshed_snapshot.auth_marker = Some("chatgpt:account-a:2:pro".to_string());
         state.pending_internal.insert(
             "request-id".to_string(),
-            PendingInternalRequest::Login {
-                account_id: "account-a".to_string(),
-                started_at: Instant::now(),
-                expected_snapshot: Some(older_snapshot.clone()),
-                generation: None,
-                completion: None,
-            },
+            pending_login("account-a", Some(older_snapshot.clone()), None, None),
         );
 
         assert_eq!(
@@ -3043,21 +3903,28 @@ mod tests {
         assert_eq!(command.expected_snapshot, Some(snapshot));
     }
 
+    #[test]
+    fn prewarm_login_command_targets_refreshed_snapshot() {
+        let snapshot = current_snapshot("account-a");
+        let command = RuntimeLoginCommand::prewarm(
+            prepared_login("account-a", Some(snapshot.clone())),
+            snapshot.clone(),
+        );
+
+        assert_eq!(command.expected_snapshot, Some(snapshot));
+        assert_eq!(command.generation, None);
+        assert!(command.completion.is_none());
+    }
+
     #[tokio::test]
     async fn proxy_internal_login_success_marks_runtime_account() {
         let (background_tx, _background_rx) = mpsc::channel(1);
-        let mut state = ProxyState::new(background_tx, shared_runtime_auto_switch_coordinator());
+        let mut state = proxy_state(background_tx);
         let (completion_tx, completion_rx) = oneshot::channel();
         state.pending_login_account_id = Some("account-a".to_string());
         state.pending_internal.insert(
             "request-id".to_string(),
-            PendingInternalRequest::Login {
-                account_id: "account-a".to_string(),
-                started_at: Instant::now(),
-                expected_snapshot: None,
-                generation: None,
-                completion: Some(completion_tx),
-            },
+            pending_login("account-a", None, None, Some(completion_tx)),
         );
 
         assert!(state.handle_internal_response(&json!({
@@ -3099,18 +3966,17 @@ mod tests {
             BackgroundAutoSwitchQueueStatus::Queued
         );
 
-        let mut state = ProxyState::new(background_tx, coordinator);
+        let mut state = proxy_state_with_coordinator(background_tx, coordinator);
         let (completion_tx, completion_rx) = oneshot::channel();
         state.pending_login_account_id = Some("account-a".to_string());
         state.pending_internal.insert(
             "request-id".to_string(),
-            PendingInternalRequest::Login {
-                account_id: "account-a".to_string(),
-                started_at: Instant::now(),
-                expected_snapshot: None,
-                generation: Some(stale_generation),
-                completion: Some(completion_tx),
-            },
+            pending_login(
+                "account-a",
+                None,
+                Some(stale_generation),
+                Some(completion_tx),
+            ),
         );
 
         assert!(state.handle_internal_response(&json!({
@@ -3132,18 +3998,12 @@ mod tests {
     #[tokio::test]
     async fn proxy_internal_login_rejection_does_not_mark_runtime_account() {
         let (background_tx, _background_rx) = mpsc::channel(1);
-        let mut state = ProxyState::new(background_tx, shared_runtime_auto_switch_coordinator());
+        let mut state = proxy_state(background_tx);
         let (completion_tx, completion_rx) = oneshot::channel();
         state.pending_login_account_id = Some("account-a".to_string());
         state.pending_internal.insert(
             "request-id".to_string(),
-            PendingInternalRequest::Login {
-                account_id: "account-a".to_string(),
-                started_at: Instant::now(),
-                expected_snapshot: None,
-                generation: None,
-                completion: Some(completion_tx),
-            },
+            pending_login("account-a", None, None, Some(completion_tx)),
         );
 
         assert!(state.handle_internal_response(&json!({
@@ -3166,19 +4026,19 @@ mod tests {
     #[tokio::test]
     async fn proxy_expired_internal_login_clears_pending_and_swallows_late_response() {
         let (background_tx, _background_rx) = mpsc::channel(1);
-        let mut state = ProxyState::new(background_tx, shared_runtime_auto_switch_coordinator());
+        let mut state = proxy_state(background_tx);
         let request_id = state.next_internal_request_id();
         let (completion_tx, completion_rx) = oneshot::channel();
         state.pending_login_account_id = Some("account-a".to_string());
         state.pending_internal.insert(
             request_id.clone(),
-            PendingInternalRequest::Login {
-                account_id: "account-a".to_string(),
-                started_at: Instant::now() - APP_SERVER_REQUEST_TIMEOUT - Duration::from_secs(1),
-                expected_snapshot: None,
-                generation: None,
-                completion: Some(completion_tx),
-            },
+            pending_login_started(
+                "account-a",
+                Instant::now() - APP_SERVER_REQUEST_TIMEOUT - Duration::from_secs(1),
+                None,
+                None,
+                Some(completion_tx),
+            ),
         );
 
         state.clear_expired_pending_logins(Instant::now());
@@ -3201,19 +4061,13 @@ mod tests {
     #[tokio::test]
     async fn proxy_cancels_connection_pending_login_and_swallows_late_response() {
         let (background_tx, _background_rx) = mpsc::channel(1);
-        let mut state = ProxyState::new(background_tx, shared_runtime_auto_switch_coordinator());
+        let mut state = proxy_state(background_tx);
         let request_id = state.next_internal_request_id();
         let (completion_tx, completion_rx) = oneshot::channel();
         state.pending_login_account_id = Some("account-a".to_string());
         state.pending_internal.insert(
             request_id.clone(),
-            PendingInternalRequest::Login {
-                account_id: "account-a".to_string(),
-                started_at: Instant::now(),
-                expected_snapshot: None,
-                generation: None,
-                completion: Some(completion_tx),
-            },
+            pending_login("account-a", None, None, Some(completion_tx)),
         );
 
         state.cancel_pending_logins(RuntimeLoginResult::Stale);
@@ -3321,6 +4175,74 @@ mod tests {
         )))
     }
 
+    fn runtime_auth_sender() -> watch::Sender<RuntimeAuthState> {
+        let (sender, _receiver) = watch::channel(RuntimeAuthState::new(Instant::now()));
+        sender
+    }
+
+    fn proxy_state(background_requests: mpsc::Sender<BackgroundRuntimeRequest>) -> ProxyState {
+        ProxyState::new(
+            background_requests,
+            shared_runtime_auto_switch_coordinator(),
+            runtime_auth_sender(),
+        )
+    }
+
+    fn proxy_state_with_coordinator(
+        background_requests: mpsc::Sender<BackgroundRuntimeRequest>,
+        coordinator: super::SharedRuntimeAutoSwitchCoordinator,
+    ) -> ProxyState {
+        ProxyState::new(background_requests, coordinator, runtime_auth_sender())
+    }
+
+    fn runtime_loaded_auth(account_id: &str) -> RuntimeLoadedAuth {
+        RuntimeLoadedAuth {
+            account_id: account_id.to_string(),
+            chatgpt_account_id: account_id.to_string(),
+            access_token_expires_at: None,
+            current_snapshot: None,
+        }
+    }
+
+    fn runtime_loaded_auth_expires_in(account_id: &str, seconds: i64) -> RuntimeLoadedAuth {
+        RuntimeLoadedAuth {
+            access_token_expires_at: Some(Utc::now() + chrono::Duration::seconds(seconds)),
+            ..runtime_loaded_auth(account_id)
+        }
+    }
+
+    fn pending_login(
+        account_id: &str,
+        expected_snapshot: Option<CurrentAccountSnapshot>,
+        generation: Option<u64>,
+        completion: Option<oneshot::Sender<RuntimeLoginResult>>,
+    ) -> PendingInternalRequest {
+        pending_login_started(
+            account_id,
+            Instant::now(),
+            expected_snapshot,
+            generation,
+            completion,
+        )
+    }
+
+    fn pending_login_started(
+        account_id: &str,
+        started_at: Instant,
+        expected_snapshot: Option<CurrentAccountSnapshot>,
+        generation: Option<u64>,
+        completion: Option<oneshot::Sender<RuntimeLoginResult>>,
+    ) -> PendingInternalRequest {
+        PendingInternalRequest::Login {
+            account_id: account_id.to_string(),
+            started_at,
+            expected_snapshot,
+            generation,
+            loaded_auth: runtime_loaded_auth(account_id),
+            completion,
+        }
+    }
+
     fn test_auto_switch_request(
         priority: RuntimeAutoSwitchPriority,
         generation: u64,
@@ -3348,6 +4270,20 @@ mod tests {
         });
         account.id = account_id.to_string();
         account
+    }
+
+    fn set_account_access_token(account: &mut StoredAccount, token: String) {
+        let AuthData::ChatGPT { access_token, .. } = &mut account.auth_data else {
+            panic!("test account should use ChatGPT auth");
+        };
+        *access_token = token.into();
+    }
+
+    fn test_jwt_with_exp(exp: i64) -> String {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"exp":{exp}}}"#));
+        format!("{header}.{payload}.")
     }
 
     fn rate_limit_notification(
