@@ -1,8 +1,8 @@
 use std::fmt;
 use std::fs;
-use std::io::Write;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use reqwest::StatusCode;
@@ -12,6 +12,10 @@ use uuid::Uuid;
 
 const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/seven332/codex-switch/releases";
 const UPDATE_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const UPDATE_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+const UPDATE_PROGRESS_BAR_WIDTH: usize = 24;
+const UPDATE_PROGRESS_FILLED: &str = "\u{2588}";
+const UPDATE_PROGRESS_EMPTY: &str = "\u{2591}";
 const MAX_UPDATE_ASSET_SIZE: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug)]
@@ -219,6 +223,7 @@ async fn read_limited_asset_response(
         .and_then(|content_length| usize::try_from(content_length).ok())
         .unwrap_or(0);
     let mut binary = Vec::with_capacity(capacity);
+    let mut progress = DownloadProgress::new(name, content_length);
     while let Some(chunk) = response
         .chunk()
         .await
@@ -230,9 +235,144 @@ async fn read_limited_asset_response(
             .context("Downloaded release asset size overflowed usize")?;
         validate_asset_size(name, next_size)?;
         binary.extend_from_slice(&chunk);
+        progress.advance(chunk.len());
     }
     validate_asset_size(name, binary.len())?;
+    progress.finish();
     Ok(binary)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadProgressMode {
+    Terminal,
+    Plain,
+}
+
+#[derive(Debug)]
+struct DownloadProgress<'a> {
+    name: &'a str,
+    total: Option<u64>,
+    downloaded: u64,
+    mode: DownloadProgressMode,
+    last_render: Instant,
+    rendered_terminal_line: bool,
+    finished: bool,
+}
+
+impl<'a> DownloadProgress<'a> {
+    fn new(name: &'a str, total: Option<u64>) -> Self {
+        let mode = if io::stderr().is_terminal() {
+            DownloadProgressMode::Terminal
+        } else {
+            DownloadProgressMode::Plain
+        };
+        let mut progress = Self {
+            name,
+            total,
+            downloaded: 0,
+            mode,
+            last_render: Instant::now(),
+            rendered_terminal_line: false,
+            finished: false,
+        };
+        progress.render(false);
+        progress
+    }
+
+    fn advance(&mut self, chunk_len: usize) {
+        self.downloaded = self
+            .downloaded
+            .saturating_add(u64::try_from(chunk_len).unwrap_or(u64::MAX));
+        if self.mode == DownloadProgressMode::Terminal
+            && self.last_render.elapsed() >= UPDATE_PROGRESS_INTERVAL
+        {
+            self.render(false);
+        }
+    }
+
+    fn finish(&mut self) {
+        self.render(true);
+        self.finished = true;
+    }
+
+    fn render(&mut self, done: bool) {
+        let line = format_download_progress(self.name, self.downloaded, self.total, done);
+        match self.mode {
+            DownloadProgressMode::Terminal => {
+                let mut stderr = io::stderr().lock();
+                let _ = write!(stderr, "\r\x1b[2K{line}");
+                if done {
+                    let _ = writeln!(stderr);
+                }
+                self.rendered_terminal_line = true;
+            }
+            DownloadProgressMode::Plain => {
+                if done || self.downloaded == 0 {
+                    let mut stderr = io::stderr().lock();
+                    let _ = writeln!(stderr, "{line}");
+                }
+            }
+        }
+        self.last_render = Instant::now();
+    }
+}
+
+impl Drop for DownloadProgress<'_> {
+    fn drop(&mut self) {
+        if self.mode == DownloadProgressMode::Terminal
+            && self.rendered_terminal_line
+            && !self.finished
+        {
+            let _ = writeln!(io::stderr());
+        }
+    }
+}
+
+fn format_download_progress(name: &str, downloaded: u64, total: Option<u64>, done: bool) -> String {
+    let verb = if done { "Downloaded" } else { "Downloading" };
+    match total {
+        Some(total) if total > 0 => {
+            let percent = downloaded.min(total) as f64 * 100.0 / total as f64;
+            format!(
+                "{verb} {name}: [{}] {percent:.1}% {} / {}",
+                format_progress_bar(downloaded, total),
+                format_bytes(downloaded),
+                format_bytes(total)
+            )
+        }
+        _ => format!("{verb} {name}: {}", format_bytes(downloaded)),
+    }
+}
+
+fn format_progress_bar(downloaded: u64, total: u64) -> String {
+    if total == 0 {
+        return UPDATE_PROGRESS_EMPTY.repeat(UPDATE_PROGRESS_BAR_WIDTH);
+    }
+
+    let filled = ((u128::from(downloaded.min(total)) * UPDATE_PROGRESS_BAR_WIDTH as u128)
+        / u128::from(total)) as usize;
+    let empty = UPDATE_PROGRESS_BAR_WIDTH.saturating_sub(filled);
+    format!(
+        "{}{}",
+        UPDATE_PROGRESS_FILLED.repeat(filled),
+        UPDATE_PROGRESS_EMPTY.repeat(empty)
+    )
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+
+    if bytes < KIB {
+        format!("{bytes} B")
+    } else if bytes < MIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else if bytes < GIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    }
 }
 
 fn release_asset<'a>(release: &'a GitHubRelease, name: &str) -> Result<&'a GitHubReleaseAsset> {
@@ -453,11 +593,11 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        GitHubRelease, GitHubReleaseAsset, UpdateOutcome, install_binary_at,
-        is_cargo_build_artifact_path, normalize_release_tag, parse_asset_sha256_digest,
-        parse_release_version, platform_asset_name, release_asset, sha256_hex,
-        update_check_outcome, update_temp_path, validate_asset_content_length, validate_asset_size,
-        verify_asset_digest,
+        GitHubRelease, GitHubReleaseAsset, UpdateOutcome, format_bytes, format_download_progress,
+        format_progress_bar, install_binary_at, is_cargo_build_artifact_path,
+        normalize_release_tag, parse_asset_sha256_digest, parse_release_version,
+        platform_asset_name, release_asset, sha256_hex, update_check_outcome, update_temp_path,
+        validate_asset_content_length, validate_asset_size, verify_asset_digest,
     };
 
     #[test]
@@ -598,6 +738,55 @@ mod tests {
         assert!(validate_asset_size("codex-switch", 0).is_err());
         assert!(validate_asset_size("codex-switch", 64 * 1024 * 1024).is_ok());
         assert!(validate_asset_size("codex-switch", 64 * 1024 * 1024 + 1).is_err());
+    }
+
+    #[test]
+    fn download_progress_formats_known_total() {
+        assert_eq!(
+            format_download_progress("codex-switch", 512, Some(1024), false),
+            format!(
+                "Downloading codex-switch: [{}] 50.0% 512 B / 1.0 KiB",
+                format_progress_bar(512, 1024)
+            )
+        );
+        assert_eq!(
+            format_download_progress("codex-switch", 2048, Some(1024), true),
+            format!(
+                "Downloaded codex-switch: [{}] 100.0% 2.0 KiB / 1.0 KiB",
+                format_progress_bar(2048, 1024)
+            )
+        );
+    }
+
+    #[test]
+    fn download_progress_formats_unknown_total() {
+        assert_eq!(
+            format_download_progress("codex-switch", 1024, None, false),
+            "Downloading codex-switch: 1.0 KiB"
+        );
+        assert_eq!(
+            format_download_progress("codex-switch", 1536, None, true),
+            "Downloaded codex-switch: 1.5 KiB"
+        );
+    }
+
+    #[test]
+    fn byte_format_uses_binary_units() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1023), "1023 B");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MiB");
+    }
+
+    #[test]
+    fn progress_bar_clamps_at_total() {
+        assert_eq!(format_progress_bar(0, 0), "\u{2591}".repeat(24));
+        assert_eq!(format_progress_bar(0, 100), "\u{2591}".repeat(24));
+        assert_eq!(
+            format_progress_bar(50, 100),
+            format!("{}{}", "\u{2588}".repeat(12), "\u{2591}".repeat(12))
+        );
+        assert_eq!(format_progress_bar(200, 100), "\u{2588}".repeat(24));
     }
 
     #[test]
