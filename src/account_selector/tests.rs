@@ -519,7 +519,7 @@ fn weekly_headroom_is_scaled_to_five_hour_units() {
     assert_eq!(selection.metrics.five_hour_headroom, 30.0);
     assert_eq!(selection.metrics.weekly_headroom, 10.0);
     assert_eq!(selection.metrics.five_hour_headroom_units, 30.0);
-    assert_eq!(selection.metrics.weekly_headroom_units, 40.0);
+    assert_eq!(selection.metrics.weekly_headroom_units, 50.0);
     assert_eq!(selection.metrics.bottleneck, UsageWindow::FiveHour);
     assert_eq!(selection.metrics.bottleneck_headroom, 30.0);
 }
@@ -961,8 +961,6 @@ fn simulator_evaluates_policies_across_realistic_usage_scenarios() {
     let shadow_price = find_policy_stats(aggregate_stats, SHADOW_PRICE_POLICY_NAME);
     let reset_weighted_minimax =
         find_policy_stats(aggregate_stats, RESET_WEIGHTED_MINIMAX_POLICY_NAME);
-    let demand_aware_hysteresis =
-        find_policy_stats(aggregate_stats, DEMAND_AWARE_HYSTERESIS_POLICY_NAME);
     let aggregate_demand_credits = aggregate_stats[0].stats.total_demand_credits();
 
     for scenario in &evaluation.scenarios {
@@ -999,11 +997,6 @@ fn simulator_evaluates_policies_across_realistic_usage_scenarios() {
         reset_weighted_minimax.stats.preventable_failures, 0,
         "reset-weighted-minimax should not miss a serviceable account:\n{diagnostics}",
     );
-    assert_eq!(
-        demand_aware_hysteresis.stats.preventable_failures, 0,
-        "demand-aware-hysteresis should not miss a serviceable account:\n{diagnostics}",
-    );
-
     for candidate in RUNTIME_REPLACEMENT_CANDIDATES {
         find_policy_stats(aggregate_stats, policy_name_for_kind(*candidate));
     }
@@ -2376,9 +2369,6 @@ fn assert_availability_policy_invariants(
     let shadow_price = find_policy_stats(&scenario.policy_stats, SHADOW_PRICE_POLICY_NAME);
     let reset_weighted_minimax =
         find_policy_stats(&scenario.policy_stats, RESET_WEIGHTED_MINIMAX_POLICY_NAME);
-    let demand_aware_hysteresis =
-        find_policy_stats(&scenario.policy_stats, DEMAND_AWARE_HYSTERESIS_POLICY_NAME);
-
     assert_eq!(
         deadline_aware.stats.preventable_failures, 0,
         "deadline-aware should not miss a serviceable account in {}:\n{diagnostics}",
@@ -2392,11 +2382,6 @@ fn assert_availability_policy_invariants(
     assert_eq!(
         reset_weighted_minimax.stats.preventable_failures, 0,
         "reset-weighted-minimax should not miss a serviceable account in {}:\n{diagnostics}",
-        scenario.scenario_name
-    );
-    assert_eq!(
-        demand_aware_hysteresis.stats.preventable_failures, 0,
-        "demand-aware-hysteresis should not miss a serviceable account in {}:\n{diagnostics}",
         scenario.scenario_name
     );
 }

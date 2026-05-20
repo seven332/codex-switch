@@ -15,7 +15,7 @@ pub use reset_weighted_minimax::ResetWeightedMinimaxPolicy;
 pub use shadow_price::ShadowPricePolicy;
 
 pub const DEFAULT_MIN_SAFE_HEADROOM: f64 = 5.0;
-pub const DEFAULT_WEEKLY_TO_FIVE_HOUR_RATIO: f64 = 4.0;
+pub const DEFAULT_WEEKLY_TO_FIVE_HOUR_RATIO: f64 = 5.0;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SelectionConfig {
