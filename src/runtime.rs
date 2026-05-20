@@ -187,6 +187,10 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
         codex_args_summary
     ));
     startup_log(format_args!(
+        "codex-switch version: {}",
+        env!("CARGO_PKG_VERSION")
+    ));
+    startup_log(format_args!(
         "codex version: {}",
         codex_http::detected_codex_version().unwrap_or_else(|| "unknown".to_string())
     ));
