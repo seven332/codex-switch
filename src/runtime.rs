@@ -186,6 +186,10 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
         "run start: codex-bin={codex_bin}, args={}",
         codex_args_summary
     ));
+    startup_log(format_args!(
+        "codex version: {}",
+        codex_http::detected_codex_version().unwrap_or_else(|| "unknown".to_string())
+    ));
 
     let stage_start = Instant::now();
     startup_log("initial auto-switch: start");

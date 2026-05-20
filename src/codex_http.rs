@@ -11,6 +11,7 @@ const CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR: &str = "CODEX_INTERNAL_ORIGINA
 const DEFAULT_CODEX_BIN: &str = "codex";
 
 static CODEX_BIN: OnceLock<String> = OnceLock::new();
+static DETECTED_CODEX_VERSION: OnceLock<Option<String>> = OnceLock::new();
 static CODEX_VERSION: OnceLock<String> = OnceLock::new();
 static TERMINAL_INFO: OnceLock<TerminalInfo> = OnceLock::new();
 
@@ -29,6 +30,12 @@ pub fn set_codex_bin_for_user_agent(codex_bin: impl Into<String>) {
 
 pub fn codex_version() -> String {
     CODEX_VERSION.get_or_init(detect_codex_version).clone()
+}
+
+pub fn detected_codex_version() -> Option<String> {
+    DETECTED_CODEX_VERSION
+        .get_or_init(detect_configured_codex_version)
+        .clone()
 }
 
 pub fn originator_value() -> String {
@@ -106,13 +113,16 @@ fn sanitize_user_agent(candidate: String, fallback: &str) -> String {
 }
 
 fn detect_codex_version() -> String {
+    detected_codex_version().unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+}
+
+fn detect_configured_codex_version() -> Option<String> {
     let codex_bin = CODEX_BIN
         .get()
         .map(String::as_str)
         .unwrap_or(DEFAULT_CODEX_BIN);
 
     detect_codex_version_from_bin(codex_bin)
-        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
 }
 
 fn detect_codex_version_from_bin(codex_bin: &str) -> Option<String> {
