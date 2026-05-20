@@ -19,11 +19,15 @@ mod usage;
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Local, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Local, TimeZone, Utc};
 use clap::Parser;
 
 use cli::{Cli, Command};
 use types::{AccountsStore, StoredAccount, UsageInfo};
+
+const USAGE_BAR_WIDTH: usize = 20;
+const USAGE_BAR_FILLED: &str = "\u{2588}";
+const USAGE_BAR_EMPTY: &str = "\u{2591}";
 
 #[tokio::main]
 async fn main() {
@@ -358,14 +362,12 @@ fn print_usage(account: &StoredAccount, info: &UsageInfo, is_current: bool, now:
     print_limit_window(
         "5-hour",
         info.primary_used_percent,
-        info.primary_window_minutes,
         info.primary_resets_at,
         now,
     );
     print_limit_window(
         "weekly",
         info.secondary_used_percent,
-        info.secondary_window_minutes,
         info.secondary_resets_at,
         now,
     );
@@ -385,22 +387,24 @@ fn format_usage_account_header(account: &StoredAccount, is_current: bool) -> Str
     )
 }
 
-fn print_limit_window(
+fn print_limit_window(label: &str, used_percent: Option<f64>, resets_at: Option<i64>, now: i64) {
+    println!(
+        "{}",
+        format_limit_window(label, used_percent, resets_at, now)
+    );
+}
+
+fn format_limit_window(
     label: &str,
     used_percent: Option<f64>,
-    window_minutes: Option<i64>,
     resets_at: Option<i64>,
     now: i64,
-) {
-    let percent = used_percent
-        .map(|value| format!("{value:.1}% used"))
-        .unwrap_or_else(|| "-".to_string());
+) -> String {
+    let left = format_usage_left_percent(used_percent);
+    let bar = format_usage_left_bar(used_percent);
     let reset = format_reset_timestamp_option(resets_at, now);
 
-    match window_minutes {
-        Some(minutes) => println!("{label}: {percent}, window {minutes}m, resets {reset}"),
-        None => println!("{label}: {percent}, resets {reset}"),
-    }
+    format!("{label:<7} [{bar}]  {left}, resets {reset}")
 }
 
 fn print_credits(info: &UsageInfo) {
@@ -435,14 +439,12 @@ fn print_additional_limits(info: &UsageInfo, now: i64) {
         print_limit_window(
             "  5-hour",
             limit.primary_used_percent,
-            limit.primary_window_minutes,
             limit.primary_resets_at,
             now,
         );
         print_limit_window(
             "  weekly",
             limit.secondary_used_percent,
-            limit.secondary_window_minutes,
             limit.secondary_resets_at,
             now,
         );
@@ -471,11 +473,58 @@ fn format_reset_timestamp(timestamp: i64, now: i64) -> String {
     let Some(dt) = Utc.timestamp_opt(timestamp, 0).single() else {
         return timestamp.to_string();
     };
-    let absolute = format_local_datetime(&dt);
+    let Some(short) = format_short_reset_datetime(dt, now) else {
+        return timestamp.to_string();
+    };
+    format!("{} ({short})", format_reset_relative_time(timestamp, now))
+}
+
+fn format_short_reset_datetime(dt: DateTime<Utc>, now: i64) -> Option<String> {
+    let now = Utc.timestamp_opt(now, 0).single()?.with_timezone(&Local);
+    let dt = dt.with_timezone(&Local);
+    let date = dt.date_naive();
+    let now_date = now.date_naive();
+    let day_delta = date.signed_duration_since(now_date).num_days();
+
+    if day_delta == 0 {
+        Some(format!("today {}", dt.format("%H:%M")))
+    } else if day_delta == 1 {
+        Some(format!("tomorrow {}", dt.format("%H:%M")))
+    } else if (2..7).contains(&day_delta) {
+        Some(dt.format("%a %H:%M").to_string())
+    } else if dt.year() == now.year() {
+        Some(dt.format("%H:%M on %-d %b").to_string())
+    } else {
+        Some(dt.format("%H:%M on %-d %b %Y").to_string())
+    }
+}
+
+fn format_usage_left_percent(used_percent: Option<f64>) -> String {
+    used_percent
+        .map(|used| format!("{:.1}% left", usage_left_percent(used)))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_usage_left_bar(used_percent: Option<f64>) -> String {
+    let Some(used_percent) = used_percent else {
+        return USAGE_BAR_EMPTY.repeat(USAGE_BAR_WIDTH);
+    };
+    let left = usage_left_percent(used_percent);
+    let filled = ((left / 100.0) * USAGE_BAR_WIDTH as f64).round() as usize;
+    let filled = filled.min(USAGE_BAR_WIDTH);
+    let empty = USAGE_BAR_WIDTH.saturating_sub(filled);
     format!(
-        "{absolute} ({})",
-        format_reset_relative_time(timestamp, now)
+        "{}{}",
+        USAGE_BAR_FILLED.repeat(filled),
+        USAGE_BAR_EMPTY.repeat(empty)
     )
+}
+
+fn usage_left_percent(used_percent: f64) -> f64 {
+    if !used_percent.is_finite() {
+        return 0.0;
+    }
+    (100.0 - used_percent).clamp(0.0, 100.0)
 }
 
 fn format_reset_relative_time(timestamp: i64, now: i64) -> String {
@@ -520,7 +569,8 @@ fn format_reset_duration(seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_local_datetime, format_reset_timestamp_option, format_usage_account_header,
+        format_limit_window, format_reset_timestamp_option, format_short_reset_datetime,
+        format_usage_account_header, format_usage_left_bar, format_usage_left_percent,
         usage_account_from_store,
     };
     use crate::store;
@@ -613,9 +663,65 @@ mod tests {
 
     fn expected_reset_timestamp(timestamp: i64, relative: &str) -> String {
         format!(
-            "{} ({relative})",
-            format_local_datetime(&Utc.timestamp_opt(timestamp, 0).unwrap())
+            "{relative} ({})",
+            format_short_reset_datetime(Utc.timestamp_opt(timestamp, 0).unwrap(), 1_800_000_000)
+                .unwrap()
         )
+    }
+
+    #[test]
+    fn reset_timestamp_uses_short_local_time() {
+        let now = 1_800_000_000;
+        let reset = now + 2 * 24 * 60 * 60 + 15 * 60;
+
+        assert_eq!(
+            format_reset_timestamp_option(Some(reset), now),
+            format!(
+                "in 2d 15m ({})",
+                format_short_reset_datetime(Utc.timestamp_opt(reset, 0).unwrap(), now).unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn usage_left_percent_and_bar_use_remaining_quota() {
+        assert_eq!(format_usage_left_percent(Some(92.0)), "8.0% left");
+        assert_eq!(
+            format_usage_left_bar(Some(92.0)),
+            format!("{}{}", "\u{2588}".repeat(2), "\u{2591}".repeat(18))
+        );
+        assert_eq!(format_usage_left_percent(Some(10.0)), "90.0% left");
+        assert_eq!(
+            format_usage_left_bar(Some(10.0)),
+            format!("{}{}", "\u{2588}".repeat(18), "\u{2591}".repeat(2))
+        );
+    }
+
+    #[test]
+    fn usage_left_percent_clamps_out_of_range_values() {
+        assert_eq!(format_usage_left_percent(Some(150.0)), "0.0% left");
+        assert_eq!(format_usage_left_bar(Some(150.0)), "\u{2591}".repeat(20));
+        assert_eq!(format_usage_left_percent(Some(-20.0)), "100.0% left");
+        assert_eq!(format_usage_left_bar(Some(-20.0)), "\u{2588}".repeat(20));
+        assert_eq!(format_usage_left_percent(None), "-");
+        assert_eq!(format_usage_left_bar(None), "\u{2591}".repeat(20));
+        assert_eq!(format_usage_left_percent(Some(f64::NAN)), "0.0% left");
+        assert_eq!(format_usage_left_bar(Some(f64::NAN)), "\u{2591}".repeat(20));
+    }
+
+    #[test]
+    fn limit_window_formats_left_quota_and_short_reset() {
+        let now = 1_800_000_000;
+        let reset = now + 2 * 60 * 60 + 15 * 60;
+
+        assert_eq!(
+            format_limit_window("weekly", Some(92.0), Some(reset), now),
+            format!(
+                "weekly  [{}]  8.0% left, resets {}",
+                format_usage_left_bar(Some(92.0)),
+                format_reset_timestamp_option(Some(reset), now)
+            )
+        );
     }
 
     #[test]
