@@ -26,6 +26,7 @@ use cli::{Cli, Command};
 use types::{AccountsStore, StoredAccount, UsageInfo};
 
 const USAGE_BAR_WIDTH: usize = 20;
+const USAGE_LABEL_WIDTH: usize = 7;
 const USAGE_BAR_FILLED: &str = "\u{2588}";
 const USAGE_BAR_EMPTY: &str = "\u{2591}";
 
@@ -362,12 +363,14 @@ fn print_usage(account: &StoredAccount, info: &UsageInfo, is_current: bool, now:
     print_limit_window(
         "5-hour",
         info.primary_used_percent,
+        info.primary_window_minutes,
         info.primary_resets_at,
         now,
     );
     print_limit_window(
         "weekly",
         info.secondary_used_percent,
+        info.secondary_window_minutes,
         info.secondary_resets_at,
         now,
     );
@@ -387,24 +390,38 @@ fn format_usage_account_header(account: &StoredAccount, is_current: bool) -> Str
     )
 }
 
-fn print_limit_window(label: &str, used_percent: Option<f64>, resets_at: Option<i64>, now: i64) {
+fn print_limit_window(
+    label: &str,
+    used_percent: Option<f64>,
+    window_minutes: Option<i64>,
+    resets_at: Option<i64>,
+    now: i64,
+) {
     println!(
         "{}",
-        format_limit_window(label, used_percent, resets_at, now)
+        format_limit_window(label, used_percent, window_minutes, resets_at, now)
     );
 }
 
 fn format_limit_window(
     label: &str,
     used_percent: Option<f64>,
+    window_minutes: Option<i64>,
     resets_at: Option<i64>,
     now: i64,
 ) -> String {
     let left = format_usage_left_percent(used_percent);
-    let bar = format_usage_left_bar(used_percent);
-    let reset = format_reset_timestamp_option(resets_at, now);
+    let quota_bar = format_usage_left_bar(used_percent);
+    let reset_bar = format_reset_remaining_bar(resets_at, window_minutes, now);
+    let reset = format_reset_detail(resets_at, window_minutes, now);
+    let label_width = USAGE_LABEL_WIDTH.max(label.len());
 
-    format!("{label:<7} [{bar}]  {left}, resets {reset}")
+    format!(
+        "{:<width$} quota [{quota_bar}] {left}\n{:<width$} reset [{reset_bar}] {reset}",
+        label,
+        "",
+        width = label_width
+    )
 }
 
 fn print_credits(info: &UsageInfo) {
@@ -439,12 +456,14 @@ fn print_additional_limits(info: &UsageInfo, now: i64) {
         print_limit_window(
             "  5-hour",
             limit.primary_used_percent,
+            limit.primary_window_minutes,
             limit.primary_resets_at,
             now,
         );
         print_limit_window(
             "  weekly",
             limit.secondary_used_percent,
+            limit.secondary_window_minutes,
             limit.secondary_resets_at,
             now,
         );
@@ -506,11 +525,55 @@ fn format_usage_left_percent(used_percent: Option<f64>) -> String {
 }
 
 fn format_usage_left_bar(used_percent: Option<f64>) -> String {
-    let Some(used_percent) = used_percent else {
+    format_ratio_bar(used_percent.map(|used| usage_left_percent(used) / 100.0))
+}
+
+fn usage_left_percent(used_percent: f64) -> f64 {
+    if !used_percent.is_finite() {
+        return 0.0;
+    }
+    (100.0 - used_percent).clamp(0.0, 100.0)
+}
+
+fn format_reset_remaining_percent(
+    resets_at: Option<i64>,
+    window_minutes: Option<i64>,
+    now: i64,
+) -> String {
+    reset_window_remaining_ratio(resets_at, window_minutes, now)
+        .map(|ratio| format!("{:.0}% remaining", ratio * 100.0))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_reset_remaining_bar(
+    resets_at: Option<i64>,
+    window_minutes: Option<i64>,
+    now: i64,
+) -> String {
+    format_ratio_bar(reset_window_remaining_ratio(resets_at, window_minutes, now))
+}
+
+fn format_reset_detail(resets_at: Option<i64>, window_minutes: Option<i64>, now: i64) -> String {
+    let remaining = format_reset_remaining_percent(resets_at, window_minutes, now);
+    let reset = format_reset_timestamp_option(resets_at, now);
+
+    match (remaining.as_str(), reset.as_str()) {
+        ("-", "-") => "-".to_string(),
+        ("-", reset) => reset.to_string(),
+        (remaining, "-") => remaining.to_string(),
+        (remaining, reset) => format!("{remaining}, {reset}"),
+    }
+}
+
+fn format_ratio_bar(ratio: Option<f64>) -> String {
+    let Some(ratio) = ratio else {
         return USAGE_BAR_EMPTY.repeat(USAGE_BAR_WIDTH);
     };
-    let left = usage_left_percent(used_percent);
-    let filled = ((left / 100.0) * USAGE_BAR_WIDTH as f64).round() as usize;
+    if !ratio.is_finite() {
+        return USAGE_BAR_EMPTY.repeat(USAGE_BAR_WIDTH);
+    }
+
+    let filled = (ratio.clamp(0.0, 1.0) * USAGE_BAR_WIDTH as f64).round() as usize;
     let filled = filled.min(USAGE_BAR_WIDTH);
     let empty = USAGE_BAR_WIDTH.saturating_sub(filled);
     format!(
@@ -520,11 +583,26 @@ fn format_usage_left_bar(used_percent: Option<f64>) -> String {
     )
 }
 
-fn usage_left_percent(used_percent: f64) -> f64 {
-    if !used_percent.is_finite() {
-        return 0.0;
+fn reset_window_remaining_ratio(
+    resets_at: Option<i64>,
+    window_minutes: Option<i64>,
+    now: i64,
+) -> Option<f64> {
+    let (Some(resets_at), Some(window_minutes)) = (resets_at, window_minutes) else {
+        return None;
+    };
+    if window_minutes <= 0 {
+        return None;
     }
-    (100.0 - used_percent).clamp(0.0, 100.0)
+
+    let window_seconds = window_minutes.checked_mul(60)?;
+    if window_seconds <= 0 {
+        return None;
+    }
+    Utc.timestamp_opt(resets_at, 0).single()?;
+
+    let remaining = resets_at.saturating_sub(now).max(0);
+    Some((remaining as f64 / window_seconds as f64).clamp(0.0, 1.0))
 }
 
 fn format_reset_relative_time(timestamp: i64, now: i64) -> String {
@@ -569,7 +647,8 @@ fn format_reset_duration(seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_limit_window, format_reset_timestamp_option, format_short_reset_datetime,
+        format_limit_window, format_reset_detail, format_reset_remaining_bar,
+        format_reset_remaining_percent, format_reset_timestamp_option, format_short_reset_datetime,
         format_usage_account_header, format_usage_left_bar, format_usage_left_percent,
         usage_account_from_store,
     };
@@ -710,15 +789,93 @@ mod tests {
     }
 
     #[test]
-    fn limit_window_formats_left_quota_and_short_reset() {
+    fn reset_remaining_bar_shows_remaining_window() {
+        let now = 1_800_000_000;
+        let reset = now + 60 * 60;
+
+        assert_eq!(
+            format_reset_remaining_bar(Some(reset), Some(300), now),
+            format!("{}{}", "\u{2588}".repeat(4), "\u{2591}".repeat(16))
+        );
+        assert_eq!(
+            format_reset_remaining_percent(Some(reset), Some(300), now),
+            "20% remaining"
+        );
+    }
+
+    #[test]
+    fn reset_remaining_preserves_missing_or_invalid_window() {
+        let now = 1_800_000_000;
+
+        assert_eq!(
+            format_reset_remaining_bar(None, Some(300), now),
+            "\u{2591}".repeat(20)
+        );
+        assert_eq!(format_reset_remaining_percent(None, Some(300), now), "-");
+        assert_eq!(
+            format_reset_remaining_bar(Some(now + 60), None, now),
+            "\u{2591}".repeat(20)
+        );
+        assert_eq!(
+            format_reset_remaining_percent(Some(now + 60), Some(0), now),
+            "-"
+        );
+        assert_eq!(
+            format_reset_remaining_bar(Some(i64::MAX), Some(300), now),
+            "\u{2591}".repeat(20)
+        );
+        assert_eq!(
+            format_reset_remaining_percent(Some(i64::MAX), Some(300), now),
+            "-"
+        );
+    }
+
+    #[test]
+    fn reset_detail_omits_duplicate_missing_placeholders() {
+        let now = 1_800_000_000;
+        let reset = now + 60 * 60;
+
+        assert_eq!(format_reset_detail(None, None, now), "-");
+        assert_eq!(
+            format_reset_detail(Some(reset), None, now),
+            format_reset_timestamp_option(Some(reset), now)
+        );
+        assert_eq!(
+            format_reset_detail(Some(reset), Some(300), now),
+            format!(
+                "20% remaining, {}",
+                format_reset_timestamp_option(Some(reset), now)
+            )
+        );
+    }
+
+    #[test]
+    fn limit_window_formats_quota_and_reset_remaining() {
         let now = 1_800_000_000;
         let reset = now + 2 * 60 * 60 + 15 * 60;
 
         assert_eq!(
-            format_limit_window("weekly", Some(92.0), Some(reset), now),
+            format_limit_window("weekly", Some(92.0), Some(10_080), Some(reset), now),
             format!(
-                "weekly  [{}]  8.0% left, resets {}",
+                "weekly  quota [{}] 8.0% left\n        reset [{}] 1% remaining, {}",
                 format_usage_left_bar(Some(92.0)),
+                format_reset_remaining_bar(Some(reset), Some(10_080), now),
+                format_reset_timestamp_option(Some(reset), now)
+            )
+        );
+    }
+
+    #[test]
+    fn limit_window_aligns_reset_with_indented_labels() {
+        let now = 1_800_000_000;
+        let reset = now + 60 * 60;
+
+        assert_eq!(
+            format_limit_window("  5-hour", Some(20.0), Some(300), Some(reset), now),
+            format!(
+                "  5-hour quota [{}] 80.0% left\n         reset [{}] 20% remaining, {}",
+                format_usage_left_bar(Some(20.0)),
+                format_reset_remaining_bar(Some(reset), Some(300), now),
                 format_reset_timestamp_option(Some(reset), now)
             )
         );
