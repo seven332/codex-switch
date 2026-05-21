@@ -27,8 +27,10 @@ use types::{AccountsStore, StoredAccount, UsageInfo};
 
 const USAGE_BAR_WIDTH: usize = 20;
 const USAGE_LABEL_WIDTH: usize = 6;
-const USAGE_BAR_FILLED: &str = "\u{2588}";
-const USAGE_BAR_EMPTY: &str = "\u{2591}";
+const QUOTA_BAR_FILLED: &str = "\u{2588}";
+const QUOTA_BAR_EMPTY: &str = "\u{2591}";
+const RESET_BAR_FILLED: &str = "\u{2588}";
+const RESET_BAR_EMPTY: &str = "\u{2500}";
 
 #[tokio::main]
 async fn main() {
@@ -554,7 +556,11 @@ fn format_usage_left_percent(used_percent: Option<f64>) -> String {
 }
 
 fn format_usage_left_bar(used_percent: Option<f64>) -> String {
-    format_ratio_bar(used_percent.map(|used| usage_left_percent(used) / 100.0))
+    format_ratio_bar(
+        used_percent.map(|used| usage_left_percent(used) / 100.0),
+        QUOTA_BAR_FILLED,
+        QUOTA_BAR_EMPTY,
+    )
 }
 
 fn usage_left_percent(used_percent: f64) -> f64 {
@@ -579,7 +585,11 @@ fn format_reset_remaining_bar(
     window_minutes: Option<i64>,
     now: i64,
 ) -> String {
-    format_ratio_bar(reset_window_remaining_ratio(resets_at, window_minutes, now))
+    format_ratio_bar(
+        reset_window_remaining_ratio(resets_at, window_minutes, now),
+        RESET_BAR_FILLED,
+        RESET_BAR_EMPTY,
+    )
 }
 
 fn format_reset_detail(resets_at: Option<i64>, window_minutes: Option<i64>, now: i64) -> String {
@@ -594,22 +604,18 @@ fn format_reset_detail(resets_at: Option<i64>, window_minutes: Option<i64>, now:
     }
 }
 
-fn format_ratio_bar(ratio: Option<f64>) -> String {
+fn format_ratio_bar(ratio: Option<f64>, filled_char: &str, empty_char: &str) -> String {
     let Some(ratio) = ratio else {
-        return USAGE_BAR_EMPTY.repeat(USAGE_BAR_WIDTH);
+        return empty_char.repeat(USAGE_BAR_WIDTH);
     };
     if !ratio.is_finite() {
-        return USAGE_BAR_EMPTY.repeat(USAGE_BAR_WIDTH);
+        return empty_char.repeat(USAGE_BAR_WIDTH);
     }
 
     let filled = (ratio.clamp(0.0, 1.0) * USAGE_BAR_WIDTH as f64).round() as usize;
     let filled = filled.min(USAGE_BAR_WIDTH);
     let empty = USAGE_BAR_WIDTH.saturating_sub(filled);
-    format!(
-        "{}{}",
-        USAGE_BAR_FILLED.repeat(filled),
-        USAGE_BAR_EMPTY.repeat(empty)
-    )
+    format!("{}{}", filled_char.repeat(filled), empty_char.repeat(empty))
 }
 
 fn reset_window_remaining_ratio(
@@ -824,7 +830,7 @@ mod tests {
 
         assert_eq!(
             format_reset_remaining_bar(Some(reset), Some(300), now),
-            format!("{}{}", "\u{2588}".repeat(4), "\u{2591}".repeat(16))
+            format!("{}{}", "\u{2588}".repeat(4), "\u{2500}".repeat(16))
         );
         assert_eq!(
             format_reset_remaining_percent(Some(reset), Some(300), now),
@@ -838,12 +844,12 @@ mod tests {
 
         assert_eq!(
             format_reset_remaining_bar(None, Some(300), now),
-            "\u{2591}".repeat(20)
+            "\u{2500}".repeat(20)
         );
         assert_eq!(format_reset_remaining_percent(None, Some(300), now), "-");
         assert_eq!(
             format_reset_remaining_bar(Some(now + 60), None, now),
-            "\u{2591}".repeat(20)
+            "\u{2500}".repeat(20)
         );
         assert_eq!(
             format_reset_remaining_percent(Some(now + 60), Some(0), now),
@@ -851,7 +857,7 @@ mod tests {
         );
         assert_eq!(
             format_reset_remaining_bar(Some(i64::MAX), Some(300), now),
-            "\u{2591}".repeat(20)
+            "\u{2500}".repeat(20)
         );
         assert_eq!(
             format_reset_remaining_percent(Some(i64::MAX), Some(300), now),
