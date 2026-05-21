@@ -378,7 +378,12 @@ fn format_usage(
     now: i64,
     show_additional: bool,
 ) -> String {
-    let mut lines = vec![format_usage_account_header(account, is_current)];
+    let unavailable_status = format_usage_unavailable_status(info);
+    let mut lines = vec![format_usage_account_header(
+        account,
+        is_current,
+        unavailable_status.is_some(),
+    )];
 
     if matches!(info.error.as_deref(), Some("usage unsupported")) {
         lines.push("usage: unsupported".to_string());
@@ -394,6 +399,9 @@ fn format_usage(
         "plan: {}",
         info.plan_type.as_deref().unwrap_or("-")
     ));
+    if let Some(status) = unavailable_status {
+        lines.push(status);
+    }
     lines.push(format_limit_window(
         "5-hour",
         info.primary_used_percent,
@@ -411,9 +419,6 @@ fn format_usage(
     if let Some(credits) = format_credits(info) {
         lines.push(credits);
     }
-    if let Some(kind) = &info.rate_limit_reached_type {
-        lines.push(format!("rate limit reached: {kind}"));
-    }
     if show_additional {
         lines.extend(format_additional_limits(info, now));
     }
@@ -421,13 +426,45 @@ fn format_usage(
     lines.join("\n")
 }
 
-fn format_usage_account_header(account: &StoredAccount, is_current: bool) -> String {
+fn format_usage_account_header(
+    account: &StoredAccount,
+    is_current: bool,
+    is_limited: bool,
+) -> String {
     let marker = if is_current { "* " } else { "" };
+    let status = if is_limited { " [UNAVAILABLE]" } else { "" };
     format!(
-        "{marker}{} ({})",
+        "{marker}{} ({}){status}",
         account.name,
         store::short_id(&account.id)
     )
+}
+
+fn format_limit_status(kind: &str) -> String {
+    let reason = match kind {
+        "rate_limit_reached" => "rate limited",
+        "workspace_owner_credits_depleted" | "workspace_member_credits_depleted" => {
+            "credits depleted"
+        }
+        "workspace_owner_usage_limit_reached" | "workspace_member_usage_limit_reached" => {
+            "usage limit reached"
+        }
+        _ => "limited",
+    };
+
+    format!("status: {reason} ({kind})")
+}
+
+fn format_usage_unavailable_status(info: &UsageInfo) -> Option<String> {
+    if info.error.is_some() {
+        return None;
+    }
+
+    if let Some(kind) = &info.rate_limit_reached_type {
+        return Some(format_limit_status(kind));
+    }
+
+    auto_switch::usage_unavailable_reason(info).map(|reason| format!("status: {reason}"))
 }
 
 fn format_limit_window(
@@ -682,7 +719,7 @@ fn format_reset_duration(seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_limit_window, format_reset_detail, format_reset_remaining_bar,
+        format_limit_status, format_limit_window, format_reset_detail, format_reset_remaining_bar,
         format_reset_remaining_percent, format_reset_timestamp_option, format_short_reset_datetime,
         format_usage, format_usage_account_header, format_usage_left_bar,
         format_usage_left_percent, usage_account_from_store,
@@ -921,7 +958,7 @@ mod tests {
         let account = StoredAccount::new_api_key("work".to_string(), "sk-test".to_string());
 
         assert_eq!(
-            format_usage_account_header(&account, true),
+            format_usage_account_header(&account, true, false),
             format!("* work ({})", store::short_id(&account.id))
         );
     }
@@ -931,8 +968,83 @@ mod tests {
         let account = StoredAccount::new_api_key("work".to_string(), "sk-test".to_string());
 
         assert_eq!(
-            format_usage_account_header(&account, false),
+            format_usage_account_header(&account, false, false),
             format!("work ({})", store::short_id(&account.id))
+        );
+    }
+
+    #[test]
+    fn usage_output_marks_limited_accounts() {
+        let now = 1_800_000_000;
+        let account = StoredAccount::new_api_key("work".to_string(), "sk-test".to_string());
+        let mut info = usage_info_with_additional_limit(&account.id, now);
+        info.rate_limit_reached_type = Some("workspace_member_usage_limit_reached".to_string());
+
+        let output = format_usage(&account, &info, true, now, false);
+
+        assert!(output.starts_with(&format!(
+            "* work ({}) [UNAVAILABLE]",
+            store::short_id(&account.id)
+        )));
+        let plan_index = output.find("plan: pro").expect("plan line");
+        let status_index = output
+            .find("status: usage limit reached (workspace_member_usage_limit_reached)")
+            .expect("status line");
+        let quota_index = output.find("5-hour").expect("quota line");
+        assert!(plan_index < status_index);
+        assert!(status_index < quota_index);
+    }
+
+    #[test]
+    fn usage_output_marks_depleted_credits_unavailable() {
+        let now = 1_800_000_000;
+        let account = StoredAccount::new_api_key("work".to_string(), "sk-test".to_string());
+        let mut info = usage_info_with_additional_limit(&account.id, now);
+        info.unlimited_credits = Some(false);
+        info.credits_balance = Some("0".to_string());
+
+        let output = format_usage(&account, &info, true, now, false);
+
+        assert!(output.starts_with(&format!(
+            "* work ({}) [UNAVAILABLE]",
+            store::short_id(&account.id)
+        )));
+        assert!(output.contains("status: credits balance is 0"));
+    }
+
+    #[test]
+    fn usage_output_marks_hard_limits_unavailable() {
+        let now = 1_800_000_000;
+        let account = StoredAccount::new_api_key("work".to_string(), "sk-test".to_string());
+        let mut info = usage_info_with_additional_limit(&account.id, now);
+        info.primary_used_percent = Some(100.0);
+
+        let output = format_usage(&account, &info, true, now, false);
+
+        assert!(output.starts_with(&format!(
+            "* work ({}) [UNAVAILABLE]",
+            store::short_id(&account.id)
+        )));
+        assert!(output.contains("status: 5-hour usage is 100.0%"));
+    }
+
+    #[test]
+    fn usage_output_classifies_limited_status_reasons() {
+        assert_eq!(
+            format_limit_status("rate_limit_reached"),
+            "status: rate limited (rate_limit_reached)"
+        );
+        assert_eq!(
+            format_limit_status("workspace_owner_credits_depleted"),
+            "status: credits depleted (workspace_owner_credits_depleted)"
+        );
+        assert_eq!(
+            format_limit_status("workspace_member_usage_limit_reached"),
+            "status: usage limit reached (workspace_member_usage_limit_reached)"
+        );
+        assert_eq!(
+            format_limit_status("custom_limit"),
+            "status: limited (custom_limit)"
         );
     }
 
@@ -991,7 +1103,7 @@ mod tests {
             secondary_resets_at: Some(now + 2 * 24 * 60 * 60),
             has_credits: Some(true),
             unlimited_credits: None,
-            credits_balance: Some("0".to_string()),
+            credits_balance: Some("42".to_string()),
             rate_limit_reached_type: None,
             additional_limits: vec![UsageLimitInfo {
                 limit_id: Some("gpt-5.3-codex-spark".to_string()),

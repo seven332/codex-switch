@@ -97,6 +97,13 @@ pub fn usage_requires_switch(info: &UsageInfo) -> bool {
     matches!(assess_usage(info), UsageDecision::Unavailable(_))
 }
 
+pub fn usage_unavailable_reason(info: &UsageInfo) -> Option<String> {
+    match assess_usage(info) {
+        UsageDecision::Unavailable(reason) => Some(reason),
+        UsageDecision::Usable(_) | UsageDecision::Unsupported(_) | UsageDecision::Error(_) => None,
+    }
+}
+
 async fn plan_auto_switch(write_current_auth_on_refresh: bool) -> Result<AutoSwitchPlan> {
     let store = store::load_accounts()?;
     if store.accounts.is_empty() {
