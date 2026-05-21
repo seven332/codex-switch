@@ -15,6 +15,7 @@ mod token;
 mod types;
 mod update;
 mod usage;
+mod usage_forecast;
 
 use std::collections::HashMap;
 
@@ -23,7 +24,7 @@ use chrono::{DateTime, Datelike, Local, TimeZone, Utc};
 use clap::Parser;
 
 use cli::{Cli, Command};
-use types::{AccountsStore, StoredAccount, UsageInfo};
+use types::{AccountsStore, AuthData, StoredAccount, UsageInfo};
 
 const USAGE_BAR_WIDTH: usize = 20;
 const USAGE_LABEL_WIDTH: usize = 6;
@@ -325,8 +326,30 @@ async fn print_all_usage(show_additional: bool) -> Result<()> {
             print_usage(account, info, is_current, now, show_additional);
         }
     }
+    if has_forecastable_usage_account(&store) {
+        if let Some(forecast) = usage_forecast::forecast_all_usage(
+            &store.accounts,
+            &by_id,
+            current_account_id.as_deref(),
+            now,
+        ) {
+            println!();
+            print_usage_forecast(&forecast, now);
+        } else {
+            println!();
+            println!("overall estimate:");
+            println!("  unavailable: not enough complete usage data");
+        }
+    }
 
     Ok(())
+}
+
+fn has_forecastable_usage_account(store: &AccountsStore) -> bool {
+    store
+        .accounts
+        .iter()
+        .any(|account| matches!(account.auth_data, AuthData::ChatGPT { .. }))
 }
 
 fn print_accounts(store: &AccountsStore, current_account_id: Option<&str>) {
@@ -369,6 +392,58 @@ fn print_usage(
         "{}",
         format_usage(account, info, is_current, now, show_additional)
     );
+}
+
+fn print_usage_forecast(forecast: &usage_forecast::UsageForecast, now: i64) {
+    println!("{}", format_usage_forecast(forecast, now));
+}
+
+fn format_usage_forecast(forecast: &usage_forecast::UsageForecast, now: i64) -> String {
+    let mut lines = vec!["overall estimate:".to_string()];
+
+    match &forecast.outcome {
+        usage_forecast::UsageForecastOutcome::NotExpected { horizon_seconds } => {
+            lines.push(format!(
+                "  unavailable: not expected within {} at current pace",
+                format_reset_duration(*horizon_seconds as u64)
+            ));
+        }
+        usage_forecast::UsageForecastOutcome::Unavailable {
+            at,
+            limited_by,
+            recovery_at,
+        } => {
+            lines.push(format!(
+                "  unavailable: {}",
+                format_reset_timestamp(*at, now)
+            ));
+            lines.push(format!("  limited by: {}", limited_by.as_str()));
+            if let Some(recovery_at) = recovery_at {
+                lines.push(format!(
+                    "  recovery: {}",
+                    format_reset_timestamp(*recovery_at, now)
+                ));
+                if *recovery_at >= *at {
+                    lines.push(format!(
+                        "  expected outage: {}",
+                        format_reset_duration(recovery_at.saturating_sub(*at) as u64)
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(rates) = forecast.rates {
+        lines.push(format_estimated_rate(rates));
+    }
+
+    lines.join("\n")
+}
+
+fn format_estimated_rate(rates: usage_forecast::UsageForecastRates) -> String {
+    format!(
+        "  estimated rate: 5-hour {:.1}%/h, weekly {:.1}%/h",
+        rates.five_hour_percent_per_hour, rates.weekly_percent_per_hour
+    )
 }
 
 fn format_usage(
@@ -721,11 +796,16 @@ mod tests {
     use super::{
         format_limit_status, format_limit_window, format_reset_detail, format_reset_remaining_bar,
         format_reset_remaining_percent, format_reset_timestamp_option, format_short_reset_datetime,
-        format_usage, format_usage_account_header, format_usage_left_bar,
-        format_usage_left_percent, usage_account_from_store,
+        format_usage, format_usage_account_header, format_usage_forecast, format_usage_left_bar,
+        format_usage_left_percent, has_forecastable_usage_account, usage_account_from_store,
     };
     use crate::store;
-    use crate::types::{AccountsStore, StoredAccount, UsageInfo, UsageLimitInfo};
+    use crate::types::{
+        AccountsStore, NewChatGptAccount, RedactedString, StoredAccount, UsageInfo, UsageLimitInfo,
+    };
+    use crate::usage_forecast::{
+        ForecastLimit, UsageForecast, UsageForecastOutcome, UsageForecastRates,
+    };
     use chrono::{TimeZone, Utc};
 
     #[test]
@@ -1046,6 +1126,99 @@ mod tests {
             format_limit_status("custom_limit"),
             "status: limited (custom_limit)"
         );
+    }
+
+    #[test]
+    fn usage_forecast_output_shows_pool_estimate() {
+        let now = 1_800_000_000;
+        let forecast = UsageForecast {
+            rates: Some(UsageForecastRates {
+                five_hour_percent_per_hour: 18.0,
+                weekly_percent_per_hour: 0.7,
+            }),
+            outcome: UsageForecastOutcome::Unavailable {
+                at: now + 3 * 60 * 60,
+                limited_by: ForecastLimit::FiveHourAndWeekly,
+                recovery_at: Some(now + 4 * 60 * 60),
+            },
+        };
+
+        let output = format_usage_forecast(&forecast, now);
+
+        assert!(output.contains("overall estimate:"));
+        assert!(output.contains("unavailable: in 3h"));
+        assert!(output.contains("limited by: 5-hour and weekly"));
+        assert!(output.contains("recovery: in 4h"));
+        assert!(output.contains("expected outage: 1h"));
+        assert!(output.contains("estimated rate: 5-hour 18.0%/h, weekly 0.7%/h"));
+    }
+
+    #[test]
+    fn usage_forecast_output_shows_sustainable_estimate() {
+        let forecast = UsageForecast {
+            rates: Some(UsageForecastRates {
+                five_hour_percent_per_hour: 4.0,
+                weekly_percent_per_hour: 0.2,
+            }),
+            outcome: UsageForecastOutcome::NotExpected {
+                horizon_seconds: 14 * 24 * 60 * 60,
+            },
+        };
+
+        let output = format_usage_forecast(&forecast, 1_800_000_000);
+
+        assert!(output.contains("unavailable: not expected within 14d at current pace"));
+        assert!(output.contains("estimated rate: 5-hour 4.0%/h, weekly 0.2%/h"));
+    }
+
+    #[test]
+    fn usage_forecast_output_omits_rate_when_missing() {
+        let now = 1_800_000_000;
+        let forecast = UsageForecast {
+            rates: None,
+            outcome: UsageForecastOutcome::Unavailable {
+                at: now,
+                limited_by: ForecastLimit::FiveHour,
+                recovery_at: Some(now + 60 * 60),
+            },
+        };
+
+        let output = format_usage_forecast(&forecast, now);
+
+        assert!(output.contains("unavailable: now"));
+        assert!(!output.contains("estimated rate:"));
+    }
+
+    #[test]
+    fn usage_forecast_requires_chatgpt_account() {
+        let api_key_account = StoredAccount::new_api_key("work".to_string(), "sk-test".to_string());
+        let api_key_store = AccountsStore {
+            version: 1,
+            accounts: vec![api_key_account],
+            masked_account_ids: Vec::new(),
+        };
+
+        assert!(!has_forecastable_usage_account(&api_key_store));
+
+        let chatgpt_store = AccountsStore {
+            version: 1,
+            accounts: vec![StoredAccount::new_chatgpt(NewChatGptAccount {
+                name: "work".to_string(),
+                email: None,
+                plan_type: Some("pro".to_string()),
+                chatgpt_user_id: None,
+                chatgpt_account_is_fedramp: false,
+                token_last_refresh_at: Utc::now(),
+                subscription_expires_at: None,
+                id_token: RedactedString::new("id-token"),
+                access_token: RedactedString::new("access-token"),
+                refresh_token: RedactedString::new("refresh-token"),
+                account_id: Some("account".to_string()),
+            })],
+            masked_account_ids: Vec::new(),
+        };
+
+        assert!(has_forecastable_usage_account(&chatgpt_store));
     }
 
     #[test]

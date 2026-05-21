@@ -116,6 +116,8 @@ cargo install codex-switch --locked --force
 
 Usage reporting is supported for ChatGPT OAuth accounts. API key accounts are listed as unsupported for usage.
 
+`usage --all` also prints an overall estimate for the ChatGPT OAuth account pool based on the current 5-hour and weekly usage snapshot. The estimate starts from the current account when it has usable usage data, periodically reapplies the account selection policy, and reports the estimated 5-hour and weekly usage rates when enough samples are available.
+
 Additional usage limits are hidden by default. Pass `--show-additional` to include them.
 
 ## Release
