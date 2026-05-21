@@ -26,7 +26,7 @@ use cli::{Cli, Command};
 use types::{AccountsStore, StoredAccount, UsageInfo};
 
 const USAGE_BAR_WIDTH: usize = 20;
-const USAGE_LABEL_WIDTH: usize = 7;
+const USAGE_LABEL_WIDTH: usize = 6;
 const USAGE_BAR_FILLED: &str = "\u{2588}";
 const USAGE_BAR_EMPTY: &str = "\u{2591}";
 
@@ -442,7 +442,7 @@ fn format_limit_window(
     let label_width = USAGE_LABEL_WIDTH.max(label.len());
 
     format!(
-        "{:<width$} quota [{quota_bar}] {left}\n{:<width$} reset [{reset_bar}] {reset}",
+        "{:<width$} ┬ quota [{quota_bar}] {left}\n{:<width$} └ reset [{reset_bar}] {reset}",
         label,
         "",
         width = label_width
@@ -886,7 +886,7 @@ mod tests {
         assert_eq!(
             format_limit_window("weekly", Some(92.0), Some(10_080), Some(reset), now),
             format!(
-                "weekly  quota [{}] 8.0% left\n        reset [{}] 1% remaining, {}",
+                "weekly ┬ quota [{}] 8.0% left\n       └ reset [{}] 1% remaining, {}",
                 format_usage_left_bar(Some(92.0)),
                 format_reset_remaining_bar(Some(reset), Some(10_080), now),
                 format_reset_timestamp_option(Some(reset), now)
@@ -902,7 +902,7 @@ mod tests {
         assert_eq!(
             format_limit_window("  5-hour", Some(20.0), Some(300), Some(reset), now),
             format!(
-                "  5-hour quota [{}] 80.0% left\n         reset [{}] 20% remaining, {}",
+                "  5-hour ┬ quota [{}] 80.0% left\n         └ reset [{}] 20% remaining, {}",
                 format_usage_left_bar(Some(20.0)),
                 format_reset_remaining_bar(Some(reset), Some(300), now),
                 format_reset_timestamp_option(Some(reset), now)
@@ -939,8 +939,8 @@ mod tests {
         let output = format_usage(&account, &info, true, now, false);
 
         assert!(!output.contains("additional GPT-5.3-Codex-Spark"));
-        assert!(output.contains("5-hour  quota"));
-        assert!(output.contains("weekly  quota"));
+        assert!(output.contains("5-hour ┬ quota"));
+        assert!(output.contains("weekly ┬ quota"));
     }
 
     #[test]
@@ -952,8 +952,8 @@ mod tests {
         let output = format_usage(&account, &info, true, now, true);
 
         assert!(output.contains("additional GPT-5.3-Codex-Spark:"));
-        assert!(output.contains("  5-hour quota"));
-        assert!(output.contains("  weekly quota"));
+        assert!(output.contains("  5-hour ┬ quota"));
+        assert!(output.contains("  weekly ┬ quota"));
     }
 
     #[test]
