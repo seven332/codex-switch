@@ -97,7 +97,6 @@ impl<'a> SelectionContext<'a> {
         }
     }
 
-    #[cfg(test)]
     pub fn at(now: i64) -> Self {
         Self {
             now,
