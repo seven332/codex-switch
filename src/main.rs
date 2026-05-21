@@ -136,9 +136,13 @@ async fn run() -> Result<()> {
             let outcome = update::update(update::UpdateOptions { check, version }).await?;
             print_update_outcome(outcome);
         }
-        Command::Usage { all, account } => {
+        Command::Usage {
+            all,
+            show_additional,
+            account,
+        } => {
             if all {
-                print_all_usage().await?;
+                print_all_usage(show_additional).await?;
             } else {
                 let accounts_store = store::load_accounts()?;
                 let current_account_id = match account.as_deref() {
@@ -152,7 +156,13 @@ async fn run() -> Result<()> {
                 )?;
                 let is_current = current_account_id.as_deref() == Some(account.id.as_str());
                 let info = usage::get_account_usage(&account).await?;
-                print_usage(&account, &info, is_current, Utc::now().timestamp());
+                print_usage(
+                    &account,
+                    &info,
+                    is_current,
+                    Utc::now().timestamp(),
+                    show_additional,
+                );
             }
         }
         Command::Delete { account } => {
@@ -289,7 +299,7 @@ fn print_update_outcome(outcome: update::UpdateOutcome) {
     }
 }
 
-async fn print_all_usage() -> Result<()> {
+async fn print_all_usage(show_additional: bool) -> Result<()> {
     let store = store::load_accounts()?;
     if store.accounts.is_empty() {
         println!("No accounts stored.");
@@ -310,7 +320,7 @@ async fn print_all_usage() -> Result<()> {
         }
         if let Some(info) = by_id.get(&account.id) {
             let is_current = current_account_id.as_deref() == Some(account.id.as_str());
-            print_usage(account, info, is_current, now);
+            print_usage(account, info, is_current, now, show_additional);
         }
     }
 
@@ -346,39 +356,67 @@ fn print_accounts(store: &AccountsStore, current_account_id: Option<&str>) {
     }
 }
 
-fn print_usage(account: &StoredAccount, info: &UsageInfo, is_current: bool, now: i64) {
-    println!("{}", format_usage_account_header(account, is_current));
+fn print_usage(
+    account: &StoredAccount,
+    info: &UsageInfo,
+    is_current: bool,
+    now: i64,
+    show_additional: bool,
+) {
+    println!(
+        "{}",
+        format_usage(account, info, is_current, now, show_additional)
+    );
+}
+
+fn format_usage(
+    account: &StoredAccount,
+    info: &UsageInfo,
+    is_current: bool,
+    now: i64,
+    show_additional: bool,
+) -> String {
+    let mut lines = vec![format_usage_account_header(account, is_current)];
 
     if matches!(info.error.as_deref(), Some("usage unsupported")) {
-        println!("usage: unsupported");
-        return;
+        lines.push("usage: unsupported".to_string());
+        return lines.join("\n");
     }
 
     if let Some(error) = &info.error {
-        println!("usage error: {error}");
-        return;
+        lines.push(format!("usage error: {error}"));
+        return lines.join("\n");
     }
 
-    println!("plan: {}", info.plan_type.as_deref().unwrap_or("-"));
-    print_limit_window(
+    lines.push(format!(
+        "plan: {}",
+        info.plan_type.as_deref().unwrap_or("-")
+    ));
+    lines.push(format_limit_window(
         "5-hour",
         info.primary_used_percent,
         info.primary_window_minutes,
         info.primary_resets_at,
         now,
-    );
-    print_limit_window(
+    ));
+    lines.push(format_limit_window(
         "weekly",
         info.secondary_used_percent,
         info.secondary_window_minutes,
         info.secondary_resets_at,
         now,
-    );
-    print_credits(info);
-    if let Some(kind) = &info.rate_limit_reached_type {
-        println!("rate limit reached: {kind}");
+    ));
+    if let Some(credits) = format_credits(info) {
+        lines.push(credits);
     }
-    print_additional_limits(info, now);
+    if let Some(kind) = &info.rate_limit_reached_type {
+        lines.push(format!("rate limit reached: {kind}"));
+    }
+    if show_additional {
+        lines.extend(format_additional_limits(info, now));
+    }
+
+    lines.join("\n")
 }
 
 fn format_usage_account_header(account: &StoredAccount, is_current: bool) -> String {
@@ -388,19 +426,6 @@ fn format_usage_account_header(account: &StoredAccount, is_current: bool) -> Str
         account.name,
         store::short_id(&account.id)
     )
-}
-
-fn print_limit_window(
-    label: &str,
-    used_percent: Option<f64>,
-    window_minutes: Option<i64>,
-    resets_at: Option<i64>,
-    now: i64,
-) {
-    println!(
-        "{}",
-        format_limit_window(label, used_percent, window_minutes, resets_at, now)
-    );
 }
 
 fn format_limit_window(
@@ -424,12 +449,12 @@ fn format_limit_window(
     )
 }
 
-fn print_credits(info: &UsageInfo) {
+fn format_credits(info: &UsageInfo) -> Option<String> {
     if info.has_credits.is_none()
         && info.unlimited_credits.is_none()
         && info.credits_balance.is_none()
     {
-        return;
+        return None;
     }
 
     let credits = if info.unlimited_credits == Some(true) {
@@ -442,32 +467,36 @@ fn print_credits(info: &UsageInfo) {
         "available".to_string()
     };
 
-    println!("credits: {credits}");
+    Some(format!("credits: {credits}"))
 }
 
-fn print_additional_limits(info: &UsageInfo, now: i64) {
+fn format_additional_limits(info: &UsageInfo, now: i64) -> Vec<String> {
+    let mut lines = Vec::new();
+
     for limit in &info.additional_limits {
         let label = limit
             .limit_name
             .as_deref()
             .or(limit.limit_id.as_deref())
             .unwrap_or("additional");
-        println!("additional {label}:");
-        print_limit_window(
+        lines.push(format!("additional {label}:"));
+        lines.push(format_limit_window(
             "  5-hour",
             limit.primary_used_percent,
             limit.primary_window_minutes,
             limit.primary_resets_at,
             now,
-        );
-        print_limit_window(
+        ));
+        lines.push(format_limit_window(
             "  weekly",
             limit.secondary_used_percent,
             limit.secondary_window_minutes,
             limit.secondary_resets_at,
             now,
-        );
+        ));
     }
+
+    lines
 }
 
 fn format_datetime_option(value: Option<&DateTime<Utc>>) -> String {
@@ -649,11 +678,11 @@ mod tests {
     use super::{
         format_limit_window, format_reset_detail, format_reset_remaining_bar,
         format_reset_remaining_percent, format_reset_timestamp_option, format_short_reset_datetime,
-        format_usage_account_header, format_usage_left_bar, format_usage_left_percent,
-        usage_account_from_store,
+        format_usage, format_usage_account_header, format_usage_left_bar,
+        format_usage_left_percent, usage_account_from_store,
     };
     use crate::store;
-    use crate::types::{AccountsStore, StoredAccount};
+    use crate::types::{AccountsStore, StoredAccount, UsageInfo, UsageLimitInfo};
     use chrono::{TimeZone, Utc};
 
     #[test]
@@ -902,6 +931,32 @@ mod tests {
     }
 
     #[test]
+    fn usage_output_hides_additional_limits_by_default() {
+        let now = 1_800_000_000;
+        let account = StoredAccount::new_api_key("work".to_string(), "sk-test".to_string());
+        let info = usage_info_with_additional_limit(&account.id, now);
+
+        let output = format_usage(&account, &info, true, now, false);
+
+        assert!(!output.contains("additional GPT-5.3-Codex-Spark"));
+        assert!(output.contains("5-hour  quota"));
+        assert!(output.contains("weekly  quota"));
+    }
+
+    #[test]
+    fn usage_output_shows_additional_limits_when_requested() {
+        let now = 1_800_000_000;
+        let account = StoredAccount::new_api_key("work".to_string(), "sk-test".to_string());
+        let info = usage_info_with_additional_limit(&account.id, now);
+
+        let output = format_usage(&account, &info, true, now, true);
+
+        assert!(output.contains("additional GPT-5.3-Codex-Spark:"));
+        assert!(output.contains("  5-hour quota"));
+        assert!(output.contains("  weekly quota"));
+    }
+
+    #[test]
     fn usage_account_from_store_uses_current_auth_account() {
         let account = StoredAccount::new_api_key("work".to_string(), "sk-test".to_string());
         let accounts_store = AccountsStore {
@@ -914,6 +969,36 @@ mod tests {
             .expect("current account");
 
         assert_eq!(selected.id, account.id);
+    }
+
+    fn usage_info_with_additional_limit(account_id: &str, now: i64) -> UsageInfo {
+        UsageInfo {
+            account_id: account_id.to_string(),
+            limit_id: None,
+            limit_name: None,
+            plan_type: Some("pro".to_string()),
+            primary_used_percent: Some(10.0),
+            primary_window_minutes: Some(300),
+            primary_resets_at: Some(now + 60 * 60),
+            secondary_used_percent: Some(20.0),
+            secondary_window_minutes: Some(10_080),
+            secondary_resets_at: Some(now + 2 * 24 * 60 * 60),
+            has_credits: Some(true),
+            unlimited_credits: None,
+            credits_balance: Some("0".to_string()),
+            rate_limit_reached_type: None,
+            additional_limits: vec![UsageLimitInfo {
+                limit_id: Some("gpt-5.3-codex-spark".to_string()),
+                limit_name: Some("GPT-5.3-Codex-Spark".to_string()),
+                primary_used_percent: Some(0.0),
+                primary_window_minutes: Some(300),
+                primary_resets_at: Some(now + 2 * 60 * 60),
+                secondary_used_percent: Some(0.0),
+                secondary_window_minutes: Some(10_080),
+                secondary_resets_at: Some(now + 3 * 24 * 60 * 60),
+            }],
+            error: None,
+        }
     }
 
     #[test]
