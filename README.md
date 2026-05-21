@@ -25,8 +25,8 @@ codex-switch switch <name-or-id>
 codex-switch auto-switch
 codex-switch run [--codex-bin <path>] -- [CODEX_ARGS]...
 codex-switch update [--check] [--version <version>]
-codex-switch usage [name-or-id]
-codex-switch usage --all
+codex-switch usage [--show-additional] [name-or-id]
+codex-switch usage --all [--show-additional]
 codex-switch delete <name-or-id>
 codex-switch rename <name-or-id> <new-name>
 ```
@@ -115,6 +115,8 @@ cargo install codex-switch --locked --force
 ## Usage
 
 Usage reporting is supported for ChatGPT OAuth accounts. API key accounts are listed as unsupported for usage.
+
+Additional usage limits are hidden by default. Pass `--show-additional` to include them.
 
 ## Release
 

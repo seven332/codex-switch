@@ -75,6 +75,9 @@ pub enum Command {
         /// Query every stored account.
         #[arg(long, conflicts_with = "account")]
         all: bool,
+        /// Include additional usage limits.
+        #[arg(long = "show-additional")]
+        show_additional: bool,
         /// Account name, full ID, or unique ID prefix. Defaults to the current Codex auth account.
         account: Option<String>,
     },
