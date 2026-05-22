@@ -6,8 +6,8 @@ use chrono::Utc;
 
 use crate::store::{self, write_new_private_file, write_private_file};
 use crate::types::{
-    AccountsStore, AuthData, AuthDotJson, NewChatGptAccount, StoredAccount, TokenData,
-    parse_chatgpt_id_token_claims,
+    AccountsStore, AuthData, AuthDotJson, AuthJsonAuthMode, NewChatGptAccount, StoredAccount,
+    TokenData, try_parse_chatgpt_id_token_claims,
 };
 
 pub fn codex_home() -> Result<PathBuf> {
@@ -33,7 +33,7 @@ pub fn write_account_auth(account: &StoredAccount) -> Result<PathBuf> {
 }
 
 pub fn account_auth_json_content(account: &StoredAccount) -> Result<String> {
-    let auth_json = create_auth_json(account);
+    let auth_json = create_auth_json(account)?;
     let mut content =
         serde_json::to_string_pretty(&auth_json).context("Failed to serialize auth.json")?;
     content.push('\n');
@@ -93,63 +93,92 @@ fn import_from_auth_json_contents(content: &str, account_name: String) -> Result
     let auth: AuthDotJson =
         serde_json::from_str(content).context("Failed to parse auth.json contents")?;
     let AuthDotJson {
+        auth_mode,
         openai_api_key,
         tokens,
         last_refresh,
+        agent_identity: _,
         ..
     } = auth;
+    let resolved_auth_mode = auth_mode.unwrap_or_else(|| {
+        if openai_api_key.is_some() {
+            AuthJsonAuthMode::ApiKey
+        } else {
+            AuthJsonAuthMode::Chatgpt
+        }
+    });
 
-    if let Some(api_key) = openai_api_key {
-        return Ok(StoredAccount::new_api_key(
-            account_name,
-            api_key.into_inner(),
-        ));
+    match resolved_auth_mode {
+        AuthJsonAuthMode::ApiKey => {
+            let Some(api_key) = openai_api_key else {
+                anyhow::bail!("API key auth.json is missing OPENAI_API_KEY");
+            };
+            Ok(StoredAccount::new_api_key(
+                account_name,
+                api_key.into_inner(),
+            ))
+        }
+        AuthJsonAuthMode::Chatgpt => {
+            let Some(tokens) = tokens else {
+                anyhow::bail!("ChatGPT auth.json is missing tokens");
+            };
+            let claims = try_parse_chatgpt_id_token_claims(tokens.id_token.expose_secret())
+                .context("ChatGPT auth.json contains an invalid id_token")?;
+            Ok(StoredAccount::new_chatgpt(NewChatGptAccount {
+                name: account_name,
+                email: claims.email,
+                plan_type: claims.plan_type,
+                chatgpt_user_id: claims.user_id,
+                chatgpt_account_is_fedramp: claims.account_is_fedramp,
+                token_last_refresh_at: last_refresh.unwrap_or_else(Utc::now),
+                subscription_expires_at: claims.subscription_expires_at,
+                id_token: tokens.id_token,
+                access_token: tokens.access_token,
+                refresh_token: tokens.refresh_token,
+                account_id: tokens.account_id.or(claims.account_id),
+            }))
+        }
+        AuthJsonAuthMode::ChatgptAuthTokens => {
+            anyhow::bail!(
+                "externally managed ChatGPT auth token auth.json files are not supported by codex-switch"
+            );
+        }
+        AuthJsonAuthMode::AgentIdentity => {
+            anyhow::bail!("agent identity auth.json files are not supported by codex-switch");
+        }
     }
-
-    if let Some(tokens) = tokens {
-        let claims = parse_chatgpt_id_token_claims(tokens.id_token.expose_secret());
-        return Ok(StoredAccount::new_chatgpt(NewChatGptAccount {
-            name: account_name,
-            email: claims.email,
-            plan_type: claims.plan_type,
-            chatgpt_user_id: claims.user_id,
-            chatgpt_account_is_fedramp: claims.account_is_fedramp,
-            token_last_refresh_at: last_refresh.unwrap_or_else(Utc::now),
-            subscription_expires_at: claims.subscription_expires_at,
-            id_token: tokens.id_token,
-            access_token: tokens.access_token,
-            refresh_token: tokens.refresh_token,
-            account_id: claims.account_id.or(tokens.account_id),
-        }));
-    }
-
-    anyhow::bail!("auth.json contains neither OPENAI_API_KEY nor tokens");
 }
 
-fn create_auth_json(account: &StoredAccount) -> AuthDotJson {
+fn create_auth_json(account: &StoredAccount) -> Result<AuthDotJson> {
     match &account.auth_data {
-        AuthData::ApiKey { key } => AuthDotJson {
-            auth_mode: Some("apikey".to_string()),
+        AuthData::ApiKey { key } => Ok(AuthDotJson {
+            auth_mode: Some(AuthJsonAuthMode::ApiKey),
             openai_api_key: Some(key.clone()),
             tokens: None,
             last_refresh: None,
-        },
+            agent_identity: None,
+        }),
         AuthData::ChatGPT {
             id_token,
             access_token,
             refresh_token,
             account_id,
-        } => AuthDotJson {
-            auth_mode: Some("chatgpt".to_string()),
-            openai_api_key: None,
-            tokens: Some(TokenData {
-                id_token: id_token.clone(),
-                access_token: access_token.clone(),
-                refresh_token: refresh_token.clone(),
-                account_id: account_id.clone(),
-            }),
-            last_refresh: account.token_last_refresh_at,
-        },
+        } => {
+            try_parse_chatgpt_id_token_claims(id_token.expose_secret())
+                .context("Stored ChatGPT account contains an invalid id_token")?;
+            Ok(AuthDotJson {
+                auth_mode: Some(AuthJsonAuthMode::Chatgpt),
+                openai_api_key: None,
+                tokens: Some(TokenData {
+                    id_token: id_token.clone(),
+                    access_token: access_token.clone(),
+                    refresh_token: refresh_token.clone(),
+                    account_id: account_id.clone(),
+                }),
+                last_refresh: account.token_last_refresh_at,
+                agent_identity: None,
+            })
+        }
     }
 }
 
@@ -158,15 +187,17 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    use base64::Engine;
     use chrono::{TimeZone, Utc};
     use uuid::Uuid;
 
-    use super::{account_auth_json_content, export_account_auth};
-    use crate::types::{AuthDotJson, NewChatGptAccount, StoredAccount};
+    use super::{account_auth_json_content, export_account_auth, import_from_auth_json_contents};
+    use crate::types::{AuthData, AuthDotJson, AuthJsonAuthMode, NewChatGptAccount, StoredAccount};
 
     #[test]
     fn oauth_export_uses_codex_auth_json_shape() {
         let account = chatgpt_account();
+        let expected_id_token = test_id_token();
         let content =
             account_auth_json_content(&account).expect("auth.json should serialize successfully");
 
@@ -177,14 +208,36 @@ mod tests {
             serde_json::from_str(&content).expect("exported auth.json should be valid JSON");
         let tokens = auth.tokens.expect("OAuth export should include tokens");
 
-        assert!(value.get("OPENAI_API_KEY").is_none());
-        assert_eq!(auth.auth_mode.as_deref(), Some("chatgpt"));
+        assert!(
+            value
+                .get("OPENAI_API_KEY")
+                .is_some_and(serde_json::Value::is_null)
+        );
+        assert_eq!(auth.auth_mode, Some(AuthJsonAuthMode::Chatgpt));
         assert_eq!(auth.openai_api_key, None);
         assert_eq!(auth.last_refresh, account.token_last_refresh_at);
-        assert_eq!(tokens.id_token.expose_secret(), "id-token");
+        assert_eq!(auth.agent_identity, None);
+        assert_eq!(tokens.id_token.expose_secret(), expected_id_token);
         assert_eq!(tokens.access_token.expose_secret(), "access-token");
         assert_eq!(tokens.refresh_token.expose_secret(), "refresh-token");
         assert_eq!(tokens.account_id.as_deref(), Some("account-id"));
+    }
+
+    #[test]
+    fn oauth_export_rejects_invalid_stored_id_token() {
+        let mut account = chatgpt_account();
+        let AuthData::ChatGPT { id_token, .. } = &mut account.auth_data else {
+            panic!("test account should use ChatGPT auth");
+        };
+        *id_token = "not-a-jwt".into();
+
+        let err = account_auth_json_content(&account)
+            .expect_err("invalid stored id_token should not export");
+
+        assert!(
+            format!("{err:#}").contains("Stored ChatGPT account contains an invalid id_token"),
+            "{err:#}"
+        );
     }
 
     #[test]
@@ -199,7 +252,7 @@ mod tests {
         let auth: AuthDotJson =
             serde_json::from_str(&content).expect("exported auth.json should be valid JSON");
 
-        assert_eq!(auth.auth_mode.as_deref(), Some("apikey"));
+        assert_eq!(auth.auth_mode, Some(AuthJsonAuthMode::ApiKey));
         assert_eq!(
             auth.openai_api_key
                 .as_ref()
@@ -212,37 +265,203 @@ mod tests {
         );
         assert!(auth.tokens.is_none());
         assert!(auth.last_refresh.is_none());
+        assert_eq!(auth.agent_identity, None);
     }
 
     #[test]
     fn auth_json_deserializes_missing_or_null_api_key_as_none() {
         for content in [
-            r#"{
-                "auth_mode": "chatgpt",
-                "tokens": {
-                    "id_token": "id-token",
-                    "access_token": "access-token",
-                    "refresh_token": "refresh-token",
-                    "account_id": "account-id"
-                }
-            }"#,
-            r#"{
-                "auth_mode": "chatgpt",
-                "OPENAI_API_KEY": null,
-                "tokens": {
-                    "id_token": "id-token",
-                    "access_token": "access-token",
-                    "refresh_token": "refresh-token",
-                    "account_id": "account-id"
-                }
-            }"#,
+            chatgpt_auth_json(Some("chatgpt"), None, None),
+            chatgpt_auth_json(Some("chatgpt"), Some(serde_json::Value::Null), None),
         ] {
             let auth: AuthDotJson =
-                serde_json::from_str(content).expect("auth.json should deserialize");
+                serde_json::from_str(&content).expect("auth.json should deserialize");
 
             assert_eq!(auth.openai_api_key, None);
             assert!(auth.tokens.is_some());
         }
+    }
+
+    #[test]
+    fn import_accepts_api_key_auth_json() {
+        let account = import_from_auth_json_contents(
+            r#"{
+                "auth_mode": "apikey",
+                "OPENAI_API_KEY": "sk-test"
+            }"#,
+            "api".to_string(),
+        )
+        .expect("API key auth.json should import");
+
+        assert_eq!(account.name, "api");
+        assert_eq!(account.auth_mode, crate::types::AuthMode::ApiKey);
+        let AuthData::ApiKey { key } = account.auth_data else {
+            panic!("expected API key auth data");
+        };
+        assert_eq!(key.expose_secret(), "sk-test");
+    }
+
+    #[test]
+    fn import_accepts_regular_chatgpt_auth_json() {
+        let expected_id_token = test_id_token();
+        let content = chatgpt_auth_json(
+            Some("chatgpt"),
+            Some(serde_json::Value::Null),
+            Some("2026-05-13T12:00:00Z"),
+        );
+        let account = import_from_auth_json_contents(&content, "chatgpt".to_string())
+            .expect("regular ChatGPT auth.json should import");
+
+        assert_eq!(account.name, "chatgpt");
+        assert_eq!(account.auth_mode, crate::types::AuthMode::ChatGPT);
+        assert_eq!(
+            account.token_last_refresh_at,
+            Some(Utc.with_ymd_and_hms(2026, 5, 13, 12, 0, 0).unwrap())
+        );
+        let AuthData::ChatGPT {
+            id_token,
+            access_token,
+            refresh_token,
+            account_id,
+        } = account.auth_data
+        else {
+            panic!("expected ChatGPT auth data");
+        };
+        assert_eq!(id_token.expose_secret(), expected_id_token);
+        assert_eq!(access_token.expose_secret(), "access-token");
+        assert_eq!(refresh_token.expose_secret(), "refresh-token");
+        assert_eq!(account_id.as_deref(), Some("account-id"));
+    }
+
+    #[test]
+    fn import_preserves_token_data_account_id_over_id_token_claim() {
+        let mut content: serde_json::Value =
+            serde_json::from_str(&chatgpt_auth_json(Some("chatgpt"), None, None))
+                .expect("test auth.json should parse");
+        content["tokens"]["account_id"] = serde_json::json!("token-data-account-id");
+
+        let account = import_from_auth_json_contents(&content.to_string(), "chatgpt".to_string())
+            .expect("regular ChatGPT auth.json should import");
+
+        let AuthData::ChatGPT { account_id, .. } = account.auth_data else {
+            panic!("expected ChatGPT auth data");
+        };
+        assert_eq!(account_id.as_deref(), Some("token-data-account-id"));
+    }
+
+    #[test]
+    fn import_defaults_missing_auth_mode_with_api_key_to_api_key() {
+        let account = import_from_auth_json_contents(
+            r#"{
+                "OPENAI_API_KEY": "sk-test"
+            }"#,
+            "api".to_string(),
+        )
+        .expect("missing auth_mode with API key should import as API key");
+
+        assert_eq!(account.auth_mode, crate::types::AuthMode::ApiKey);
+        let AuthData::ApiKey { key } = account.auth_data else {
+            panic!("expected API key auth data");
+        };
+        assert_eq!(key.expose_secret(), "sk-test");
+    }
+
+    #[test]
+    fn import_defaults_missing_auth_mode_without_api_key_to_chatgpt() {
+        let account = import_from_auth_json_contents(
+            &chatgpt_auth_json(None, None, None),
+            "chatgpt".to_string(),
+        )
+        .expect("missing auth_mode without API key should import as ChatGPT");
+
+        assert_eq!(account.auth_mode, crate::types::AuthMode::ChatGPT);
+        let AuthData::ChatGPT { account_id, .. } = account.auth_data else {
+            panic!("expected ChatGPT auth data");
+        };
+        assert_eq!(account_id.as_deref(), Some("account-id"));
+    }
+
+    #[test]
+    fn import_respects_explicit_chatgpt_auth_mode_over_api_key() {
+        let account = import_from_auth_json_contents(
+            &chatgpt_auth_json(Some("chatgpt"), Some(serde_json::json!("sk-test")), None),
+            "chatgpt".to_string(),
+        )
+        .expect("explicit ChatGPT auth mode should use tokens");
+
+        assert_eq!(account.auth_mode, crate::types::AuthMode::ChatGPT);
+        let AuthData::ChatGPT { refresh_token, .. } = account.auth_data else {
+            panic!("expected ChatGPT auth data");
+        };
+        assert_eq!(refresh_token.expose_secret(), "refresh-token");
+    }
+
+    #[test]
+    fn import_rejects_invalid_chatgpt_id_token() {
+        let err = import_from_auth_json_contents(
+            r#"{
+                "auth_mode": "chatgpt",
+                "OPENAI_API_KEY": null,
+                "tokens": {
+                    "id_token": "not-a-jwt",
+                    "access_token": "access-token",
+                    "refresh_token": "refresh-token",
+                    "account_id": "account-id"
+                }
+            }"#,
+            "chatgpt".to_string(),
+        )
+        .expect_err("invalid ChatGPT id_token should be rejected");
+
+        assert!(format!("{err:#}").contains("invalid ID token"), "{err:#}");
+    }
+
+    #[test]
+    fn import_respects_explicit_api_key_auth_mode_over_tokens() {
+        let err = import_from_auth_json_contents(
+            &chatgpt_auth_json(Some("apikey"), None, None),
+            "api".to_string(),
+        )
+        .expect_err("explicit API key auth mode should require OPENAI_API_KEY");
+
+        assert!(err.to_string().contains("missing OPENAI_API_KEY"), "{err}");
+    }
+
+    #[test]
+    fn import_rejects_agent_identity_auth_json() {
+        let err = import_from_auth_json_contents(
+            r#"{
+                "auth_mode": "agentIdentity",
+                "OPENAI_API_KEY": null,
+                "agent_identity": "agent-identity-jwt"
+            }"#,
+            "agent".to_string(),
+        )
+        .expect_err("agent identity auth should be rejected");
+
+        assert!(
+            err.to_string().contains("agent identity auth.json files"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn import_rejects_external_chatgpt_auth_tokens_auth_json() {
+        let err = import_from_auth_json_contents(
+            &chatgpt_auth_json(
+                Some("chatgptAuthTokens"),
+                Some(serde_json::Value::Null),
+                None,
+            ),
+            "external".to_string(),
+        )
+        .expect_err("external ChatGPT auth tokens should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("externally managed ChatGPT auth token"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -317,11 +536,57 @@ mod tests {
             chatgpt_account_is_fedramp: false,
             token_last_refresh_at: Utc.with_ymd_and_hms(2026, 5, 13, 12, 0, 0).unwrap(),
             subscription_expires_at: None,
-            id_token: "id-token".into(),
+            id_token: test_id_token().into(),
             access_token: "access-token".into(),
             refresh_token: "refresh-token".into(),
             account_id: Some("account-id".to_string()),
         })
+    }
+
+    fn chatgpt_auth_json(
+        auth_mode: Option<&str>,
+        openai_api_key: Option<serde_json::Value>,
+        last_refresh: Option<&str>,
+    ) -> String {
+        let mut value = serde_json::json!({
+            "tokens": {
+                "id_token": test_id_token(),
+                "access_token": "access-token",
+                "refresh_token": "refresh-token",
+                "account_id": "account-id"
+            }
+        });
+        if let Some(auth_mode) = auth_mode {
+            value["auth_mode"] = serde_json::json!(auth_mode);
+        }
+        if let Some(openai_api_key) = openai_api_key {
+            value["OPENAI_API_KEY"] = openai_api_key;
+        }
+        if let Some(last_refresh) = last_refresh {
+            value["last_refresh"] = serde_json::json!(last_refresh);
+        }
+        serde_json::to_string(&value).expect("test auth.json should serialize")
+    }
+
+    fn test_id_token() -> String {
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let payload = serde_json::json!({
+            "email": "user@example.com",
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "account-id",
+                "chatgpt_plan_type": "pro",
+                "chatgpt_user_id": "user-id",
+                "chatgpt_account_is_fedramp": false
+            }
+        });
+        let payload_json = serde_json::to_vec(&payload).expect("test payload should serialize");
+
+        format!(
+            "{}.{}.{}",
+            encode(br#"{"alg":"none","typ":"JWT"}"#),
+            encode(&payload_json),
+            encode(b"sig")
+        )
     }
 
     fn temp_export_path(name: &str) -> PathBuf {

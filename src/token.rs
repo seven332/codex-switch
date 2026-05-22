@@ -14,7 +14,7 @@ use crate::auth_json;
 use crate::codex_http;
 use crate::redaction::redact_known_secrets;
 use crate::store;
-use crate::types::{AuthData, RedactedString, StoredAccount, parse_chatgpt_id_token_claims};
+use crate::types::{AuthData, RedactedString, StoredAccount, try_parse_chatgpt_id_token_claims};
 
 const REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR: &str = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
@@ -164,11 +164,13 @@ async fn refresh_chatgpt_tokens_locked(
     let claims = refreshed
         .id_token
         .as_ref()
-        .map(|id_token| parse_chatgpt_id_token_claims(id_token.expose_secret()));
-    let next_account_id = claims
-        .as_ref()
-        .and_then(|claims| claims.account_id.clone())
-        .or(current_account_id);
+        .map(|id_token| {
+            try_parse_chatgpt_id_token_claims(id_token.expose_secret())
+                .context("Token refresh response contains an invalid id_token")
+        })
+        .transpose()?;
+    let next_account_id =
+        current_account_id.or_else(|| claims.as_ref().and_then(|claims| claims.account_id.clone()));
     let token_last_refresh_at = Utc::now();
 
     let accounts_store = store::load_accounts()?;

@@ -16,7 +16,7 @@ use chrono::Utc;
 use crate::codex_http;
 use crate::redaction::redact_known_secrets;
 use crate::types::{
-    NewChatGptAccount, RedactedString, StoredAccount, parse_chatgpt_id_token_claims,
+    NewChatGptAccount, RedactedString, StoredAccount, try_parse_chatgpt_id_token_claims,
 };
 
 const DEFAULT_ISSUER: &str = "https://auth.openai.com";
@@ -90,7 +90,7 @@ pub async fn login(account_name: String, flow: LoginFlow) -> Result<StoredAccoun
         LoginFlow::Browser => browser_login().await?,
         LoginFlow::DeviceAuth => device_auth_login().await?,
     };
-    Ok(stored_account_from_tokens(account_name, tokens))
+    stored_account_from_tokens(account_name, tokens)
 }
 
 async fn browser_login() -> Result<TokenResponse> {
@@ -140,10 +140,14 @@ fn oauth_http_client() -> Result<reqwest::Client> {
         .context("Failed to build OAuth HTTP client")
 }
 
-fn stored_account_from_tokens(account_name: String, tokens: TokenResponse) -> StoredAccount {
-    let claims = parse_chatgpt_id_token_claims(tokens.id_token.expose_secret());
+fn stored_account_from_tokens(
+    account_name: String,
+    tokens: TokenResponse,
+) -> Result<StoredAccount> {
+    let claims = try_parse_chatgpt_id_token_claims(tokens.id_token.expose_secret())
+        .context("OAuth token response contains an invalid id_token")?;
 
-    StoredAccount::new_chatgpt(NewChatGptAccount {
+    Ok(StoredAccount::new_chatgpt(NewChatGptAccount {
         name: account_name,
         email: claims.email,
         plan_type: claims.plan_type,
@@ -155,7 +159,7 @@ fn stored_account_from_tokens(account_name: String, tokens: TokenResponse) -> St
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token,
         account_id: claims.account_id,
-    })
+    }))
 }
 
 async fn request_device_code(client: &reqwest::Client, issuer: &str) -> Result<DeviceCode> {
@@ -636,6 +640,7 @@ fn print_browser_login_prompt(port: u16, auth_url: &str) {
 #[cfg(test)]
 mod tests {
     use super::{build_authorize_url, normalize_poll_interval, parse_query};
+    use base64::Engine;
 
     #[test]
     fn normalize_poll_interval_uses_default_for_zero() {
@@ -763,5 +768,58 @@ mod tests {
         .expect("deserialize user code response");
         assert_eq!(response.device_auth_id.expose_secret(), device_auth_id);
         assert_eq!(response.user_code.expose_secret(), user_code);
+    }
+
+    #[test]
+    fn stored_account_from_tokens_rejects_invalid_id_token() {
+        let err = super::stored_account_from_tokens(
+            "oauth".to_string(),
+            super::TokenResponse {
+                id_token: "not-a-jwt".into(),
+                access_token: "access-token".into(),
+                refresh_token: "refresh-token".into(),
+            },
+        )
+        .expect_err("invalid id_token should be rejected");
+
+        assert!(format!("{err:#}").contains("invalid ID token"), "{err:#}");
+    }
+
+    #[test]
+    fn stored_account_from_tokens_reads_claims_from_id_token() {
+        let account = super::stored_account_from_tokens(
+            "oauth".to_string(),
+            super::TokenResponse {
+                id_token: test_id_token().into(),
+                access_token: "access-token".into(),
+                refresh_token: "refresh-token".into(),
+            },
+        )
+        .expect("valid id_token should create account");
+
+        assert_eq!(account.email.as_deref(), Some("user@example.com"));
+        assert_eq!(account.plan_type.as_deref(), Some("pro"));
+        assert_eq!(account.chatgpt_user_id.as_deref(), Some("user-id"));
+    }
+
+    fn test_id_token() -> String {
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let payload = serde_json::json!({
+            "email": "user@example.com",
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "account-id",
+                "chatgpt_plan_type": "pro",
+                "chatgpt_user_id": "user-id",
+                "chatgpt_account_is_fedramp": false
+            }
+        });
+        let payload_json = serde_json::to_vec(&payload).expect("test payload should serialize");
+
+        format!(
+            "{}.{}.{}",
+            encode(br#"{"alg":"none","typ":"JWT"}"#),
+            encode(&payload_json),
+            encode(b"sig")
+        )
     }
 }

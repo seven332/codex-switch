@@ -2,6 +2,7 @@ use std::fmt;
 
 use base64::Engine;
 use chrono::{DateTime, Utc};
+use serde::de;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -175,78 +176,187 @@ pub struct ChatGptIdTokenClaims {
     pub subscription_expires_at: Option<DateTime<Utc>>,
 }
 
-pub fn parse_chatgpt_id_token_claims(id_token: &str) -> ChatGptIdTokenClaims {
-    let parts: Vec<&str> = id_token.split('.').collect();
-    if parts.len() != 3 {
-        return ChatGptIdTokenClaims::default();
+#[derive(Deserialize)]
+struct ChatGptJwtClaims {
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(rename = "https://api.openai.com/profile", default)]
+    profile: Option<ChatGptProfileClaims>,
+    #[serde(rename = "https://api.openai.com/auth", default)]
+    auth: Option<ChatGptAuthClaims>,
+}
+
+#[derive(Deserialize)]
+struct ChatGptProfileClaims {
+    #[serde(default)]
+    email: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ChatGptAuthClaims {
+    #[serde(default)]
+    chatgpt_plan_type: Option<String>,
+    #[serde(default)]
+    chatgpt_user_id: Option<String>,
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    chatgpt_account_id: Option<String>,
+    #[serde(default)]
+    chatgpt_account_is_fedramp: bool,
+    #[serde(default)]
+    chatgpt_subscription_active_until: Option<serde_json::Value>,
+}
+
+#[derive(Debug)]
+pub enum ChatGptIdTokenParseError {
+    InvalidFormat,
+    Base64(base64::DecodeError),
+    Json(serde_json::Error),
+}
+
+impl fmt::Display for ChatGptIdTokenParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidFormat => f.write_str("invalid ID token format"),
+            Self::Base64(_) => f.write_str("invalid ID token payload encoding"),
+            Self::Json(_) => f.write_str("invalid ID token payload JSON"),
+        }
     }
+}
 
-    let payload = match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[1]) {
-        Ok(bytes) => bytes,
-        Err(_) => return ChatGptIdTokenClaims::default(),
-    };
-
-    let json: serde_json::Value = match serde_json::from_slice(&payload) {
-        Ok(value) => value,
-        Err(_) => return ChatGptIdTokenClaims::default(),
-    };
-
-    let profile_claims = json.get("https://api.openai.com/profile");
-    let auth_claims = json.get("https://api.openai.com/auth");
-
-    ChatGptIdTokenClaims {
-        email: json
-            .get("email")
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                profile_claims
-                    .and_then(|profile| profile.get("email"))
-                    .and_then(|v| v.as_str())
-            })
-            .map(String::from),
-        plan_type: auth_claims
-            .and_then(|auth| auth.get("chatgpt_plan_type"))
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        user_id: auth_claims
-            .and_then(|auth| auth.get("chatgpt_user_id").or_else(|| auth.get("user_id")))
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        account_id: auth_claims
-            .and_then(|auth| auth.get("chatgpt_account_id"))
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        account_is_fedramp: auth_claims
-            .and_then(|auth| auth.get("chatgpt_account_is_fedramp"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        subscription_expires_at: auth_claims
-            .and_then(|auth| auth.get("chatgpt_subscription_active_until"))
-            .and_then(|v| v.as_str())
-            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-            .map(|value| value.with_timezone(&Utc)),
+impl std::error::Error for ChatGptIdTokenParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidFormat => None,
+            Self::Base64(err) => Some(err),
+            Self::Json(err) => Some(err),
+        }
     }
+}
+
+impl From<base64::DecodeError> for ChatGptIdTokenParseError {
+    fn from(err: base64::DecodeError) -> Self {
+        Self::Base64(err)
+    }
+}
+
+impl From<serde_json::Error> for ChatGptIdTokenParseError {
+    fn from(err: serde_json::Error) -> Self {
+        Self::Json(err)
+    }
+}
+
+pub fn try_parse_chatgpt_id_token_claims(
+    id_token: &str,
+) -> Result<ChatGptIdTokenClaims, ChatGptIdTokenParseError> {
+    let mut parts = id_token.split('.');
+    let (_header_b64, payload_b64, _signature_b64) =
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some(header), Some(payload), Some(signature))
+                if !header.is_empty() && !payload.is_empty() && !signature.is_empty() =>
+            {
+                (header, payload, signature)
+            }
+            _ => return Err(ChatGptIdTokenParseError::InvalidFormat),
+        };
+
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload_b64)?;
+    let claims: ChatGptJwtClaims = serde_json::from_slice(&payload)?;
+
+    Ok(chatgpt_id_token_claims_from_jwt_claims(claims))
+}
+
+fn chatgpt_id_token_claims_from_jwt_claims(claims: ChatGptJwtClaims) -> ChatGptIdTokenClaims {
+    let email = claims
+        .email
+        .or_else(|| claims.profile.and_then(|profile| profile.email));
+
+    match claims.auth {
+        Some(auth) => ChatGptIdTokenClaims {
+            email,
+            plan_type: auth
+                .chatgpt_plan_type
+                .as_deref()
+                .map(normalize_chatgpt_auth_plan_type),
+            user_id: auth.chatgpt_user_id.or(auth.user_id),
+            account_id: auth.chatgpt_account_id,
+            account_is_fedramp: auth.chatgpt_account_is_fedramp,
+            subscription_expires_at: auth
+                .chatgpt_subscription_active_until
+                .as_ref()
+                .and_then(|value| value.as_str())
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&Utc)),
+        },
+        None => ChatGptIdTokenClaims {
+            email,
+            ..ChatGptIdTokenClaims::default()
+        },
+    }
+}
+
+fn normalize_chatgpt_auth_plan_type(value: &str) -> String {
+    match value {
+        "free" => "free",
+        "go" => "go",
+        "plus" => "plus",
+        "pro" => "pro",
+        "prolite" => "prolite",
+        "team" => "team",
+        "self_serve_business_usage_based" => "self_serve_business_usage_based",
+        "business" => "business",
+        "enterprise_cbp_usage_based" => "enterprise_cbp_usage_based",
+        "enterprise" | "hc" => "enterprise",
+        "education" | "edu" => "edu",
+        _ => return value.to_string(),
+    }
+    .to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthDotJson {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth_mode: Option<String>,
-    #[serde(rename = "OPENAI_API_KEY", skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<AuthJsonAuthMode>,
+    #[serde(rename = "OPENAI_API_KEY")]
     pub openai_api_key: Option<RedactedString>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens: Option<TokenData>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_refresh: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_identity: Option<RedactedString>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthJsonAuthMode {
+    #[serde(rename = "apikey")]
+    ApiKey,
+    #[serde(rename = "chatgpt")]
+    Chatgpt,
+    #[serde(rename = "chatgptAuthTokens")]
+    ChatgptAuthTokens,
+    #[serde(rename = "agentIdentity")]
+    AgentIdentity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenData {
+    #[serde(deserialize_with = "deserialize_id_token")]
     pub id_token: RedactedString,
     pub access_token: RedactedString,
     pub refresh_token: RedactedString,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
+}
+
+fn deserialize_id_token<'de, D>(deserializer: D) -> Result<RedactedString, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    try_parse_chatgpt_id_token_claims(&value).map_err(de::Error::custom)?;
+    Ok(RedactedString::new(value))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -421,46 +531,61 @@ pub struct CreditStatusDetails {
     pub balance: Option<Option<String>>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanType {
-    #[serde(rename = "guest")]
     Guest,
-    #[serde(rename = "free")]
     Free,
-    #[serde(rename = "go")]
     Go,
-    #[serde(rename = "plus")]
     Plus,
-    #[serde(rename = "pro")]
     Pro,
-    #[serde(rename = "prolite")]
     ProLite,
-    #[serde(rename = "free_workspace")]
     FreeWorkspace,
-    #[serde(rename = "team")]
     Team,
-    #[serde(rename = "self_serve_business_usage_based")]
     SelfServeBusinessUsageBased,
-    #[serde(rename = "business")]
     Business,
-    #[serde(rename = "enterprise_cbp_usage_based")]
     EnterpriseCbpUsageBased,
-    #[serde(rename = "education")]
     Education,
-    #[serde(rename = "quorum")]
     Quorum,
-    #[serde(rename = "k12")]
     K12,
-    #[serde(rename = "enterprise")]
     Enterprise,
-    #[serde(rename = "edu")]
     Edu,
-    #[serde(rename = "unknown", other)]
-    Unknown,
+    Unknown(String),
+}
+
+impl<'de> Deserialize<'de> for PlanType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(Self::from_raw_value(value))
+    }
 }
 
 impl PlanType {
-    pub fn as_str(self) -> &'static str {
+    fn from_raw_value(value: String) -> Self {
+        match value.as_str() {
+            "guest" => Self::Guest,
+            "free" => Self::Free,
+            "go" => Self::Go,
+            "plus" => Self::Plus,
+            "pro" => Self::Pro,
+            "prolite" => Self::ProLite,
+            "free_workspace" => Self::FreeWorkspace,
+            "team" => Self::Team,
+            "self_serve_business_usage_based" => Self::SelfServeBusinessUsageBased,
+            "business" => Self::Business,
+            "enterprise_cbp_usage_based" => Self::EnterpriseCbpUsageBased,
+            "education" => Self::Education,
+            "quorum" => Self::Quorum,
+            "k12" => Self::K12,
+            "enterprise" => Self::Enterprise,
+            "edu" => Self::Edu,
+            _ => Self::Unknown(value),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
         match self {
             Self::Guest => "guest",
             Self::Free => "free",
@@ -478,7 +603,7 @@ impl PlanType {
             Self::K12 => "k12",
             Self::Enterprise => "enterprise",
             Self::Edu => "edu",
-            Self::Unknown => "unknown",
+            Self::Unknown(value) => value,
         }
     }
 }
@@ -486,6 +611,7 @@ impl PlanType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
 
     #[test]
     fn redacted_string_debug_redacts_secret_but_json_preserves_value() {
@@ -543,9 +669,10 @@ mod tests {
     #[test]
     fn accounts_and_auth_json_keep_raw_secret_json_values() {
         let api_secret = "sk-json-compat-secret";
-        let id_secret = "id-token-json-compat-secret";
+        let id_secret = test_id_token();
         let access_secret = "access-token-json-compat-secret";
         let refresh_secret = "refresh-token-json-compat-secret";
+        let agent_identity_secret = "agent-identity-json-compat-secret";
 
         let api_account = StoredAccount::new_api_key("api".to_string(), api_secret.to_string());
         let chatgpt_account = StoredAccount::new_chatgpt(NewChatGptAccount {
@@ -556,7 +683,7 @@ mod tests {
             chatgpt_account_is_fedramp: false,
             token_last_refresh_at: Utc::now(),
             subscription_expires_at: None,
-            id_token: id_secret.into(),
+            id_token: id_secret.clone().into(),
             access_token: access_secret.into(),
             refresh_token: refresh_secret.into(),
             account_id: Some("account-id".to_string()),
@@ -567,21 +694,28 @@ mod tests {
             masked_account_ids: Vec::new(),
         };
         let auth_json = AuthDotJson {
-            auth_mode: Some("chatgpt".to_string()),
+            auth_mode: Some(AuthJsonAuthMode::Chatgpt),
             openai_api_key: Some(api_secret.into()),
             tokens: Some(TokenData {
-                id_token: id_secret.into(),
+                id_token: id_secret.clone().into(),
                 access_token: access_secret.into(),
                 refresh_token: refresh_secret.into(),
                 account_id: Some("account-id".to_string()),
             }),
             last_refresh: None,
+            agent_identity: Some(agent_identity_secret.into()),
         };
         let auth_debug = format!(
             "{auth_json:?} {:?}",
             auth_json.tokens.as_ref().expect("tokens")
         );
-        for secret in [api_secret, id_secret, access_secret, refresh_secret] {
+        for secret in [
+            api_secret,
+            id_secret.as_str(),
+            access_secret,
+            refresh_secret,
+            agent_identity_secret,
+        ] {
             assert!(
                 !auth_debug.contains(secret),
                 "auth debug output leaked {secret}"
@@ -591,8 +725,21 @@ mod tests {
 
         let store_json = serde_json::to_string(&store).expect("serialize accounts store");
         let auth_file_json = serde_json::to_string(&auth_json).expect("serialize auth json");
-        for secret in [api_secret, id_secret, access_secret, refresh_secret] {
+        for secret in [
+            api_secret,
+            id_secret.as_str(),
+            access_secret,
+            refresh_secret,
+        ] {
             assert!(store_json.contains(secret), "accounts json lost {secret}");
+        }
+        for secret in [
+            api_secret,
+            id_secret.as_str(),
+            access_secret,
+            refresh_secret,
+            agent_identity_secret,
+        ] {
             assert!(auth_file_json.contains(secret), "auth json lost {secret}");
         }
 
@@ -609,6 +756,13 @@ mod tests {
         assert_eq!(decoded_tokens.id_token.expose_secret(), id_secret);
         assert_eq!(decoded_tokens.access_token.expose_secret(), access_secret);
         assert_eq!(decoded_tokens.refresh_token.expose_secret(), refresh_secret);
+        assert_eq!(
+            decoded_auth
+                .agent_identity
+                .as_ref()
+                .map(RedactedString::expose_secret),
+            Some(agent_identity_secret)
+        );
     }
 
     #[test]
@@ -631,5 +785,97 @@ mod tests {
 
         assert!(store.accounts.is_empty());
         assert!(store.masked_account_ids.is_empty());
+    }
+
+    #[test]
+    fn usage_plan_type_preserves_unknown_raw_value() {
+        let plan: PlanType =
+            serde_json::from_str(r#""future_plan""#).expect("plan should deserialize");
+
+        assert_eq!(plan.as_str(), "future_plan");
+    }
+
+    #[test]
+    fn id_token_plan_type_normalizes_codex_auth_aliases() {
+        let enterprise = try_parse_chatgpt_id_token_claims(&test_id_token_with_plan("hc"))
+            .expect("enterprise alias should parse");
+        let edu = try_parse_chatgpt_id_token_claims(&test_id_token_with_plan("education"))
+            .expect("education alias should parse");
+
+        assert_eq!(enterprise.plan_type.as_deref(), Some("enterprise"));
+        assert_eq!(edu.plan_type.as_deref(), Some("edu"));
+    }
+
+    #[test]
+    fn id_token_plan_type_preserves_unknown_raw_value() {
+        let claims = try_parse_chatgpt_id_token_claims(&test_id_token_with_plan("Pro"))
+            .expect("unknown plan casing should still parse");
+
+        assert_eq!(claims.plan_type.as_deref(), Some("Pro"));
+    }
+
+    #[test]
+    fn id_token_ignores_invalid_subscription_expiry_type() {
+        let payload = serde_json::json!({
+            "email": "user@example.com",
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "account-id",
+                "chatgpt_plan_type": "pro",
+                "chatgpt_user_id": "user-id",
+                "chatgpt_account_is_fedramp": false,
+                "chatgpt_subscription_active_until": 123
+            }
+        });
+
+        let claims = try_parse_chatgpt_id_token_claims(&test_id_token_with_payload(payload))
+            .expect("non-Codex subscription expiry type should not reject the token");
+
+        assert_eq!(claims.subscription_expires_at, None);
+    }
+
+    #[test]
+    fn id_token_claims_reject_invalid_claim_types() {
+        let payload = serde_json::json!({
+            "email": "user@example.com",
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "account-id",
+                "chatgpt_plan_type": "pro",
+                "chatgpt_user_id": "user-id",
+                "chatgpt_account_is_fedramp": "false"
+            }
+        });
+
+        let err = try_parse_chatgpt_id_token_claims(&test_id_token_with_payload(payload))
+            .expect_err("invalid claim type should be rejected");
+
+        assert!(err.to_string().contains("invalid ID token payload JSON"));
+    }
+
+    fn test_id_token() -> String {
+        test_id_token_with_plan("pro")
+    }
+
+    fn test_id_token_with_plan(plan_type: &str) -> String {
+        test_id_token_with_payload(serde_json::json!({
+            "email": "user@example.com",
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "account-id",
+                "chatgpt_plan_type": plan_type,
+                "chatgpt_user_id": "user-id",
+                "chatgpt_account_is_fedramp": false
+            }
+        }))
+    }
+
+    fn test_id_token_with_payload(payload: serde_json::Value) -> String {
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let payload_json = serde_json::to_vec(&payload).expect("test payload should serialize");
+
+        format!(
+            "{}.{}.{}",
+            encode(br#"{"alg":"none","typ":"JWT"}"#),
+            encode(&payload_json),
+            encode(b"sig")
+        )
     }
 }
