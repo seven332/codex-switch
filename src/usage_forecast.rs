@@ -769,7 +769,8 @@ impl ForecastLimit {
 mod tests {
     use super::{
         ForecastLimit, POLICY_REEVALUATION_SECONDS, UsageForecastOutcome, UsageForecastRates,
-        build_forecast, forecast_all_usage, initial_account_index, next_event_time,
+        build_forecast, charge_account, forecast_all_usage, initial_account_index, next_event_time,
+        select_account_index,
     };
     use crate::types::{AuthData, RedactedString, StoredAccount, UsageInfo, UsageLimitInfo};
     use chrono::Utc;
@@ -1386,6 +1387,70 @@ mod tests {
         .expect("next event");
 
         assert_eq!(next, next_policy_reevaluation);
+    }
+
+    #[test]
+    fn exhausted_five_hour_window_stops_account_from_weekly_charges() {
+        let accounts = vec![chatgpt_account("current"), chatgpt_account("replacement")];
+        let usage_by_id = HashMap::from([
+            (
+                accounts[0].id.clone(),
+                usage_info(&accounts[0].id, 99.0, 10.0, 240, 9_000),
+            ),
+            (
+                accounts[1].id.clone(),
+                usage_info(&accounts[1].id, 10.0, 10.0, 240, 9_000),
+            ),
+        ]);
+        let mut forecast = build_forecast(&accounts, &usage_by_id, NOW).expect("forecast input");
+        let rates = forecast.rates.expect("forecast rates");
+        let selected = initial_account_index(&forecast.accounts, Some("current"), NOW)
+            .expect("initial account");
+        assert_eq!(forecast.accounts[selected].account.id, "current");
+
+        let next = next_event_time(
+            &forecast.accounts,
+            selected,
+            rates,
+            NOW,
+            NOW + POLICY_REEVALUATION_SECONDS,
+        )
+        .expect("next event");
+        let weekly_before = forecast.accounts[selected].weekly.used_percent;
+
+        charge_account(&mut forecast.accounts[selected], &rates, next - NOW);
+        let weekly_after_exhaustion = forecast.accounts[selected].weekly.used_percent;
+
+        assert_eq!(forecast.accounts[selected].five_hour.used_percent, 100.0);
+        assert!(weekly_after_exhaustion > weekly_before);
+        assert!(!forecast.accounts[selected].is_usable_at(next));
+        let replacement = select_account_index(
+            &forecast.accounts,
+            Some(forecast.accounts[selected].account.id.as_str()),
+            next,
+        )
+        .expect("replacement account");
+        assert_eq!(forecast.accounts[replacement].account.id, "replacement");
+        let replacement_weekly_before = forecast.accounts[replacement].weekly.used_percent;
+
+        let replacement_next = next_event_time(
+            &forecast.accounts,
+            replacement,
+            rates,
+            next,
+            next + POLICY_REEVALUATION_SECONDS,
+        )
+        .expect("replacement next event");
+        charge_account(
+            &mut forecast.accounts[replacement],
+            &rates,
+            replacement_next - next,
+        );
+        assert!(forecast.accounts[replacement].weekly.used_percent > replacement_weekly_before);
+        assert_eq!(
+            forecast.accounts[selected].weekly.used_percent,
+            weekly_after_exhaustion
+        );
     }
 
     fn chatgpt_account(id: &str) -> StoredAccount {
