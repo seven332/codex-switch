@@ -73,7 +73,7 @@ Use `codex-switch login <name> --replace` to re-login an existing stored ChatGPT
 
 ## Import
 
-`import` reads an existing Codex `auth.json`. When `--file` is omitted, it imports from the current Codex auth file: `$CODEX_HOME/auth.json` when `CODEX_HOME` is set, otherwise `~/.codex/auth.json`.
+`import` reads an existing Codex `auth.json`. When `--file` is omitted, it imports from the current Codex auth file: `$CODEX_HOME/auth.json` when `CODEX_HOME` is set, otherwise `~/.codex/auth.json`. API key and regular ChatGPT OAuth auth files are supported. Agent identity auth files and externally managed `chatgptAuthTokens` files are not supported because codex-switch cannot refresh or switch those credentials safely.
 
 `login` and `import` reject accounts that match an already stored auth identity. `login --replace` allows replacing the target account's own auth identity, but still rejects an identity that belongs to another stored account.
 
