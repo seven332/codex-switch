@@ -1,6 +1,30 @@
 # codex-switch
 
-Local CLI account switcher for Codex.
+Multi-account runtime switcher for Codex.
+
+`codex-switch` lets you keep several ChatGPT Codex accounts on one machine and run Codex through a small local proxy. When the current account hits a usage limit, managed sessions try to hot-load another ChatGPT OAuth account with usable quota. If a replacement is available, the next turn can use it without manually editing `auth.json` or restarting Codex.
+
+The main workflow is:
+
+```sh
+codex-switch login personal
+codex-switch login work
+codex-switch usage --all
+codex-switch run -- resume
+```
+
+Use `codex-switch run` anywhere you would normally start an interactive Codex session. Codex arguments must be passed after `--`, so `codex-switch run -- resume` starts `codex resume` with runtime account switching enabled.
+
+## Highlights
+
+- Store and manage multiple Codex accounts locally.
+- Login with ChatGPT/OpenAI OAuth, including browser login and device authorization.
+- Import and export Codex-compatible `auth.json` files.
+- Switch the active Codex account safely when unmanaged Codex processes are not running.
+- Run Codex with runtime auto-switching for ChatGPT OAuth accounts.
+- Show 5-hour, weekly, credit balance when returned, and optional additional usage limits across accounts.
+- Prefer accounts with usable quota and avoid accounts that are out of credits, rate-limited, or usage-limited.
+- Keep secrets local under `~/.codex-switch` and write Codex auth files with private Unix permissions.
 
 ## Install
 
@@ -23,12 +47,22 @@ codex-switch import <name> [--file <path>]
 codex-switch export <name-or-id> [--file <path>] [--force]
 codex-switch switch <name-or-id>
 codex-switch auto-switch
+codex-switch run [--codex-bin <path>]
 codex-switch run [--codex-bin <path>] -- [CODEX_ARGS]...
 codex-switch update [--check] [--version <version>]
 codex-switch usage [--show-additional] [name-or-id]
 codex-switch usage --all [--show-additional]
 codex-switch delete <name-or-id>
 codex-switch rename <name-or-id> <new-name>
+```
+
+Most users only need these commands day to day:
+
+```sh
+codex-switch login <name>
+codex-switch usage --all
+codex-switch run -- resume
+codex-switch switch <name-or-id>
 ```
 
 ## Storage
@@ -48,7 +82,16 @@ On Unix, both files are written with `0600` permissions.
 
 `auto-switch` also refuses to switch while Codex is running. When Codex is not running, it checks stored ChatGPT OAuth accounts and switches to the account selected by the quota-aware policy. Accounts that are out of credits, rate-limited, usage-limited, or at 100% usage are not selectable. API key accounts are not usage-checkable and are skipped as replacement candidates.
 
-`run` is the runtime auto-switching entrypoint. It checks accounts before startup, starts `codex app-server`, launches Codex as a remote TUI through a local websocket proxy, and passes arguments after `--` to `codex`. During the managed session, the proxy watches Codex app-server `account/rateLimits/updated` notifications and usage-limit errors. It also performs best-effort background auto-switch checks every 15-45 minutes. Hard usage-limit signals trigger an immediate recovery attempt. Non-hard rate-limit updates only schedule a background re-check when the current Codex auth account is near the shared 5% bottleneck headroom threshold, so normal updates do not block the TUI on usage API calls. If another shell runs `codex-switch switch <name-or-id>`, managed `run` sessions detect the current Codex auth account change and hot-load it when the selected account is ChatGPT OAuth.
+`run` is the runtime auto-switching entrypoint. It checks accounts before startup, starts `codex app-server`, launches Codex as a remote TUI through a local websocket proxy, and passes arguments after `--` to `codex`.
+
+During a managed session, codex-switch can switch the running Codex app-server to another ChatGPT OAuth account without restarting the TUI:
+
+- Usage-limit errors trigger an immediate recovery attempt.
+- Codex app-server `account/rateLimits/updated` notifications trigger immediate recovery for hard limit states, or a background re-check when the current account is near the shared 5% bottleneck headroom threshold.
+- Best-effort background auto-switch checks run every 15-45 minutes.
+- `codex-switch switch <name-or-id>` from another shell is hot-loaded by managed `run` sessions when the selected account is ChatGPT OAuth.
+
+Normal rate-limit updates do not block the TUI on usage API calls.
 
 `run` writes diagnostics to a per-process log file under `~/.codex-switch/logs/`. Before handing the terminal to Codex, startup diagnostics are also written to stderr using the default tracing format, including timestamp, level, target, and the log path, so startup hangs can be traced to initial auto-switch, app-server startup, proxy binding, or remote TUI spawn. After Codex TUI starts, codex-switch background diagnostics only go to the log file so they do not corrupt the TUI. Set `CODEX_SWITCH_LOG` to a level such as `off` or `debug`, or to a full tracing filter, to control this output.
 
