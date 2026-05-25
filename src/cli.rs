@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(name = "codex-switch")]
-#[command(about = "Local Codex account switcher")]
+#[command(about = "Multi-account runtime switcher for Codex")]
 #[command(version)]
 pub struct Cli {
     #[command(subcommand)]
@@ -57,8 +57,8 @@ pub enum Command {
         /// Codex executable to launch.
         #[arg(long, default_value = "codex")]
         codex_bin: String,
-        /// Arguments forwarded to `codex`.
-        #[arg(value_name = "CODEX_ARGS", num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true)]
+        /// Arguments forwarded to `codex`. Must be passed after `--`.
+        #[arg(value_name = "CODEX_ARGS", num_args = 0.., last = true, allow_hyphen_values = true)]
         codex_args: Vec<String>,
     },
     /// Update codex-switch from GitHub Releases.
@@ -93,4 +93,67 @@ pub enum Command {
         /// New account display name.
         new_name: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command};
+    use clap::Parser;
+
+    #[test]
+    fn run_args_require_double_dash_separator() {
+        let err = Cli::try_parse_from(["codex-switch", "run", "resume"])
+            .expect_err("run arguments should require --");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn run_without_forwarded_args_is_allowed() {
+        let cli =
+            Cli::try_parse_from(["codex-switch", "run"]).expect("run without args should parse");
+
+        let Command::Run { codex_args, .. } = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert!(codex_args.is_empty());
+    }
+
+    #[test]
+    fn run_args_after_double_dash_are_forwarded() {
+        let cli = Cli::try_parse_from([
+            "codex-switch",
+            "run",
+            "--codex-bin",
+            "/usr/local/bin/codex",
+            "--",
+            "resume",
+            "--last",
+        ])
+        .expect("run arguments after -- should parse");
+
+        let Command::Run {
+            codex_bin,
+            codex_args,
+        } = cli.command
+        else {
+            panic!("expected run command");
+        };
+
+        assert_eq!(codex_bin, "/usr/local/bin/codex");
+        assert_eq!(codex_args, ["resume", "--last"]);
+    }
+
+    #[test]
+    fn run_args_after_double_dash_may_start_with_hyphen() {
+        let cli = Cli::try_parse_from(["codex-switch", "run", "--", "--model", "gpt-5"])
+            .expect("hyphen-prefixed run arguments after -- should parse");
+
+        let Command::Run { codex_args, .. } = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert_eq!(codex_args, ["--model", "gpt-5"]);
+    }
 }
