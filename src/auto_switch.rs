@@ -1,3 +1,5 @@
+use std::fmt;
+
 use anyhow::Result;
 
 use crate::account_selector::{self, AccountUsageCandidate, SelectionConfig, SelectionContext};
@@ -9,6 +11,29 @@ use crate::types::{StoredAccount, UsageInfo, UsageLimitInfo};
 use crate::usage;
 
 const HARD_USAGE_LIMIT_PERCENT: f64 = 100.0;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NoUsableReplacement {
+    reason: String,
+}
+
+impl NoUsableReplacement {
+    pub(crate) fn new(reason: String) -> Self {
+        Self { reason }
+    }
+
+    pub(crate) fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl fmt::Display for NoUsableReplacement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for NoUsableReplacement {}
 
 #[derive(Debug)]
 pub enum AutoSwitchResult {
@@ -186,22 +211,7 @@ async fn plan_auto_switch(write_current_auth_on_refresh: bool) -> Result<AutoSwi
         });
     }
 
-    let mut switch_reason = match current_decision {
-        Some(UsageDecision::Unavailable(reason)) => reason,
-        Some(UsageDecision::Usable(_)) => {
-            "current account is usable, but usage policy found no selectable account".to_string()
-        }
-        Some(UsageDecision::Unsupported(reason) | UsageDecision::Error(reason)) => reason,
-        None => "no current account".to_string(),
-    };
-
-    if let Some(detail) = skipped.first() {
-        switch_reason.push_str(&format!("; no usable replacement found ({detail})"));
-    } else {
-        switch_reason.push_str("; no replacement account found");
-    }
-
-    anyhow::bail!("{switch_reason}");
+    Err(no_selectable_account_error(current_decision, &skipped))
 }
 
 async fn get_account_usage_for_plan(
@@ -353,6 +363,33 @@ struct AccountUsageEvaluation {
     decision: UsageDecision,
 }
 
+fn no_selectable_account_error(
+    current_decision: Option<UsageDecision>,
+    skipped: &[String],
+) -> anyhow::Error {
+    let current_is_unavailable = matches!(current_decision, Some(UsageDecision::Unavailable(_)));
+    let mut switch_reason = match current_decision {
+        Some(UsageDecision::Unavailable(reason)) => reason,
+        Some(UsageDecision::Usable(_)) => {
+            "current account is usable, but usage policy found no selectable account".to_string()
+        }
+        Some(UsageDecision::Unsupported(reason) | UsageDecision::Error(reason)) => reason,
+        None => "no current account".to_string(),
+    };
+
+    if let Some(detail) = skipped.first() {
+        switch_reason.push_str(&format!("; no usable replacement found ({detail})"));
+    } else {
+        switch_reason.push_str("; no replacement account found");
+    }
+
+    if current_is_unavailable {
+        NoUsableReplacement::new(switch_reason).into()
+    } else {
+        anyhow::anyhow!(switch_reason)
+    }
+}
+
 fn assess_usage(info: &UsageInfo) -> UsageDecision {
     if matches!(info.error.as_deref(), Some("usage unsupported")) {
         return UsageDecision::Unsupported("usage unsupported".to_string());
@@ -439,9 +476,10 @@ mod tests {
     use chrono::Utc;
 
     use super::{
-        AccountUsageEvaluation, AutoSwitchPlan, CurrentUsageOutcome, UsageDecision,
-        apply_current_usage_result, apply_replacement_usage_results, assess_usage,
-        empty_evaluation_slots, ordered_evaluations, select_usable_account_by_policy,
+        AccountUsageEvaluation, AutoSwitchPlan, CurrentUsageOutcome, NoUsableReplacement,
+        UsageDecision, apply_current_usage_result, apply_replacement_usage_results, assess_usage,
+        empty_evaluation_slots, no_selectable_account_error, ordered_evaluations,
+        select_usable_account_by_policy,
     };
     use crate::types::{AuthData, AuthMode, StoredAccount, UsageInfo};
     use crate::usage::AccountUsageFetch;
@@ -498,6 +536,36 @@ mod tests {
         assert_eq!(
             assess_usage(&info),
             UsageDecision::Usable("usage is available".to_string())
+        );
+    }
+
+    #[test]
+    fn no_selectable_account_error_is_typed_for_unavailable_current() {
+        let err = no_selectable_account_error(
+            Some(UsageDecision::Unavailable(
+                "weekly usage is 100.0%".to_string(),
+            )),
+            &["two332: weekly usage is 100.0%".to_string()],
+        );
+
+        let no_replacement = err
+            .downcast_ref::<NoUsableReplacement>()
+            .expect("unavailable current account should produce a typed replacement error");
+        assert_eq!(
+            no_replacement.reason(),
+            "weekly usage is 100.0%; no usable replacement found (two332: weekly usage is 100.0%)"
+        );
+        assert_eq!(err.to_string(), no_replacement.reason());
+    }
+
+    #[test]
+    fn no_selectable_account_error_is_plain_for_missing_current() {
+        let err = no_selectable_account_error(None, &[]);
+
+        assert!(err.downcast_ref::<NoUsableReplacement>().is_none());
+        assert_eq!(
+            err.to_string(),
+            "no current account; no replacement account found"
         );
     }
 
