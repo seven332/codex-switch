@@ -84,6 +84,8 @@ On Unix, both files are written with `0600` permissions.
 
 `run` is the runtime auto-switching entrypoint. It checks accounts before startup, starts `codex app-server`, launches Codex as a remote TUI through a local websocket proxy, and passes arguments after `--` to `codex`.
 
+If the startup check finds that the current account is usage-limited but no usable replacement account exists, `run` continues with the current Codex auth instead of blocking startup.
+
 During a managed session, codex-switch can switch the running Codex app-server to another ChatGPT OAuth account without restarting the TUI:
 
 - Usage-limit errors trigger an immediate recovery attempt.

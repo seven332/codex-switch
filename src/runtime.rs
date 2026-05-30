@@ -204,17 +204,25 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
                 format_elapsed(stage_start.elapsed()),
                 format_auto_switch_result_for_log(&initial)
             ));
-            initial
+            Some(initial)
         }
         Err(err) => {
-            startup_log(format_args!(
-                "initial auto-switch: failed in {}: {err:#}",
-                format_elapsed(stage_start.elapsed())
-            ));
-            return Err(err).context("Initial account auto-switch failed");
+            if let Some(reason) = initial_auto_switch_nonfatal_reason(&err) {
+                startup_log(format_args!(
+                    "initial auto-switch: no usable replacement in {}; continuing without switch: {reason}",
+                    format_elapsed(stage_start.elapsed())
+                ));
+                None
+            } else {
+                startup_log(format_args!(
+                    "initial auto-switch: failed in {}: {err:#}",
+                    format_elapsed(stage_start.elapsed())
+                ));
+                return Err(err).context("Initial account auto-switch failed");
+            }
         }
     };
-    if let AutoSwitchResult::CurrentUnsupported { reason, .. } = initial {
+    if let Some(AutoSwitchResult::CurrentUnsupported { reason, .. }) = initial {
         startup_log(format_args!(
             "initial auto-switch: current account unsupported: {reason}"
         ));
@@ -495,6 +503,11 @@ fn format_auto_switch_result_for_log(result: &AutoSwitchResult) -> String {
             }
         }
     }
+}
+
+fn initial_auto_switch_nonfatal_reason(err: &anyhow::Error) -> Option<&str> {
+    err.downcast_ref::<auto_switch::NoUsableReplacement>()
+        .map(auto_switch::NoUsableReplacement::reason)
 }
 
 fn validate_remote_capable_codex_args(args: &[String]) -> Result<()> {
@@ -3023,12 +3036,12 @@ mod tests {
         current_account_has_newer_access_token, current_account_snapshot_for_account,
         duration_until_utc, external_auth_payload_from_fresh_account,
         finish_background_auto_switch, format_codex_args_summary_for_log, has_cwd_arg,
-        initialize_app_server_request, prewarm_snapshot_for_matching_auth,
-        queue_background_auto_switch, queue_hard_auto_switch, random_duration_between,
-        redact_runtime_log_message, runtime_chatgpt_account_matches, sanitize_startup_log_message,
-        select_current_kept_login_account, shared_runtime_auto_switch_coordinator,
-        token_prewarm_attempt_result_for_login_result, token_prewarm_decision,
-        token_prewarm_is_suppressed, try_send_background_runtime_command,
+        initial_auto_switch_nonfatal_reason, initialize_app_server_request,
+        prewarm_snapshot_for_matching_auth, queue_background_auto_switch, queue_hard_auto_switch,
+        random_duration_between, redact_runtime_log_message, runtime_chatgpt_account_matches,
+        sanitize_startup_log_message, select_current_kept_login_account,
+        shared_runtime_auto_switch_coordinator, token_prewarm_attempt_result_for_login_result,
+        token_prewarm_decision, token_prewarm_is_suppressed, try_send_background_runtime_command,
         usage_limit_error_requires_switch, validate_remote_capable_codex_args,
     };
     use crate::types::{AuthData, NewChatGptAccount, StoredAccount};
@@ -3069,6 +3082,25 @@ mod tests {
             sanitize_startup_log_message("before\n\u{1b}[31mafter\tend"),
             "before??[31mafter?end"
         );
+    }
+
+    #[test]
+    fn initial_auto_switch_no_usable_replacement_is_nonfatal() {
+        let err = anyhow::Error::new(crate::auto_switch::NoUsableReplacement::new(
+            "rate limit reached".to_string(),
+        ));
+
+        assert_eq!(
+            initial_auto_switch_nonfatal_reason(&err),
+            Some("rate limit reached")
+        );
+    }
+
+    #[test]
+    fn initial_auto_switch_other_errors_remain_fatal() {
+        let err = anyhow::anyhow!("network failed");
+
+        assert_eq!(initial_auto_switch_nonfatal_reason(&err), None);
     }
 
     #[test]
