@@ -686,7 +686,7 @@ fn select_account_with_context_treats_explicit_none_as_no_current_account() {
 }
 
 #[test]
-fn deadline_aware_ignores_current_account_context_for_now() {
+fn deadline_aware_ignores_non_cold_current_account_context() {
     let current = chatgpt_account("current", None);
     let soon_reset = chatgpt_account("soon-reset", None);
     let current_info = usage_info("current", 20.0, 20.0, 500, 1_000);
@@ -701,6 +701,312 @@ fn deadline_aware_ignores_current_account_context_for_now() {
         .expect("usable account should be selected");
 
     assert_eq!(selection.account.id, "soon-reset");
+}
+
+#[test]
+fn deadline_aware_keeps_current_cold_account_for_first_real_usage() {
+    let current = chatgpt_account("current", None);
+    let used = chatgpt_account("used", None);
+    let current_info = usage_info("current", 0.0, 0.0, 18_000, 604_800);
+    let used_info = usage_info("used", 20.0, 20.0, 300, 604_800);
+    let candidates = [
+        candidate(&used, &used_info),
+        candidate(&current, &current_info),
+    ];
+    let context = SelectionContext::at(0).with_current_account_id(Some("current"));
+
+    let selection = select_account_with_context(&candidates, SelectionConfig::default(), context)
+        .expect("usable account should be selected");
+
+    assert_eq!(selection.account.id, "current");
+}
+
+#[test]
+fn deadline_aware_waits_to_activate_cold_account_until_stagger_interval() {
+    let last_used_at = Utc.with_ymd_and_hms(2026, 5, 10, 0, 0, 0).unwrap();
+    let active = chatgpt_account("active", Some(last_used_at));
+    let cold = chatgpt_account("cold", None);
+    let context_now = last_used_at.timestamp() + (FIVE_HOUR_WINDOW_MINUTES * 60 / 2) - 1;
+    let active_info = usage_info(
+        "active",
+        20.0,
+        20.0,
+        last_used_at.timestamp() + FIVE_HOUR_WINDOW_MINUTES * 60,
+        last_used_at.timestamp() + WEEKLY_WINDOW_MINUTES * 60,
+    );
+    let cold_info = usage_info(
+        "cold",
+        0.0,
+        0.0,
+        context_now + FIVE_HOUR_WINDOW_MINUTES * 60,
+        context_now + WEEKLY_WINDOW_MINUTES * 60,
+    );
+    let candidates = [
+        candidate(&active, &active_info),
+        candidate(&cold, &cold_info),
+    ];
+
+    let selection = select_account_with_context(
+        &candidates,
+        SelectionConfig::default(),
+        SelectionContext::at(context_now).with_current_account_id(Some("active")),
+    )
+    .expect("usable account should be selected");
+
+    assert_eq!(selection.account.id, "active");
+}
+
+#[test]
+fn deadline_aware_activates_due_cold_account() {
+    let last_used_at = Utc.with_ymd_and_hms(2026, 5, 10, 0, 0, 0).unwrap();
+    let active = chatgpt_account("active", Some(last_used_at));
+    let cold = chatgpt_account("cold", None);
+    let context_now = last_used_at.timestamp() + (FIVE_HOUR_WINDOW_MINUTES * 60 / 2);
+    let active_info = usage_info(
+        "active",
+        20.0,
+        20.0,
+        last_used_at.timestamp() + FIVE_HOUR_WINDOW_MINUTES * 60,
+        last_used_at.timestamp() + WEEKLY_WINDOW_MINUTES * 60,
+    );
+    let cold_info = usage_info(
+        "cold",
+        0.0,
+        0.0,
+        context_now + FIVE_HOUR_WINDOW_MINUTES * 60,
+        context_now + WEEKLY_WINDOW_MINUTES * 60,
+    );
+    let candidates = [
+        candidate(&active, &active_info),
+        candidate(&cold, &cold_info),
+    ];
+
+    let selection = select_account_with_context(
+        &candidates,
+        SelectionConfig::default(),
+        SelectionContext::at(context_now).with_current_account_id(Some("active")),
+    )
+    .expect("usable account should be selected");
+
+    assert_eq!(selection.account.id, "cold");
+}
+
+#[test]
+fn deadline_aware_uses_usage_reset_to_stagger_cold_activation_without_last_used_at() {
+    let active = chatgpt_account("active", None);
+    let cold = chatgpt_account("cold", None);
+    let first_usage_at = Utc
+        .with_ymd_and_hms(2026, 5, 10, 0, 0, 0)
+        .unwrap()
+        .timestamp();
+    let before_interval = first_usage_at + (FIVE_HOUR_WINDOW_MINUTES * 60 / 2) - 1;
+    let after_interval = first_usage_at + (FIVE_HOUR_WINDOW_MINUTES * 60 / 2);
+    let active_info = usage_info(
+        "active",
+        20.0,
+        20.0,
+        first_usage_at + FIVE_HOUR_WINDOW_MINUTES * 60,
+        first_usage_at + WEEKLY_WINDOW_MINUTES * 60,
+    );
+    let before_cold_info = usage_info(
+        "cold",
+        0.0,
+        0.0,
+        before_interval + FIVE_HOUR_WINDOW_MINUTES * 60,
+        before_interval + WEEKLY_WINDOW_MINUTES * 60,
+    );
+    let after_cold_info = usage_info(
+        "cold",
+        0.0,
+        0.0,
+        after_interval + FIVE_HOUR_WINDOW_MINUTES * 60,
+        after_interval + WEEKLY_WINDOW_MINUTES * 60,
+    );
+
+    let before_candidates = [
+        candidate(&active, &active_info),
+        candidate(&cold, &before_cold_info),
+    ];
+    let before_selection = select_account_with_context(
+        &before_candidates,
+        SelectionConfig::default(),
+        SelectionContext::at(before_interval).with_current_account_id(Some("active")),
+    )
+    .expect("usable account should be selected");
+    assert_eq!(before_selection.account.id, "active");
+
+    let after_candidates = [
+        candidate(&active, &active_info),
+        candidate(&cold, &after_cold_info),
+    ];
+    let after_selection = select_account_with_context(
+        &after_candidates,
+        SelectionConfig::default(),
+        SelectionContext::at(after_interval).with_current_account_id(Some("active")),
+    )
+    .expect("usable account should be selected");
+    assert_eq!(after_selection.account.id, "cold");
+}
+
+#[test]
+fn deadline_aware_does_not_activate_cold_account_on_reset_tie_before_interval() {
+    let active = chatgpt_account("active", None);
+    let cold = chatgpt_account("cold", None);
+    let first_usage_at = Utc
+        .with_ymd_and_hms(2026, 5, 10, 0, 0, 0)
+        .unwrap()
+        .timestamp();
+    let active_info = usage_info(
+        "active",
+        20.0,
+        20.0,
+        first_usage_at + FIVE_HOUR_WINDOW_MINUTES * 60,
+        first_usage_at + WEEKLY_WINDOW_MINUTES * 60,
+    );
+    let cold_info = usage_info(
+        "cold",
+        0.0,
+        0.0,
+        first_usage_at + FIVE_HOUR_WINDOW_MINUTES * 60,
+        first_usage_at + WEEKLY_WINDOW_MINUTES * 60,
+    );
+    let candidates = [
+        candidate(&active, &active_info),
+        candidate(&cold, &cold_info),
+    ];
+
+    let selection = select_account_with_context(
+        &candidates,
+        SelectionConfig::default(),
+        SelectionContext::at(first_usage_at).with_current_account_id(Some("active")),
+    )
+    .expect("usable account should be selected");
+
+    assert_eq!(selection.account.id, "active");
+}
+
+#[test]
+fn deadline_aware_allows_cold_account_before_interval_when_non_cold_is_unsafe() {
+    let active = chatgpt_account("active", None);
+    let cold = chatgpt_account("cold", None);
+    let first_usage_at = Utc
+        .with_ymd_and_hms(2026, 5, 10, 0, 0, 0)
+        .unwrap()
+        .timestamp();
+    let active_info = usage_info(
+        "active",
+        98.0,
+        20.0,
+        first_usage_at + 60,
+        first_usage_at + WEEKLY_WINDOW_MINUTES * 60,
+    );
+    let cold_info = usage_info(
+        "cold",
+        0.0,
+        0.0,
+        first_usage_at + FIVE_HOUR_WINDOW_MINUTES * 60,
+        first_usage_at + WEEKLY_WINDOW_MINUTES * 60,
+    );
+    let candidates = [
+        candidate(&active, &active_info),
+        candidate(&cold, &cold_info),
+    ];
+
+    let selection = select_account_with_context(
+        &candidates,
+        SelectionConfig::default(),
+        SelectionContext::at(first_usage_at).with_current_account_id(Some("active")),
+    )
+    .expect("usable account should be selected");
+
+    assert_eq!(selection.account.id, "cold");
+}
+
+#[test]
+fn cold_last_used_at_does_not_delay_activation_without_real_usage() {
+    let active = chatgpt_account("active", None);
+    let cold_recently_switched = chatgpt_account(
+        "cold-recently-switched",
+        Some(Utc.with_ymd_and_hms(2026, 5, 10, 1, 0, 0).unwrap()),
+    );
+    let cold_never_used = chatgpt_account("cold-never-used", None);
+    let first_usage_at = Utc
+        .with_ymd_and_hms(2026, 5, 10, 0, 0, 0)
+        .unwrap()
+        .timestamp();
+    let activation_time = first_usage_at + (FIVE_HOUR_WINDOW_MINUTES * 60 / 3);
+    let active_info = usage_info(
+        "active",
+        20.0,
+        20.0,
+        first_usage_at + FIVE_HOUR_WINDOW_MINUTES * 60,
+        first_usage_at + WEEKLY_WINDOW_MINUTES * 60,
+    );
+    let cold_recently_switched_info = usage_info(
+        "cold-recently-switched",
+        0.0,
+        0.0,
+        activation_time + FIVE_HOUR_WINDOW_MINUTES * 60,
+        activation_time + WEEKLY_WINDOW_MINUTES * 60,
+    );
+    let cold_never_used_info = usage_info(
+        "cold-never-used",
+        0.0,
+        0.0,
+        activation_time + FIVE_HOUR_WINDOW_MINUTES * 60,
+        activation_time + WEEKLY_WINDOW_MINUTES * 60,
+    );
+    let candidates = [
+        candidate(&active, &active_info),
+        candidate(&cold_recently_switched, &cold_recently_switched_info),
+        candidate(&cold_never_used, &cold_never_used_info),
+    ];
+
+    let selection = select_account_with_context(
+        &candidates,
+        SelectionConfig::default(),
+        SelectionContext::at(activation_time).with_current_account_id(Some("active")),
+    )
+    .expect("usable account should be selected");
+
+    assert_eq!(selection.account.id, "cold-never-used");
+}
+
+#[test]
+fn deadline_aware_missing_window_does_not_force_cold_activation_after_activity() {
+    let last_used_at = Utc.with_ymd_and_hms(2026, 5, 10, 0, 0, 0).unwrap();
+    let active = chatgpt_account("active", Some(last_used_at));
+    let cold = chatgpt_account("cold", None);
+    let context_now = last_used_at.timestamp() + 60;
+    let mut active_info = usage_info(
+        "active",
+        20.0,
+        20.0,
+        context_now + FIVE_HOUR_WINDOW_MINUTES * 60,
+        context_now + WEEKLY_WINDOW_MINUTES * 60,
+    );
+    let mut cold_info = usage_info(
+        "cold",
+        0.0,
+        0.0,
+        context_now + 60,
+        context_now + WEEKLY_WINDOW_MINUTES * 60,
+    );
+    active_info.primary_window_minutes = None;
+    cold_info.primary_window_minutes = None;
+    let candidates = [
+        candidate(&active, &active_info),
+        candidate(&cold, &cold_info),
+    ];
+
+    let selection = select_account_with_context(
+        &candidates,
+        SelectionConfig::default(),
+        SelectionContext::at(context_now).with_current_account_id(Some("active")),
+    )
+    .expect("usable account should be selected");
+
+    assert_eq!(selection.account.id, "active");
 }
 
 #[test]
@@ -1378,26 +1684,43 @@ fn replacement_gate_tie_breaks_between_passing_candidates() {
 }
 
 #[test]
-fn simulator_staggers_initial_reset_times_across_five_hour_and_weekly_windows() {
-    let first = SimAccount::new("account-0", 0, 2);
-    let second = SimAccount::new("account-1", 1, 2);
-    let first_usage = first.usage_info(0);
-    let second_usage = second.usage_info(0);
+fn cold_simulated_account_reset_times_drift_until_first_usage() {
+    let mut account = SimAccount::new("account-0", 0, 2);
+    let initial_usage = account.usage_info(0);
+    let later_unused_usage = account.usage_info(60);
 
-    assert_eq!(first_usage.primary_resets_at, Some(0));
     assert_eq!(
-        second_usage.primary_resets_at,
-        Some((FIVE_HOUR_WINDOW_MINUTES / 2) * 60)
+        initial_usage.primary_resets_at,
+        Some(FIVE_HOUR_WINDOW_MINUTES * 60)
     );
-    assert_eq!(first_usage.secondary_resets_at, Some(0));
     assert_eq!(
-        second_usage.secondary_resets_at,
-        Some((WEEKLY_WINDOW_MINUTES / 2) * 60)
+        initial_usage.secondary_resets_at,
+        Some(WEEKLY_WINDOW_MINUTES * 60)
+    );
+    assert_eq!(
+        later_unused_usage.primary_resets_at,
+        Some((60 + FIVE_HOUR_WINDOW_MINUTES) * 60)
+    );
+    assert_eq!(
+        later_unused_usage.secondary_resets_at,
+        Some((60 + WEEKLY_WINDOW_MINUTES) * 60)
+    );
+
+    account.consume(60, 100.0);
+    let consumed_usage = account.usage_info(120);
+
+    assert_eq!(
+        consumed_usage.primary_resets_at,
+        Some((60 + FIVE_HOUR_WINDOW_MINUTES) * 60)
+    );
+    assert_eq!(
+        consumed_usage.secondary_resets_at,
+        Some((60 + WEEKLY_WINDOW_MINUTES) * 60)
     );
 }
 
 #[test]
-fn initial_usage_reset_times_ignore_empty_stagger_placeholders() {
+fn initial_usage_reset_times_use_real_seed_events() {
     let mut account = SimAccount::new("account-1", 1, 2);
     account.seed_initial_usage(100.0, 300.0, 240, 4_000);
     let usage = account.usage_info(0);
@@ -1407,13 +1730,34 @@ fn initial_usage_reset_times_ignore_empty_stagger_placeholders() {
 }
 
 #[test]
-fn consumed_usage_reset_times_ignore_empty_stagger_placeholders() {
+fn consumed_usage_reset_times_use_real_consumption_events() {
     let mut account = SimAccount::new("account-1", 1, 2);
     account.consume(0, 100.0);
     let usage = account.usage_info(0);
 
     assert_eq!(usage.primary_resets_at, Some(FIVE_HOUR_WINDOW_MINUTES * 60));
     assert_eq!(usage.secondary_resets_at, Some(WEEKLY_WINDOW_MINUTES * 60));
+}
+
+#[test]
+fn simulator_staggers_cold_account_activation_across_five_hour_window() {
+    let mut policy = DeadlineAwarePolicy::default();
+    let mut accounts = vec![
+        SimAccount::new("account-0", 0, 2),
+        SimAccount::new("account-1", 1, 2),
+    ];
+    let first_selected = select_sim_account(&mut policy, &accounts, 0, None)
+        .expect("first account should be selected");
+    accounts[first_selected].consume(0, 100.0);
+
+    let before_interval = select_sim_account(&mut policy, &accounts, 149, Some(first_selected))
+        .expect("account should be selected before interval");
+    let after_interval = select_sim_account(&mut policy, &accounts, 150, Some(first_selected))
+        .expect("account should be selected after interval");
+
+    assert_eq!(first_selected, 0);
+    assert_eq!(before_interval, 0);
+    assert_eq!(after_interval, 1);
 }
 
 #[test]
@@ -2584,7 +2928,7 @@ fn simulate_policy_trace<P: AccountSelectionPolicy>(
     limits: TraceLimits,
 ) -> TraceOutcome {
     validate_trace_inputs(trace, limits);
-    let accounts: Vec<StoredAccount> = (0..limits.account_count)
+    let mut accounts: Vec<StoredAccount> = (0..limits.account_count)
         .map(|index| chatgpt_account(&format!("trace-account-{index}"), None))
         .collect::<Vec<_>>();
     let mut states = vec![TraceAccountState::default(); limits.account_count];
@@ -2629,6 +2973,10 @@ fn simulate_policy_trace<P: AccountSelectionPolicy>(
             });
 
         if let Some(index) = serving_index {
+            if last_account_index.is_none_or(|previous| previous != index) {
+                accounts[index].last_used_at =
+                    Some(Utc.timestamp_opt(i64::from(demand.minute) * 60, 0).unwrap());
+            }
             states[index].consume(*demand);
             outcome = outcome.with_served(demand.credits);
             last_account_index = Some(index);
@@ -2779,11 +3127,15 @@ fn serve_demand<P: AccountSelectionPolicy>(
         });
 
     if let Some(index) = serving_index {
+        if last_account_index.is_none_or(|previous| previous != index) {
+            accounts[index].account.last_used_at =
+                Some(Utc.timestamp_opt(demand.minute * 60, 0).unwrap());
+            if last_account_index.is_some() {
+                stats.account_switches += 1;
+            }
+        }
         accounts[index].consume(demand.minute, demand.credits);
         stats.served_credits += demand.credits;
-        if last_account_index.is_some_and(|previous| previous != index) {
-            stats.account_switches += 1;
-        }
         *last_account_index = Some(index);
     } else {
         stats.failed_credits += demand.credits;
@@ -2893,14 +3245,11 @@ fn weekday_load_multiplier(minute: i64) -> f64 {
 }
 
 impl SimAccount {
-    fn new(id: &str, index: usize, account_count: usize) -> Self {
-        let five_hour_seed = staggered_seed_event(index, account_count, FIVE_HOUR_WINDOW_MINUTES);
-        let weekly_seed = staggered_seed_event(index, account_count, WEEKLY_WINDOW_MINUTES);
-
+    fn new(id: &str, _index: usize, _account_count: usize) -> Self {
         Self {
             account: chatgpt_account(id, None),
-            five_hour_events: VecDeque::from([five_hour_seed]),
-            weekly_events: VecDeque::from([weekly_seed]),
+            five_hour_events: VecDeque::new(),
+            weekly_events: VecDeque::new(),
         }
     }
 
@@ -2911,8 +3260,6 @@ impl SimAccount {
         five_hour_resets_at_minute: i64,
         weekly_resets_at_minute: i64,
     ) {
-        self.remove_empty_stagger_placeholders();
-
         if five_hour_credits > 0.0 {
             let five_hour_event = seed_usage_event(
                 five_hour_resets_at_minute,
@@ -2940,19 +3287,12 @@ impl SimAccount {
     }
 
     fn consume(&mut self, minute: i64, credits: f64) {
-        self.remove_empty_stagger_placeholders();
-
         let event = UsageEvent {
             at_minute: minute,
             credits,
         };
         self.five_hour_events.push_back(event);
         self.weekly_events.push_back(event);
-    }
-
-    fn remove_empty_stagger_placeholders(&mut self) {
-        self.five_hour_events.retain(|event| event.credits > 0.0);
-        self.weekly_events.retain(|event| event.credits > 0.0);
     }
 
     fn can_serve(&self, credits: f64) -> bool {
@@ -3071,14 +3411,6 @@ fn expire_events(events: &mut VecDeque<UsageEvent>, minute: i64, window_minutes:
     }
 }
 
-fn staggered_seed_event(index: usize, account_count: usize, window_minutes: i64) -> UsageEvent {
-    let offset = staggered_reset_offset(index, account_count, window_minutes);
-    UsageEvent {
-        at_minute: offset - window_minutes,
-        credits: 0.0,
-    }
-}
-
 fn seed_usage_event(resets_at_minute: i64, window_minutes: i64, credits: f64) -> UsageEvent {
     UsageEvent {
         at_minute: resets_at_minute - window_minutes,
@@ -3092,20 +3424,10 @@ fn sort_events(events: &mut VecDeque<UsageEvent>) {
     *events = VecDeque::from(sorted);
 }
 
-fn staggered_reset_offset(index: usize, account_count: usize, window_minutes: i64) -> i64 {
-    if account_count == 0 {
-        return 0;
-    }
-
-    window_minutes * i64::try_from(index).expect("account index should fit in i64")
-        / i64::try_from(account_count).expect("account count should fit in i64")
-}
-
 fn reset_at(events: &VecDeque<UsageEvent>, minute: i64, window_minutes: i64) -> i64 {
-    events
-        .front()
-        .map_or(minute, |event| event.at_minute + window_minutes)
-        * 60
+    events.front().map_or(minute + window_minutes, |event| {
+        event.at_minute + window_minutes
+    }) * 60
 }
 
 fn total_credits(events: &VecDeque<UsageEvent>) -> f64 {
@@ -3140,9 +3462,12 @@ fn trace_usage_info(
 }
 
 fn trace_reset_at(events: &[TraceEvent], minute: i32, window_minutes: i32) -> i64 {
-    events.first().map_or(i64::from(minute), |event| {
-        i64::from(event.minute + window_minutes)
-    }) * 60
+    events
+        .first()
+        .map_or(i64::from(minute + window_minutes), |event| {
+            i64::from(event.minute + window_minutes)
+        })
+        * 60
 }
 
 fn used_percent(used: f64, limit: f64) -> f64 {

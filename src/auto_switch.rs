@@ -593,6 +593,86 @@ mod tests {
     }
 
     #[test]
+    fn policy_selection_waits_to_activate_cold_replacement_until_stagger_interval() {
+        let active = chatgpt_account("active");
+        let cold = chatgpt_account("cold");
+        let now = Utc::now().timestamp();
+        let five_hour_window_seconds = 300 * 60;
+        let weekly_window_seconds = 10_080 * 60;
+        let stagger_interval_seconds = five_hour_window_seconds / 2;
+        let active_first_usage_at = now - stagger_interval_seconds + 60;
+        let evaluations = vec![
+            AccountUsageEvaluation {
+                account: active,
+                usage: usage_info_with_limits(
+                    "active",
+                    20.0,
+                    20.0,
+                    active_first_usage_at + five_hour_window_seconds,
+                    active_first_usage_at + weekly_window_seconds,
+                ),
+                decision: UsageDecision::Usable("usage is available".to_string()),
+            },
+            AccountUsageEvaluation {
+                account: cold,
+                usage: usage_info_with_limits(
+                    "cold",
+                    0.0,
+                    0.0,
+                    now + five_hour_window_seconds,
+                    now + weekly_window_seconds,
+                ),
+                decision: UsageDecision::Usable("usage is available".to_string()),
+            },
+        ];
+
+        let selected = select_usable_account_by_policy(&evaluations, Some("active"))
+            .expect("policy should select a usable account");
+
+        assert_eq!(selected.account.id, "active");
+    }
+
+    #[test]
+    fn policy_selection_activates_cold_replacement_after_stagger_interval() {
+        let active = chatgpt_account("active");
+        let cold = chatgpt_account("cold");
+        let now = Utc::now().timestamp();
+        let five_hour_window_seconds = 300 * 60;
+        let weekly_window_seconds = 10_080 * 60;
+        let stagger_interval_seconds = five_hour_window_seconds / 2;
+        let active_first_usage_at = now - stagger_interval_seconds - 60;
+        let evaluations = vec![
+            AccountUsageEvaluation {
+                account: active,
+                usage: usage_info_with_limits(
+                    "active",
+                    20.0,
+                    20.0,
+                    active_first_usage_at + five_hour_window_seconds,
+                    active_first_usage_at + weekly_window_seconds,
+                ),
+                decision: UsageDecision::Usable("usage is available".to_string()),
+            },
+            AccountUsageEvaluation {
+                account: cold,
+                usage: usage_info_with_limits(
+                    "cold",
+                    0.0,
+                    0.0,
+                    now + five_hour_window_seconds,
+                    now + weekly_window_seconds,
+                ),
+                decision: UsageDecision::Usable("usage is available".to_string()),
+            },
+        ];
+
+        let selected = select_usable_account_by_policy(&evaluations, Some("active"))
+            .expect("policy should select a usable account");
+
+        assert_eq!(selected.account.id, "cold");
+    }
+
+    #[test]
     fn policy_selection_ignores_missing_current_account_context() {
         let first = chatgpt_account("first");
         let second = chatgpt_account("second");
@@ -799,6 +879,8 @@ mod tests {
             account_id: account_id.to_string(),
             primary_used_percent: Some(five_hour_used_percent),
             secondary_used_percent: Some(weekly_used_percent),
+            primary_window_minutes: Some(300),
+            secondary_window_minutes: Some(10_080),
             primary_resets_at: Some(five_hour_resets_at),
             secondary_resets_at: Some(weekly_resets_at),
             ..usage_info()
