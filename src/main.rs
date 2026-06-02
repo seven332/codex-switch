@@ -16,6 +16,7 @@ mod types;
 mod update;
 mod usage;
 mod usage_forecast;
+mod usage_style;
 
 use std::collections::HashMap;
 
@@ -337,8 +338,7 @@ async fn print_all_usage(show_additional: bool) -> Result<()> {
             print_usage_forecast(&forecast, now);
         } else {
             println!();
-            println!("overall estimate:");
-            println!("  unavailable: not enough complete usage data");
+            print_usage_output("overall estimate:\n  unavailable: not enough complete usage data");
         }
     }
 
@@ -388,14 +388,21 @@ fn print_usage(
     now: i64,
     show_additional: bool,
 ) {
-    println!(
-        "{}",
-        format_usage(account, info, is_current, now, show_additional)
-    );
+    print_usage_output(&format_usage(
+        account,
+        info,
+        is_current,
+        now,
+        show_additional,
+    ));
 }
 
 fn print_usage_forecast(forecast: &usage_forecast::UsageForecast, now: i64) {
-    println!("{}", format_usage_forecast(forecast, now));
+    print_usage_output(&format_usage_forecast(forecast, now));
+}
+
+fn print_usage_output(output: &str) {
+    println!("{}", usage_style::style_for_stdout().style_text(output));
 }
 
 fn format_usage_forecast(forecast: &usage_forecast::UsageForecast, now: i64) -> String {
