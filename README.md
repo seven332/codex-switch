@@ -4,6 +4,10 @@ Multi-account runtime switcher for Codex.
 
 `codex-switch` lets you keep several ChatGPT Codex accounts on one machine and run Codex through a small local proxy. When the current account hits a usage limit, managed sessions try to hot-load another ChatGPT OAuth account with usable quota. If a replacement is available, the next turn can use it without manually editing `auth.json` or restarting Codex.
 
+![codex-switch usage overview](docs/assets/usage-overview.svg)
+
+![codex-switch runtime auto-switch warning](docs/assets/runtime-auto-switch.svg)
+
 The main workflow is:
 
 ```sh

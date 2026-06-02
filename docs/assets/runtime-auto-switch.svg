@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="610" viewBox="0 0 980 610" role="img" aria-labelledby="title desc">
+  <title id="title">codex-switch runtime auto-switch warning</title>
+  <desc id="desc">Example Codex TUI session showing a codex-switch warning after hot-loading a replacement account.</desc>
+  <defs>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#0b1020" flood-opacity="0.28"/>
+    </filter>
+    <clipPath id="terminal-clip">
+      <rect x="40" y="32" width="900" height="548" rx="14"/>
+    </clipPath>
+  </defs>
+  <rect x="40" y="32" width="900" height="548" rx="14" fill="#171b23" filter="url(#shadow)"/>
+  <rect x="40" y="32" width="900" height="36" rx="14" fill="#303747"/>
+  <circle cx="62" cy="50" r="6" fill="#ff5f57"/>
+  <circle cx="83" cy="50" r="6" fill="#ffbd2e"/>
+  <circle cx="104" cy="50" r="6" fill="#28c840"/>
+  <text x="490" y="55" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" fill="#aeb7c8">codex-switch run -- resume</text>
+
+  <g font-family="Menlo, Consolas, 'SFMono-Regular', monospace" font-size="16" fill="#d9e1f2">
+    <text x="64" y="104" fill="#d9e1f2">• The usage view now matches the current account state.</text>
+
+    <text x="64" y="144" fill="#a9a9a9">──────────────────────────────────────────────────────────────────────────────</text>
+
+    <rect x="40" y="174" width="900" height="56" fill="#33363d"/>
+    <text x="64" y="210" fill="#d9e1f2">›&#160;make the runtime screenshot more realistic</text>
+
+    <text x="64" y="270" fill="#fca5a5">■ You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage</text>
+    <text x="64" y="296" fill="#fca5a5">&#160;&#160;to purchase more credits or try again at 11:35 AM.</text>
+
+    <text x="64" y="350" fill="#facc15">⚠ codex-switch switched account from work (9b3d7440) to personal (a6bf89b9)</text>
+    <text x="64" y="376" fill="#facc15">&#160;&#160;because weekly usage is 100.0%</text>
+
+    <text x="64" y="424" fill="#d9e1f2">• Updated the screenshot layout to match the Codex TUI.</text>
+  </g>
+
+  <rect x="40" y="456" width="900" height="52" fill="#33363d"/>
+  <g font-family="Menlo, Consolas, 'SFMono-Regular', monospace" font-size="16">
+    <text x="64" y="490" fill="#d9e1f2">›&#160;</text>
+    <rect x="82" y="474" width="10" height="20" fill="#c084fc"/>
+    <text x="82" y="490" fill="#171b23">U</text>
+    <text x="92" y="490" fill="#b6b9c2">se /skills to list available skills</text>
+  </g>
+
+  <rect x="40" y="508" width="900" height="72" fill="#11151b" clip-path="url(#terminal-clip)"/>
+  <g font-family="Menlo, Consolas, 'SFMono-Regular', monospace" font-size="15">
+    <text x="64" y="548" fill="#a7f3a1">codex-switch</text>
+    <text x="184" y="548" fill="#aeb7c8">·</text>
+    <text x="206" y="548" fill="#9bbcff">master</text>
+    <text x="272" y="548" fill="#aeb7c8">·</text>
+    <text x="294" y="548" fill="#ffc7a8">Context 19% used</text>
+    <text x="458" y="548" fill="#aeb7c8">·</text>
+    <text x="480" y="548" fill="#f5a6c8">5h 97% left</text>
+    <text x="586" y="548" fill="#aeb7c8">·</text>
+    <text x="608" y="548" fill="#f5a6c8">weekly 61% left</text>
+    <text x="746" y="548" fill="#aeb7c8">·</text>
+    <text x="768" y="548" fill="#ffe8b0">gpt-5.5 xhigh</text>
+  </g>
+</svg>
