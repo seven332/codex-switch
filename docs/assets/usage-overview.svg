@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="610" viewBox="0 0 980 610" role="img" aria-labelledby="title desc">
+  <title id="title">codex-switch usage --all terminal screenshot</title>
+  <desc id="desc">Example terminal output showing current account usage, quota bars, reset bars, and the overall estimate.</desc>
+  <defs>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#0b1020" flood-opacity="0.28"/>
+    </filter>
+  </defs>
+  <rect x="40" y="32" width="900" height="548" rx="14" fill="#171b23" filter="url(#shadow)"/>
+  <rect x="40" y="32" width="900" height="36" rx="14" fill="#303747"/>
+  <circle cx="62" cy="50" r="6" fill="#ff5f57"/>
+  <circle cx="83" cy="50" r="6" fill="#ffbd2e"/>
+  <circle cx="104" cy="50" r="6" fill="#28c840"/>
+  <text x="490" y="55" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" fill="#aeb7c8">codex-switch usage --all</text>
+
+  <g font-family="Menlo, Consolas, 'SFMono-Regular', monospace" font-size="16" fill="#d9e1f2">
+    <text x="64" y="104" fill="#7dd3fc">$ codex-switch usage --all</text>
+
+    <text x="64" y="142" font-weight="700">* personal (a6bf89b9)</text>
+    <text x="64" y="166" fill="#aeb7c8">plan: pro</text>
+    <text x="64" y="190">5-hour ┬ quota [█████████████████░░░] 86.0% left</text>
+    <text x="64" y="214" fill="#9aa6bd">&#160;&#160;&#160;&#160;&#160;&#160;&#160;└ reset [███████─────────────] 34% remaining, in 1h 42m (today 19:23)</text>
+    <text x="64" y="238">weekly ┬ quota [██████████████████░░] 92.0% left</text>
+    <text x="64" y="262" fill="#9aa6bd">&#160;&#160;&#160;&#160;&#160;&#160;&#160;└ reset [████████────────────] 41% remaining, in 2d 21h (Fri 16:49)</text>
+
+    <text x="64" y="314" font-weight="700">work (9b3d7440) [UNAVAILABLE]</text>
+    <text x="64" y="338" fill="#aeb7c8">plan: pro</text>
+    <text x="64" y="362" fill="#fca5a5">status: weekly usage is 100.0%</text>
+    <text x="64" y="386">5-hour ┬ quota [███████████████████░] 96.0% left</text>
+    <text x="64" y="410" fill="#9aa6bd">&#160;&#160;&#160;&#160;&#160;&#160;&#160;└ reset [█████████───────────] 43% remaining, in 2h 10m (today 19:33)</text>
+    <text x="64" y="434">weekly ┬ quota [░░░░░░░░░░░░░░░░░░░░] 0.0% left</text>
+    <text x="64" y="458" fill="#9aa6bd">&#160;&#160;&#160;&#160;&#160;&#160;&#160;└ reset [███████─────────────] 35% remaining, in 2d 10h (Fri 16:49)</text>
+
+    <text x="64" y="510" fill="#facc15">overall estimate:</text>
+    <text x="64" y="534" fill="#aeb7c8">&#160;&#160;unavailable: not expected within 14d at current pace</text>
+    <text x="64" y="558" fill="#aeb7c8">&#160;&#160;estimated rate: 5-hour 8.2%/h, weekly 0.3%/h</text>
+  </g>
+</svg>
