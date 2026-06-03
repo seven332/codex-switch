@@ -71,12 +71,18 @@ enum RuntimeClientNotification {
     Warning { message: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeLoginSuccessNotification {
+    Client(RuntimeClientNotification),
+    AuthJsonSwitch { to_label: String },
+}
+
 struct RuntimeLoginCommand {
     prepared: PreparedAccountLogin,
     expected_snapshot: Option<CurrentAccountSnapshot>,
     generation: Option<u64>,
     completion: Option<oneshot::Sender<RuntimeLoginResult>>,
-    success_notification: Option<RuntimeClientNotification>,
+    success_notification: Option<RuntimeLoginSuccessNotification>,
 }
 
 impl RuntimeLoginCommand {
@@ -95,7 +101,7 @@ impl RuntimeLoginCommand {
     fn auto_switch(
         prepared: PreparedAccountLogin,
         generation: u64,
-        success_notification: Option<RuntimeClientNotification>,
+        success_notification: Option<RuntimeLoginSuccessNotification>,
     ) -> Self {
         let expected_snapshot = prepared.current_snapshot.clone();
         Self {
@@ -111,13 +117,14 @@ impl RuntimeLoginCommand {
         prepared: PreparedAccountLogin,
         expected_snapshot: CurrentAccountSnapshot,
         completion: oneshot::Sender<RuntimeLoginResult>,
+        success_notification: Option<RuntimeLoginSuccessNotification>,
     ) -> Self {
         Self {
             prepared,
             expected_snapshot: Some(expected_snapshot),
             generation: None,
             completion: Some(completion),
-            success_notification: None,
+            success_notification,
         }
     }
 
@@ -164,6 +171,7 @@ impl RuntimeAuthState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeLoadedAuth {
     account_id: String,
+    account_label: String,
     chatgpt_account_id: String,
     access_token_expires_at: Option<DateTime<Utc>>,
     current_snapshot: Option<CurrentAccountSnapshot>,
@@ -452,13 +460,6 @@ fn format_elapsed(duration: Duration) -> String {
     }
 }
 
-fn format_runtime_account_label(account_id: &str) -> String {
-    match store::get_account_by_selector(account_id) {
-        Ok(account) => format!("{} ({})", account.name, store::short_id(&account.id)),
-        Err(_) => format!("unknown ({})", store::short_id(account_id)),
-    }
-}
-
 fn format_token_expiry_distance(expires_at: Option<DateTime<Utc>>) -> String {
     match expires_at {
         Some(expires_at) => format!(
@@ -489,29 +490,36 @@ fn child_pid_for_log(child: &Child) -> String {
 
 fn format_auto_switch_result_for_log(result: &AutoSwitchResult) -> String {
     match result {
-        AutoSwitchResult::CurrentKept { account, reason } => format!(
-            "kept {} ({}) - {reason}",
-            account.name,
-            store::short_id(&account.id)
-        ),
-        AutoSwitchResult::CurrentUnsupported { account, reason } => format!(
-            "unsupported {} ({}) - {reason}",
-            account.name,
-            store::short_id(&account.id)
-        ),
+        AutoSwitchResult::CurrentKept { account, reason } => {
+            let reason = sanitize_startup_log_message(reason);
+            format!(
+                "kept {} ({}) - {reason}",
+                sanitize_startup_log_message(&account.name),
+                store::short_id(&account.id)
+            )
+        }
+        AutoSwitchResult::CurrentUnsupported { account, reason } => {
+            let reason = sanitize_startup_log_message(reason);
+            format!(
+                "unsupported {} ({}) - {reason}",
+                sanitize_startup_log_message(&account.name),
+                store::short_id(&account.id)
+            )
+        }
         AutoSwitchResult::Switched { from, to, reason } => {
+            let reason = sanitize_startup_log_message(reason);
             if let Some(from) = from {
                 format!(
                     "switched {} ({}) -> {} ({}) - {reason}",
-                    from.name,
+                    sanitize_startup_log_message(&from.name),
                     store::short_id(&from.id),
-                    to.name,
+                    sanitize_startup_log_message(&to.name),
                     store::short_id(&to.id)
                 )
             } else {
                 format!(
                     "switched to {} ({}) - {reason}",
-                    to.name,
+                    sanitize_startup_log_message(&to.name),
                     store::short_id(&to.id)
                 )
             }
@@ -1123,7 +1131,8 @@ async fn runtime_auto_switch_command_from_work(
             {
                 AutoSwitchResult::Switched { from, to, reason } => {
                     success_notification =
-                        runtime_auto_switch_success_notification(from.as_deref(), &to, &reason);
+                        runtime_auto_switch_success_notification(from.as_deref(), &to, &reason)
+                            .map(RuntimeLoginSuccessNotification::Client);
                     *to
                 }
                 AutoSwitchResult::CurrentKept { account, .. } => *account,
@@ -1174,6 +1183,47 @@ fn runtime_auto_switch_success_notification(
     };
 
     Some(RuntimeClientNotification::Warning { message })
+}
+
+fn runtime_auth_json_switch_notification(to: &StoredAccount) -> RuntimeLoginSuccessNotification {
+    RuntimeLoginSuccessNotification::AuthJsonSwitch {
+        to_label: display_safe_account_label(to),
+    }
+}
+
+fn runtime_login_success_client_notification(
+    notification: RuntimeLoginSuccessNotification,
+    from_label: Option<&str>,
+) -> RuntimeClientNotification {
+    match notification {
+        RuntimeLoginSuccessNotification::Client(notification) => notification,
+        RuntimeLoginSuccessNotification::AuthJsonSwitch { to_label } => {
+            let reason = "current auth.json changed";
+            let message = match from_label {
+                Some(from_label) => {
+                    format!(
+                        "codex-switch switched account from {from_label} to {to_label} because {reason}"
+                    )
+                }
+                None => format!("codex-switch switched account to {to_label} because {reason}"),
+            };
+            RuntimeClientNotification::Warning { message }
+        }
+    }
+}
+
+fn runtime_login_success_client_notification_if_needed(
+    notification: RuntimeLoginSuccessNotification,
+    from_label: Option<&str>,
+    account_changed: bool,
+) -> Option<RuntimeClientNotification> {
+    match notification {
+        RuntimeLoginSuccessNotification::Client(notification) => Some(notification),
+        RuntimeLoginSuccessNotification::AuthJsonSwitch { .. } if account_changed => Some(
+            runtime_login_success_client_notification(notification, from_label),
+        ),
+        RuntimeLoginSuccessNotification::AuthJsonSwitch { .. } => None,
+    }
 }
 
 fn display_safe_account_label(account: &StoredAccount) -> String {
@@ -1380,9 +1430,22 @@ fn token_prewarm_is_suppressed(
     state: &RuntimeAuthState,
     suppressed_loaded_auth: &Option<RuntimeLoadedAuth>,
 ) -> bool {
-    suppressed_loaded_auth
-        .as_ref()
-        .is_some_and(|suppressed| state.loaded.as_ref() == Some(suppressed))
+    suppressed_loaded_auth.as_ref().is_some_and(|suppressed| {
+        state
+            .loaded
+            .as_ref()
+            .is_some_and(|loaded| runtime_loaded_auth_matches_for_suppression(loaded, suppressed))
+    })
+}
+
+fn runtime_loaded_auth_matches_for_suppression(
+    loaded: &RuntimeLoadedAuth,
+    suppressed: &RuntimeLoadedAuth,
+) -> bool {
+    loaded.account_id == suppressed.account_id
+        && loaded.chatgpt_account_id == suppressed.chatgpt_account_id
+        && loaded.access_token_expires_at == suppressed.access_token_expires_at
+        && loaded.current_snapshot == suppressed.current_snapshot
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1427,7 +1490,7 @@ async fn run_token_prewarm_attempt(
     shutdown: &mut watch::Receiver<bool>,
 ) -> TokenPrewarmAttemptResult {
     let stage_start = Instant::now();
-    let account_label = format_runtime_account_label(&loaded_auth.account_id);
+    let account_label = &loaded_auth.account_label;
     let mut log_secrets = stored_account_secret_values(&loaded_auth.account_id);
     runtime_log(format_args!(
         "token prewarm: started for {account_label} ({})",
@@ -1751,12 +1814,15 @@ async fn run_current_account_reconciler(
             continue;
         };
 
-        if let ActiveAccountReconcileAction::Attempt { snapshot } =
-            state.next_action(current_snapshot, Instant::now())
+        if let ActiveAccountReconcileAction::Attempt {
+            snapshot,
+            notify_on_success,
+        } = state.next_action(current_snapshot, Instant::now())
         {
             let result = attempt_current_account_reconcile(
                 &runtime_commands,
                 snapshot.clone(),
+                notify_on_success,
                 &mut shutdown,
             )
             .await;
@@ -1773,6 +1839,7 @@ async fn run_current_account_reconciler(
 #[derive(Debug)]
 struct ActiveAccountReconcileState {
     desired_snapshot: Option<CurrentAccountSnapshot>,
+    notify_on_success: bool,
     settled: bool,
     attempts_started: usize,
     next_attempt_at: Instant,
@@ -1783,6 +1850,7 @@ impl ActiveAccountReconcileState {
         let settled = initial_snapshot.is_none();
         Self {
             desired_snapshot: initial_snapshot,
+            notify_on_success: false,
             settled,
             attempts_started: 0,
             next_attempt_at: now,
@@ -1804,6 +1872,8 @@ impl ActiveAccountReconcileState {
     ) -> ActiveAccountReconcileAction {
         let current_snapshot = Some(current_snapshot);
         if current_snapshot != self.desired_snapshot {
+            let changed_after_startup = self.desired_snapshot.is_some();
+            self.notify_on_success = self.notify_on_success || changed_after_startup;
             self.desired_snapshot = current_snapshot;
             self.settled = self.desired_snapshot.is_none();
             self.attempts_started = 0;
@@ -1824,7 +1894,10 @@ impl ActiveAccountReconcileState {
         };
 
         self.attempts_started += 1;
-        ActiveAccountReconcileAction::Attempt { snapshot }
+        ActiveAccountReconcileAction::Attempt {
+            snapshot,
+            notify_on_success: self.notify_on_success,
+        }
     }
 
     fn finish_attempt(
@@ -1840,6 +1913,7 @@ impl ActiveAccountReconcileState {
         match outcome {
             ActiveAccountReconcileOutcome::Success | ActiveAccountReconcileOutcome::Terminal(_) => {
                 self.settled = true;
+                self.notify_on_success = false;
                 self.attempts_started = 0;
             }
             ActiveAccountReconcileOutcome::Stale => {}
@@ -1862,7 +1936,10 @@ impl ActiveAccountReconcileState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ActiveAccountReconcileAction {
     Wait,
-    Attempt { snapshot: CurrentAccountSnapshot },
+    Attempt {
+        snapshot: CurrentAccountSnapshot,
+        notify_on_success: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1882,6 +1959,7 @@ enum ActiveAccountReconcileAttemptResult {
 async fn attempt_current_account_reconcile(
     runtime_commands: &mpsc::Sender<RuntimeCommand>,
     expected_snapshot: CurrentAccountSnapshot,
+    notify_on_success: bool,
     shutdown: &mut watch::Receiver<bool>,
 ) -> ActiveAccountReconcileAttemptResult {
     match current_snapshot_matches(&expected_snapshot) {
@@ -1920,6 +1998,8 @@ async fn attempt_current_account_reconcile(
         );
     }
 
+    let success_notification =
+        notify_on_success.then(|| runtime_auth_json_switch_notification(&account));
     let prepared = match prepare_login(account).await {
         Ok(prepared) => prepared,
         Err(err) => {
@@ -1950,6 +2030,7 @@ async fn attempt_current_account_reconcile(
         prepared,
         expected_snapshot.clone(),
         completion_tx,
+        success_notification,
     ));
     match runtime_commands.try_send(command) {
         Ok(()) => {
@@ -2130,9 +2211,12 @@ async fn proxy_websockets(
             command = runtime_commands.recv(), if runtime_commands_open => {
                 match command {
                     Some(RuntimeCommand::LoginPreparedAccount(prepared)) => {
-                        state
+                        if let Some(notification) = state
                             .login_prepared_chatgpt_account(&mut app_server_write, prepared)
-                            .await?;
+                            .await?
+                        {
+                            send_runtime_client_notification(&mut client_write, notification).await?;
+                        }
                     }
                     None => {
                         runtime_commands_open = false;
@@ -2175,6 +2259,7 @@ struct ProxyState {
     next_request_id: u64,
     pending_internal: HashMap<String, PendingInternalRequest>,
     app_server_account_id: Option<String>,
+    app_server_account_label: Option<String>,
     app_server_snapshot: Option<CurrentAccountSnapshot>,
     pending_login_account_id: Option<String>,
     runtime_auth_state: RuntimeAuthState,
@@ -2191,7 +2276,7 @@ enum PendingInternalRequest {
         generation: Option<u64>,
         loaded_auth: RuntimeLoadedAuth,
         completion: Option<oneshot::Sender<RuntimeLoginResult>>,
-        success_notification: Option<RuntimeClientNotification>,
+        success_notification: Option<RuntimeLoginSuccessNotification>,
     },
 }
 
@@ -2207,6 +2292,7 @@ impl ProxyState {
             next_request_id: 1,
             pending_internal: HashMap::new(),
             app_server_account_id: None,
+            app_server_account_label: None,
             app_server_snapshot: None,
             pending_login_account_id: None,
             runtime_auth_state,
@@ -2234,6 +2320,7 @@ impl ProxyState {
 
     fn set_runtime_loaded_auth(&mut self, loaded_auth: RuntimeLoadedAuth) {
         self.app_server_account_id = Some(loaded_auth.account_id.clone());
+        self.app_server_account_label = Some(loaded_auth.account_label.clone());
         self.app_server_snapshot = loaded_auth.current_snapshot.clone();
         self.runtime_auth_state.loaded = Some(loaded_auth);
         self.runtime_auth_state.last_activity_at = Instant::now();
@@ -2261,7 +2348,7 @@ impl ProxyState {
         &mut self,
         app_server_write: &mut SplitSink<WsStream, Message>,
         command: RuntimeLoginCommand,
-    ) -> Result<()> {
+    ) -> Result<Option<RuntimeClientNotification>> {
         let RuntimeLoginCommand {
             prepared,
             expected_snapshot,
@@ -2277,7 +2364,7 @@ impl ProxyState {
                 .is_current_generation(generation)
         {
             complete_runtime_login(completion, RuntimeLoginResult::Stale);
-            return Ok(());
+            return Ok(None);
         }
 
         let snapshot_matches = match &expected_snapshot {
@@ -2288,24 +2375,28 @@ impl ProxyState {
                         completion,
                         RuntimeLoginResult::Transient(err.to_string()),
                     );
-                    return Ok(());
+                    return Ok(None);
                 }
             },
             None => current_account_id_matches(&prepared.account_id)?,
         };
         if !snapshot_matches {
             complete_runtime_login(completion, RuntimeLoginResult::Stale);
-            return Ok(());
+            return Ok(None);
         }
 
-        match self.pending_login_status(&prepared.account_id, expected_snapshot.as_ref()) {
+        match self.pending_login_status_and_merge_notification(
+            &prepared.account_id,
+            expected_snapshot.as_ref(),
+            success_notification.clone(),
+        ) {
             PendingLoginStatus::None => {}
             PendingLoginStatus::Matching => {
                 complete_runtime_login(
                     completion,
                     RuntimeLoginResult::Deferred("Login request is already pending".to_string()),
                 );
-                return Ok(());
+                return Ok(None);
             }
             PendingLoginStatus::Other => {
                 complete_runtime_login(
@@ -2314,13 +2405,16 @@ impl ProxyState {
                         "Another login request is already pending".to_string(),
                     ),
                 );
-                return Ok(());
+                return Ok(None);
             }
         }
 
         if self.runtime_login_already_matches(&prepared.account_id, expected_snapshot.as_ref()) {
-            complete_runtime_login(completion, RuntimeLoginResult::Success);
-            return Ok(());
+            return Ok(self.complete_already_matched_runtime_login(
+                &prepared,
+                completion,
+                success_notification,
+            ));
         }
 
         let loaded_auth = runtime_loaded_auth_from_prepared(&prepared, expected_snapshot.clone());
@@ -2349,7 +2443,7 @@ impl ProxyState {
             },
         );
         self.pending_login_account_id = Some(prepared.account_id);
-        Ok(())
+        Ok(None)
     }
 
     fn queue_background_auto_switch(&self) -> BackgroundAutoSwitchQueueStatus {
@@ -2366,26 +2460,77 @@ impl ProxyState {
         expected_snapshot: Option<&CurrentAccountSnapshot>,
     ) -> bool {
         match expected_snapshot {
-            Some(snapshot) => self.app_server_snapshot.as_ref() == Some(snapshot),
+            Some(snapshot) => {
+                self.app_server_account_id.as_deref() == Some(account_id)
+                    && self.app_server_snapshot.as_ref() == Some(snapshot)
+            }
             None => self.app_server_account_id.as_deref() == Some(account_id),
         }
     }
 
-    fn pending_login_status(
-        &self,
+    fn mark_runtime_login_already_matched(&mut self, prepared: &PreparedAccountLogin) {
+        self.app_server_account_label = Some(prepared.account_label.clone());
+        let mut runtime_auth_changed = false;
+        if let Some(loaded_auth) = self.runtime_auth_state.loaded.as_mut()
+            && loaded_auth.account_id == prepared.account_id
+            && loaded_auth.account_label != prepared.account_label
+        {
+            loaded_auth.account_label = prepared.account_label.clone();
+            runtime_auth_changed = true;
+        }
+        if runtime_auth_changed {
+            let _ = self.runtime_auth.send(self.runtime_auth_state.clone());
+        }
+    }
+
+    fn complete_already_matched_runtime_login(
+        &mut self,
+        prepared: &PreparedAccountLogin,
+        completion: Option<oneshot::Sender<RuntimeLoginResult>>,
+        success_notification: Option<RuntimeLoginSuccessNotification>,
+    ) -> Option<RuntimeClientNotification> {
+        let account_changed = self
+            .app_server_account_id
+            .as_deref()
+            .is_some_and(|current| current != prepared.account_id);
+        let previous_label = self.app_server_account_label.clone();
+        self.mark_runtime_login_already_matched(prepared);
+        complete_runtime_login(completion, RuntimeLoginResult::Success);
+        success_notification.and_then(|notification| {
+            runtime_login_success_client_notification_if_needed(
+                notification,
+                previous_label.as_deref(),
+                account_changed,
+            )
+        })
+    }
+
+    fn pending_login_status_and_merge_notification(
+        &mut self,
         account_id: &str,
         expected_snapshot: Option<&CurrentAccountSnapshot>,
+        success_notification: Option<RuntimeLoginSuccessNotification>,
     ) -> PendingLoginStatus {
         let mut has_pending_login = false;
-        for pending in self.pending_internal.values() {
-            let PendingInternalRequest::Login {
-                account_id: pending_account_id,
-                expected_snapshot: pending_snapshot,
-                ..
-            } = pending;
-            has_pending_login = true;
-            if pending_account_id == account_id && pending_snapshot.as_ref() == expected_snapshot {
-                return PendingLoginStatus::Matching;
+        for pending in self.pending_internal.values_mut() {
+            match pending {
+                PendingInternalRequest::Login {
+                    account_id: pending_account_id,
+                    expected_snapshot: pending_snapshot,
+                    success_notification: pending_success_notification,
+                    ..
+                } => {
+                    has_pending_login = true;
+                    if pending_account_id == account_id
+                        && pending_snapshot.as_ref() == expected_snapshot
+                    {
+                        merge_runtime_login_success_notification(
+                            pending_success_notification,
+                            success_notification.clone(),
+                        );
+                        return PendingLoginStatus::Matching;
+                    }
+                }
             }
         }
 
@@ -2394,6 +2539,35 @@ impl ProxyState {
         } else {
             PendingLoginStatus::None
         }
+    }
+
+    #[cfg(test)]
+    fn pending_login_status(
+        &mut self,
+        account_id: &str,
+        expected_snapshot: Option<&CurrentAccountSnapshot>,
+    ) -> PendingLoginStatus {
+        self.pending_login_status_and_merge_notification(account_id, expected_snapshot, None)
+    }
+}
+
+fn merge_runtime_login_success_notification(
+    target: &mut Option<RuntimeLoginSuccessNotification>,
+    incoming: Option<RuntimeLoginSuccessNotification>,
+) {
+    let Some(incoming) = incoming else {
+        return;
+    };
+
+    match (target.as_ref(), &incoming) {
+        (Some(RuntimeLoginSuccessNotification::Client(_)), _) => {}
+        (_, RuntimeLoginSuccessNotification::Client(_)) | (None, _) => {
+            *target = Some(incoming);
+        }
+        (
+            Some(RuntimeLoginSuccessNotification::AuthJsonSwitch { .. }),
+            RuntimeLoginSuccessNotification::AuthJsonSwitch { .. },
+        ) => {}
     }
 }
 
@@ -2482,8 +2656,19 @@ impl ProxyState {
                     }
                 };
                 if result == RuntimeLoginResult::Success {
+                    let account_changed = self
+                        .app_server_account_id
+                        .as_deref()
+                        .is_some_and(|current| current != account_id);
+                    let previous_label = self.app_server_account_label.clone();
                     self.set_runtime_loaded_auth(loaded_auth);
-                    client_notification = success_notification;
+                    client_notification = success_notification.and_then(|notification| {
+                        runtime_login_success_client_notification_if_needed(
+                            notification,
+                            previous_label.as_deref(),
+                            account_changed,
+                        )
+                    });
                 }
                 complete_runtime_login(completion, result);
             }
@@ -2935,6 +3120,7 @@ fn current_account_id_matches(account_id: &str) -> Result<bool> {
 
 struct PreparedAccountLogin {
     account_id: String,
+    account_label: String,
     payload: ExternalAuthPayload,
     current_snapshot: Option<CurrentAccountSnapshot>,
 }
@@ -2946,10 +3132,12 @@ async fn prepare_login(account: StoredAccount) -> Result<PreparedAccountLogin> {
 
 fn prepare_login_from_fresh_account(account: StoredAccount) -> Result<PreparedAccountLogin> {
     let account_id = account.id.clone();
+    let account_label = display_safe_account_label(&account);
     let current_snapshot = prepared_current_account_snapshot(&account)?;
     let payload = external_auth_payload_from_fresh_account(account)?;
     Ok(PreparedAccountLogin {
         account_id,
+        account_label,
         payload,
         current_snapshot,
     })
@@ -2986,6 +3174,7 @@ fn runtime_loaded_auth_from_prepared(
 ) -> RuntimeLoadedAuth {
     RuntimeLoadedAuth {
         account_id: prepared.account_id.clone(),
+        account_label: prepared.account_label.clone(),
         chatgpt_account_id: prepared.payload.chatgpt_account_id.clone(),
         access_token_expires_at: token::access_token_expires_at(&prepared.payload.access_token),
         current_snapshot,
@@ -3002,6 +3191,7 @@ fn runtime_loaded_auth_from_account_and_payload(
         .map(|_| current_account_snapshot_for_account(account));
     RuntimeLoadedAuth {
         account_id: account.id.clone(),
+        account_label: display_safe_account_label(account),
         chatgpt_account_id: payload.chatgpt_account_id.clone(),
         access_token_expires_at: token::access_token_expires_at(&payload.access_token),
         current_snapshot,
@@ -3145,25 +3335,27 @@ mod tests {
     use super::{
         ACTIVE_ACCOUNT_MAX_ATTEMPTS, ACTIVE_ACCOUNT_RETRY_DELAYS, ACTIVE_ACCOUNT_WATCH_INTERVAL,
         APP_SERVER_REQUEST_TIMEOUT, ActiveAccountReconcileAction, ActiveAccountReconcileOutcome,
-        ActiveAccountReconcileState, AutoSwitchLoginMode, BackgroundAutoSwitchQueueStatus,
-        BackgroundRuntimeRequest, CurrentAccountSnapshot, ExternalAuthPayload,
-        PendingInternalRequest, PendingLoginStatus, PreparedAccountLogin, ProxyState,
-        RateLimitAutoSwitchTrigger, RuntimeAuthState, RuntimeAutoSwitchPriority,
+        ActiveAccountReconcileState, AutoSwitchLoginMode, AutoSwitchResult,
+        BackgroundAutoSwitchQueueStatus, BackgroundRuntimeRequest, CurrentAccountSnapshot,
+        ExternalAuthPayload, PendingInternalRequest, PendingLoginStatus, PreparedAccountLogin,
+        ProxyState, RateLimitAutoSwitchTrigger, RuntimeAuthState, RuntimeAutoSwitchPriority,
         RuntimeClientNotification, RuntimeCommand, RuntimeCommandSendStatus, RuntimeLoadedAuth,
-        RuntimeLoginCommand, RuntimeLoginResult, TOKEN_PREWARM_IDLE_AFTER,
-        TokenPrewarmAttemptResult, TokenPrewarmDecision, classify_rate_limit_notification,
-        classify_runtime_login_error, codex_args_with_default_cwd, current_account_auth_marker,
+        RuntimeLoginCommand, RuntimeLoginResult, RuntimeLoginSuccessNotification,
+        TOKEN_PREWARM_IDLE_AFTER, TokenPrewarmAttemptResult, TokenPrewarmDecision,
+        classify_rate_limit_notification, classify_runtime_login_error,
+        codex_args_with_default_cwd, current_account_auth_marker,
         current_account_has_newer_access_token, current_account_snapshot_for_account,
         duration_until_utc, external_auth_payload_from_fresh_account,
-        finish_background_auto_switch, format_codex_args_summary_for_log, has_cwd_arg,
-        initial_auto_switch_nonfatal_reason, initialize_app_server_request,
-        prewarm_snapshot_for_matching_auth, queue_background_auto_switch, queue_hard_auto_switch,
-        random_duration_between, redact_runtime_log_message,
+        finish_background_auto_switch, format_auto_switch_result_for_log,
+        format_codex_args_summary_for_log, has_cwd_arg, initial_auto_switch_nonfatal_reason,
+        initialize_app_server_request, prewarm_snapshot_for_matching_auth,
+        queue_background_auto_switch, queue_hard_auto_switch, random_duration_between,
+        redact_runtime_log_message, runtime_auth_json_switch_notification,
         runtime_auto_switch_success_notification, runtime_chatgpt_account_matches,
-        runtime_client_notification_value, sanitize_startup_log_message,
-        select_current_kept_login_account, shared_runtime_auto_switch_coordinator,
-        token_prewarm_attempt_result_for_login_result, token_prewarm_decision,
-        token_prewarm_is_suppressed, try_send_background_runtime_command,
+        runtime_client_notification_value, runtime_login_success_client_notification,
+        sanitize_startup_log_message, select_current_kept_login_account,
+        shared_runtime_auto_switch_coordinator, token_prewarm_attempt_result_for_login_result,
+        token_prewarm_decision, token_prewarm_is_suppressed, try_send_background_runtime_command,
         usage_limit_error_requires_switch, validate_remote_capable_codex_args,
     };
     use crate::types::{AuthData, NewChatGptAccount, StoredAccount};
@@ -3246,6 +3438,24 @@ mod tests {
         assert_eq!(
             format_codex_args_summary_for_log(&["--model".to_string(), "gpt-test".to_string()]),
             "default (2 args)"
+        );
+    }
+
+    #[test]
+    fn auto_switch_log_result_sanitizes_account_names_and_reasons() {
+        let mut from = chatgpt_account("from-account-id");
+        from.name = "from\naccount".to_string();
+        let mut to = chatgpt_account("to-account-id");
+        to.name = "to\taccount".to_string();
+        let result = AutoSwitchResult::Switched {
+            from: Some(Box::new(from)),
+            to: Box::new(to),
+            reason: "weekly\nusage is 100.0%".to_string(),
+        };
+
+        assert_eq!(
+            format_auto_switch_result_for_log(&result),
+            "switched from?account (from-acc) -> to?account (to-accou) - weekly?usage is 100.0%"
         );
     }
 
@@ -3615,6 +3825,20 @@ mod tests {
     }
 
     #[test]
+    fn token_prewarm_suppression_ignores_display_label_changes() {
+        let loaded = runtime_loaded_auth_expires_in("account-a", 4 * 60);
+        let renamed_state = RuntimeAuthState {
+            loaded: Some(RuntimeLoadedAuth {
+                account_label: "renamed account".to_string(),
+                ..loaded.clone()
+            }),
+            last_activity_at: Instant::now(),
+        };
+
+        assert!(token_prewarm_is_suppressed(&renamed_state, &Some(loaded)));
+    }
+
+    #[test]
     fn token_prewarm_terminal_result_suppresses_retries() {
         assert_eq!(
             token_prewarm_attempt_result_for_login_result(&RuntimeLoginResult::Terminal(
@@ -3749,7 +3973,8 @@ mod tests {
         assert_eq!(
             state.next_action(changed_snapshot.clone(), now),
             ActiveAccountReconcileAction::Attempt {
-                snapshot: changed_snapshot.clone()
+                snapshot: changed_snapshot.clone(),
+                notify_on_success: true,
             }
         );
         state.finish_attempt(
@@ -3766,7 +3991,8 @@ mod tests {
         assert_eq!(
             state.next_action(changed_snapshot.clone(), retry_at),
             ActiveAccountReconcileAction::Attempt {
-                snapshot: changed_snapshot.clone()
+                snapshot: changed_snapshot.clone(),
+                notify_on_success: true,
             }
         );
         state.finish_attempt(
@@ -3789,7 +4015,113 @@ mod tests {
         assert_eq!(
             state.next_action(initial_snapshot.clone(), now),
             ActiveAccountReconcileAction::Attempt {
-                snapshot: initial_snapshot
+                snapshot: initial_snapshot,
+                notify_on_success: false,
+            }
+        );
+    }
+
+    #[test]
+    fn active_account_reconciler_does_not_notify_after_initial_snapshot_error() {
+        let now = Instant::now();
+        let initial_snapshot = current_snapshot("account-a");
+        let mut state = ActiveAccountReconcileState::new(None, now);
+
+        assert_eq!(
+            state.next_action(initial_snapshot.clone(), now),
+            ActiveAccountReconcileAction::Attempt {
+                snapshot: initial_snapshot,
+                notify_on_success: false,
+            }
+        );
+    }
+
+    #[test]
+    fn active_account_reconciler_notifies_for_runtime_same_account_snapshot_change() {
+        let now = Instant::now();
+        let initial_snapshot = current_snapshot("account-a");
+        let mut refreshed_snapshot = current_snapshot("account-a");
+        refreshed_snapshot.auth_marker = Some("chatgpt:account-a:2:pro".to_string());
+        let mut state = ActiveAccountReconcileState::new(Some(initial_snapshot), now);
+
+        assert_eq!(
+            state.next_action(refreshed_snapshot.clone(), now),
+            ActiveAccountReconcileAction::Attempt {
+                snapshot: refreshed_snapshot,
+                notify_on_success: true,
+            }
+        );
+    }
+
+    #[test]
+    fn active_account_reconciler_preserves_notification_across_stale_token_refresh() {
+        let now = Instant::now();
+        let initial_snapshot = current_snapshot("account-a");
+        let changed_snapshot = current_snapshot("account-b");
+        let mut refreshed_snapshot = current_snapshot("account-b");
+        refreshed_snapshot.auth_marker = Some("chatgpt:account-b:2:pro".to_string());
+        let mut state = ActiveAccountReconcileState::new(Some(initial_snapshot), now);
+
+        assert_eq!(
+            state.next_action(changed_snapshot.clone(), now),
+            ActiveAccountReconcileAction::Attempt {
+                snapshot: changed_snapshot.clone(),
+                notify_on_success: true,
+            }
+        );
+        state.finish_attempt(&changed_snapshot, ActiveAccountReconcileOutcome::Stale, now);
+
+        assert_eq!(
+            state.next_action(refreshed_snapshot.clone(), now),
+            ActiveAccountReconcileAction::Attempt {
+                snapshot: refreshed_snapshot.clone(),
+                notify_on_success: true,
+            }
+        );
+        state.finish_attempt(
+            &refreshed_snapshot,
+            ActiveAccountReconcileOutcome::Success,
+            now,
+        );
+
+        let mut second_refresh = current_snapshot("account-b");
+        second_refresh.auth_marker = Some("chatgpt:account-b:3:pro".to_string());
+        assert_eq!(
+            state.next_action(second_refresh.clone(), now),
+            ActiveAccountReconcileAction::Attempt {
+                snapshot: second_refresh,
+                notify_on_success: true,
+            }
+        );
+    }
+
+    #[test]
+    fn active_account_reconciler_notifies_after_terminal_then_same_account_relogin() {
+        let now = Instant::now();
+        let initial_snapshot = current_snapshot("account-a");
+        let first_snapshot = current_snapshot("account-b");
+        let mut relogin_snapshot = current_snapshot("account-b");
+        relogin_snapshot.auth_marker = Some("chatgpt:account-b:replacement:pro".to_string());
+        let mut state = ActiveAccountReconcileState::new(Some(initial_snapshot), now);
+
+        assert_eq!(
+            state.next_action(first_snapshot.clone(), now),
+            ActiveAccountReconcileAction::Attempt {
+                snapshot: first_snapshot.clone(),
+                notify_on_success: true,
+            }
+        );
+        state.finish_attempt(
+            &first_snapshot,
+            ActiveAccountReconcileOutcome::Terminal("Token refresh failed".to_string()),
+            now,
+        );
+
+        assert_eq!(
+            state.next_action(relogin_snapshot.clone(), now),
+            ActiveAccountReconcileAction::Attempt {
+                snapshot: relogin_snapshot,
+                notify_on_success: true,
             }
         );
     }
@@ -3839,7 +4171,8 @@ mod tests {
             assert_eq!(
                 state.next_action(changed_snapshot.clone(), now),
                 ActiveAccountReconcileAction::Attempt {
-                    snapshot: changed_snapshot.clone()
+                    snapshot: changed_snapshot.clone(),
+                    notify_on_success: true,
                 }
             );
             state.finish_attempt(
@@ -3857,7 +4190,8 @@ mod tests {
         assert_eq!(
             state.next_action(changed_snapshot.clone(), now),
             ActiveAccountReconcileAction::Attempt {
-                snapshot: changed_snapshot.clone()
+                snapshot: changed_snapshot.clone(),
+                notify_on_success: true,
             }
         );
         state.finish_attempt(
@@ -3883,7 +4217,8 @@ mod tests {
             assert_eq!(
                 state.next_action(changed_snapshot.clone(), now),
                 ActiveAccountReconcileAction::Attempt {
-                    snapshot: changed_snapshot.clone()
+                    snapshot: changed_snapshot.clone(),
+                    notify_on_success: true,
                 }
             );
             state.finish_attempt(
@@ -3903,7 +4238,8 @@ mod tests {
         assert_eq!(
             state.next_action(changed_snapshot.clone(), now),
             ActiveAccountReconcileAction::Attempt {
-                snapshot: changed_snapshot
+                snapshot: changed_snapshot,
+                notify_on_success: true,
             }
         );
     }
@@ -3950,7 +4286,8 @@ mod tests {
         assert_eq!(
             state.next_action(second_snapshot.clone(), now),
             ActiveAccountReconcileAction::Attempt {
-                snapshot: second_snapshot
+                snapshot: second_snapshot,
+                notify_on_success: true,
             }
         );
     }
@@ -3995,6 +4332,17 @@ mod tests {
 
         assert!(!state.runtime_login_already_matches("account-a", Some(&refreshed_snapshot)));
         assert!(state.runtime_login_already_matches("account-a", None));
+    }
+
+    #[test]
+    fn proxy_reconciled_login_requires_matching_account_and_snapshot() {
+        let (background_tx, _background_rx) = mpsc::channel(1);
+        let mut state = proxy_state(background_tx);
+        let snapshot = current_snapshot("account-a");
+        state.app_server_account_id = Some("account-b".to_string());
+        state.app_server_snapshot = Some(snapshot.clone());
+
+        assert!(!state.runtime_login_already_matches("account-a", Some(&snapshot)));
     }
 
     #[test]
@@ -4066,6 +4414,29 @@ mod tests {
     }
 
     #[test]
+    fn reconciled_login_command_preserves_success_notification() {
+        let snapshot = current_snapshot("account-a");
+        let (completion_tx, _completion_rx) = oneshot::channel();
+        let notification = RuntimeClientNotification::Warning {
+            message: "codex-switch switched account to account-a".to_string(),
+        };
+        let command = RuntimeLoginCommand::reconciled(
+            prepared_login("account-a", Some(snapshot.clone())),
+            snapshot.clone(),
+            completion_tx,
+            Some(RuntimeLoginSuccessNotification::Client(
+                notification.clone(),
+            )),
+        );
+
+        assert_eq!(command.expected_snapshot, Some(snapshot));
+        assert_eq!(
+            command.success_notification,
+            Some(RuntimeLoginSuccessNotification::Client(notification))
+        );
+    }
+
+    #[test]
     fn prewarm_login_command_targets_refreshed_snapshot() {
         let snapshot = current_snapshot("account-a");
         let command = RuntimeLoginCommand::prewarm(
@@ -4105,6 +4476,24 @@ mod tests {
         assert_eq!(
             runtime_auto_switch_success_notification(Some(&account), &account, "usage changed"),
             None
+        );
+    }
+
+    #[test]
+    fn runtime_auth_json_switch_notification_formats_warning() {
+        let mut account = chatgpt_account("account-a");
+        account.name = "work\naccount".to_string();
+
+        assert_eq!(
+            runtime_login_success_client_notification(
+                runtime_auth_json_switch_notification(&account),
+                Some("personal (a6bf89b9)")
+            ),
+            RuntimeClientNotification::Warning {
+                message:
+                    "codex-switch switched account from personal (a6bf89b9) to work?account (account-) because current auth.json changed"
+                        .to_string()
+            }
         );
     }
 
@@ -4159,6 +4548,7 @@ mod tests {
     async fn proxy_internal_login_success_returns_runtime_switch_warning() {
         let (background_tx, _background_rx) = mpsc::channel(1);
         let mut state = proxy_state(background_tx);
+        state.app_server_account_id = Some("account-b".to_string());
         state.pending_login_account_id = Some("account-a".to_string());
         let notification = RuntimeClientNotification::Warning {
             message: "codex-switch switched account from a to b".to_string(),
@@ -4177,6 +4567,222 @@ mod tests {
         assert_eq!(outcome.client_notification, Some(notification));
         assert_eq!(state.app_server_account_id.as_deref(), Some("account-a"));
         assert_eq!(state.pending_login_account_id, None);
+    }
+
+    #[tokio::test]
+    async fn proxy_internal_login_success_returns_client_warning_without_previous_account() {
+        let (background_tx, _background_rx) = mpsc::channel(1);
+        let mut state = proxy_state(background_tx);
+        state.pending_login_account_id = Some("account-a".to_string());
+        let notification = RuntimeClientNotification::Warning {
+            message: "codex-switch switched account from a to b".to_string(),
+        };
+        state.pending_internal.insert(
+            "request-id".to_string(),
+            pending_login_with_success_notification("account-a", notification.clone()),
+        );
+
+        let outcome = state.handle_internal_response(&json!({
+            "id": "request-id",
+            "result": null
+        }));
+
+        assert!(outcome.is_handled());
+        assert_eq!(outcome.client_notification, Some(notification));
+        assert_eq!(state.app_server_account_id.as_deref(), Some("account-a"));
+        assert_eq!(state.pending_login_account_id, None);
+    }
+
+    #[tokio::test]
+    async fn proxy_internal_login_success_suppresses_auth_json_warning_when_account_did_not_change()
+    {
+        let (background_tx, _background_rx) = mpsc::channel(1);
+        let mut state = proxy_state(background_tx);
+        state.app_server_account_id = Some("account-a".to_string());
+        state.pending_login_account_id = Some("account-a".to_string());
+        state.pending_internal.insert(
+            "request-id".to_string(),
+            pending_login_with_auth_json_success_notification("account-a"),
+        );
+
+        let outcome = state.handle_internal_response(&json!({
+            "id": "request-id",
+            "result": null
+        }));
+
+        assert!(outcome.is_handled());
+        assert_eq!(outcome.client_notification, None);
+        assert_eq!(state.app_server_account_id.as_deref(), Some("account-a"));
+        assert_eq!(state.pending_login_account_id, None);
+    }
+
+    #[tokio::test]
+    async fn proxy_internal_login_success_suppresses_auth_json_warning_without_previous_account() {
+        let (background_tx, _background_rx) = mpsc::channel(1);
+        let mut state = proxy_state(background_tx);
+        state.pending_login_account_id = Some("account-a".to_string());
+        state.pending_internal.insert(
+            "request-id".to_string(),
+            pending_login_with_auth_json_success_notification("account-a"),
+        );
+
+        let outcome = state.handle_internal_response(&json!({
+            "id": "request-id",
+            "result": null
+        }));
+
+        assert!(outcome.is_handled());
+        assert_eq!(outcome.client_notification, None);
+        assert_eq!(state.app_server_account_id.as_deref(), Some("account-a"));
+        assert_eq!(state.pending_login_account_id, None);
+    }
+
+    #[tokio::test]
+    async fn proxy_matching_pending_login_upgrades_auth_json_warning_to_client_warning() {
+        let (background_tx, _background_rx) = mpsc::channel(1);
+        let mut state = proxy_state(background_tx);
+        state.app_server_account_id = Some("account-b".to_string());
+        state.pending_login_account_id = Some("account-a".to_string());
+        state.pending_internal.insert(
+            "request-id".to_string(),
+            pending_login_with_auth_json_success_notification("account-a"),
+        );
+        let notification = RuntimeClientNotification::Warning {
+            message: "codex-switch switched account from account-b to account-a because weekly usage is 100.0%".to_string(),
+        };
+
+        assert_eq!(
+            state.pending_login_status_and_merge_notification(
+                "account-a",
+                None,
+                Some(RuntimeLoginSuccessNotification::Client(
+                    notification.clone()
+                ))
+            ),
+            PendingLoginStatus::Matching
+        );
+        let outcome = state.handle_internal_response(&json!({
+            "id": "request-id",
+            "result": null
+        }));
+
+        assert!(outcome.is_handled());
+        assert_eq!(outcome.client_notification, Some(notification));
+        assert_eq!(state.app_server_account_id.as_deref(), Some("account-a"));
+        assert_eq!(state.pending_login_account_id, None);
+    }
+
+    #[test]
+    fn proxy_set_runtime_loaded_auth_updates_account_label() {
+        let (background_tx, _background_rx) = mpsc::channel(1);
+        let mut state = proxy_state(background_tx);
+        state.app_server_account_id = Some("account-a".to_string());
+        state.app_server_account_label = Some("account-a label".to_string());
+
+        state.set_runtime_loaded_auth(runtime_loaded_auth("account-a"));
+        assert_eq!(
+            state.app_server_account_label.as_deref(),
+            Some("account-a (account-a)")
+        );
+
+        state.set_runtime_loaded_auth(runtime_loaded_auth("account-b"));
+        assert_eq!(
+            state.app_server_account_label.as_deref(),
+            Some("account-b (account-b)")
+        );
+    }
+
+    #[test]
+    fn proxy_mark_runtime_login_already_matched_updates_account_label() {
+        let (background_tx, _background_rx) = mpsc::channel(1);
+        let mut state = proxy_state(background_tx);
+        let prepared = prepared_login("account-a", None);
+        state.runtime_auth_state.loaded = Some(RuntimeLoadedAuth {
+            account_label: "old label".to_string(),
+            ..runtime_loaded_auth("account-a")
+        });
+
+        state.mark_runtime_login_already_matched(&prepared);
+
+        assert_eq!(
+            state.app_server_account_label.as_deref(),
+            Some("account-a (account-a)")
+        );
+        assert_eq!(
+            state
+                .runtime_auth_state
+                .loaded
+                .as_ref()
+                .map(|loaded| loaded.account_label.as_str()),
+            Some("account-a (account-a)")
+        );
+    }
+
+    #[test]
+    fn proxy_mark_runtime_login_already_matched_only_notifies_runtime_auth_on_label_change() {
+        let (background_tx, _background_rx) = mpsc::channel(1);
+        let (runtime_auth_tx, runtime_auth_rx) =
+            watch::channel(RuntimeAuthState::new(Instant::now()));
+        let mut state = ProxyState::new(
+            background_tx,
+            shared_runtime_auto_switch_coordinator(),
+            runtime_auth_tx,
+        );
+        let prepared = prepared_login("account-a", None);
+        state.runtime_auth_state.loaded = Some(runtime_loaded_auth("account-a"));
+
+        state.mark_runtime_login_already_matched(&prepared);
+        assert!(matches!(runtime_auth_rx.has_changed(), Ok(false)));
+
+        state.runtime_auth_state.loaded = Some(RuntimeLoadedAuth {
+            account_label: "old label".to_string(),
+            ..runtime_loaded_auth("account-a")
+        });
+        state.mark_runtime_login_already_matched(&prepared);
+        assert!(matches!(runtime_auth_rx.has_changed(), Ok(true)));
+    }
+
+    #[test]
+    fn proxy_already_matched_runtime_login_returns_client_warning() {
+        let (background_tx, _background_rx) = mpsc::channel(1);
+        let mut state = proxy_state(background_tx);
+        state.app_server_account_id = Some("account-a".to_string());
+        state.app_server_account_label = Some("account-a (account-a)".to_string());
+        let prepared = prepared_login("account-a", None);
+        let notification = RuntimeClientNotification::Warning {
+            message: "codex-switch switched account from account-b to account-a because weekly usage is 100.0%".to_string(),
+        };
+
+        assert_eq!(
+            state.complete_already_matched_runtime_login(
+                &prepared,
+                None,
+                Some(RuntimeLoginSuccessNotification::Client(
+                    notification.clone()
+                ))
+            ),
+            Some(notification)
+        );
+    }
+
+    #[test]
+    fn proxy_already_matched_runtime_login_suppresses_auth_json_warning() {
+        let (background_tx, _background_rx) = mpsc::channel(1);
+        let mut state = proxy_state(background_tx);
+        state.app_server_account_id = Some("account-a".to_string());
+        state.app_server_account_label = Some("account-a (account-a)".to_string());
+        let prepared = prepared_login("account-a", None);
+
+        assert_eq!(
+            state.complete_already_matched_runtime_login(
+                &prepared,
+                None,
+                Some(RuntimeLoginSuccessNotification::AuthJsonSwitch {
+                    to_label: "account-a (account-a)".to_string()
+                })
+            ),
+            None
+        );
     }
 
     #[tokio::test]
@@ -4404,6 +5010,7 @@ mod tests {
     ) -> PreparedAccountLogin {
         PreparedAccountLogin {
             account_id: account_id.to_string(),
+            account_label: format!("{account_id} ({account_id})"),
             payload: ExternalAuthPayload {
                 access_token: "access-token".to_string(),
                 chatgpt_account_id: account_id.to_string(),
@@ -4446,6 +5053,7 @@ mod tests {
     fn runtime_loaded_auth(account_id: &str) -> RuntimeLoadedAuth {
         RuntimeLoadedAuth {
             account_id: account_id.to_string(),
+            account_label: format!("{account_id} ({account_id})"),
             chatgpt_account_id: account_id.to_string(),
             access_token_expires_at: None,
             current_snapshot: None,
@@ -4477,6 +5085,27 @@ mod tests {
     fn pending_login_with_success_notification(
         account_id: &str,
         success_notification: RuntimeClientNotification,
+    ) -> PendingInternalRequest {
+        pending_login_with_login_success_notification(
+            account_id,
+            RuntimeLoginSuccessNotification::Client(success_notification),
+        )
+    }
+
+    fn pending_login_with_auth_json_success_notification(
+        account_id: &str,
+    ) -> PendingInternalRequest {
+        pending_login_with_login_success_notification(
+            account_id,
+            RuntimeLoginSuccessNotification::AuthJsonSwitch {
+                to_label: format!("{account_id} ({account_id})"),
+            },
+        )
+    }
+
+    fn pending_login_with_login_success_notification(
+        account_id: &str,
+        success_notification: RuntimeLoginSuccessNotification,
     ) -> PendingInternalRequest {
         let PendingInternalRequest::Login {
             account_id,
