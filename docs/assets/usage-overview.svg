@@ -16,22 +16,28 @@
   <g font-family="Menlo, Consolas, 'SFMono-Regular', monospace" font-size="16" fill="#d9e1f2">
     <text x="64" y="104" fill="#7dd3fc">$ codex-switch usage --all</text>
 
-    <text x="64" y="142" font-weight="700">* personal (a6bf89b9)</text>
+    <text x="64" y="142">
+      <tspan fill="#86efac" font-weight="700">*</tspan>
+      <tspan fill="#d9e1f2" font-weight="700">&#160;personal (a6bf89b9)</tspan>
+    </text>
     <text x="64" y="166" fill="#aeb7c8">plan: pro</text>
-    <text x="64" y="190">5-hour ┬ quota [█████████████████░░░] 86.0% left</text>
-    <text x="64" y="214" fill="#9aa6bd">&#160;&#160;&#160;&#160;&#160;&#160;&#160;└ reset [███████─────────────] 34% remaining, in 1h 42m (today 19:23)</text>
-    <text x="64" y="238">weekly ┬ quota [██████████████████░░] 92.0% left</text>
-    <text x="64" y="262" fill="#9aa6bd">&#160;&#160;&#160;&#160;&#160;&#160;&#160;└ reset [████████────────────] 41% remaining, in 2d 21h (Fri 16:49)</text>
+    <text x="64" y="190">5-hour ┬ quota [<tspan fill="#86efac">█████████████████</tspan><tspan fill="#5d6678">░░░</tspan>] <tspan fill="#86efac">86.0% left</tspan></text>
+    <text x="64" y="214">&#160;&#160;&#160;&#160;&#160;&#160;&#160;└ reset [███████─────────────] 34% remaining, in 1h 42m (today 19:23)</text>
+    <text x="64" y="238">weekly ┬ quota [<tspan fill="#86efac">██████████████████</tspan><tspan fill="#5d6678">░░</tspan>] <tspan fill="#86efac">92.0% left</tspan></text>
+    <text x="64" y="262">&#160;&#160;&#160;&#160;&#160;&#160;&#160;└ reset [████████────────────] 41% remaining, in 2d 21h (Fri 16:49)</text>
 
-    <text x="64" y="314" font-weight="700">work (9b3d7440) [UNAVAILABLE]</text>
+    <text x="64" y="314">
+      <tspan fill="#d9e1f2" font-weight="700">work (9b3d7440)</tspan>
+      <tspan fill="#fca5a5" font-weight="700">&#160;[UNAVAILABLE]</tspan>
+    </text>
     <text x="64" y="338" fill="#aeb7c8">plan: pro</text>
     <text x="64" y="362" fill="#fca5a5">status: weekly usage is 100.0%</text>
-    <text x="64" y="386">5-hour ┬ quota [███████████████████░] 96.0% left</text>
-    <text x="64" y="410" fill="#9aa6bd">&#160;&#160;&#160;&#160;&#160;&#160;&#160;└ reset [█████████───────────] 43% remaining, in 2h 10m (today 19:33)</text>
-    <text x="64" y="434">weekly ┬ quota [░░░░░░░░░░░░░░░░░░░░] 0.0% left</text>
-    <text x="64" y="458" fill="#9aa6bd">&#160;&#160;&#160;&#160;&#160;&#160;&#160;└ reset [███████─────────────] 35% remaining, in 2d 10h (Fri 16:49)</text>
+    <text x="64" y="386">5-hour ┬ quota [<tspan fill="#86efac">███████████████████</tspan><tspan fill="#5d6678">░</tspan>] <tspan fill="#86efac">96.0% left</tspan></text>
+    <text x="64" y="410">&#160;&#160;&#160;&#160;&#160;&#160;&#160;└ reset [█████████───────────] 43% remaining, in 2h 10m (today 19:33)</text>
+    <text x="64" y="434">weekly ┬ quota [<tspan fill="#5d6678">░░░░░░░░░░░░░░░░░░░░</tspan>] <tspan fill="#fca5a5" font-weight="700">0.0% left</tspan></text>
+    <text x="64" y="458">&#160;&#160;&#160;&#160;&#160;&#160;&#160;└ reset [███████─────────────] 35% remaining, in 2d 10h (Fri 16:49)</text>
 
-    <text x="64" y="510" fill="#facc15">overall estimate:</text>
+    <text x="64" y="510" fill="#facc15" font-weight="700">overall estimate:</text>
     <text x="64" y="534" fill="#aeb7c8">&#160;&#160;unavailable: not expected within 14d at current pace</text>
     <text x="64" y="558" fill="#aeb7c8">&#160;&#160;estimated rate: 5-hour 8.2%/h, weekly 0.3%/h</text>
   </g>
