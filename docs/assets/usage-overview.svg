@@ -37,8 +37,8 @@
     <text x="64" y="434">weekly ┬ quota [<tspan fill="#5d6678">░░░░░░░░░░░░░░░░░░░░</tspan>] <tspan fill="#fca5a5" font-weight="700">0.0% left</tspan></text>
     <text x="64" y="458">&#160;&#160;&#160;&#160;&#160;&#160;&#160;└ reset [███████─────────────] 35% remaining, in 2d 10h (Fri 16:49)</text>
 
-    <text x="64" y="510" fill="#facc15" font-weight="700">overall estimate:</text>
-    <text x="64" y="534" fill="#aeb7c8">&#160;&#160;unavailable: not expected within 14d at current pace</text>
+    <text x="64" y="510" fill="#d9e1f2" font-weight="700">overall estimate:</text>
+    <text x="64" y="534" fill="#86efac">&#160;&#160;unavailable: not expected within 14d at current pace</text>
     <text x="64" y="558" fill="#aeb7c8">&#160;&#160;estimated rate: 5-hour 8.2%/h, weekly 0.3%/h</text>
   </g>
 </svg>
