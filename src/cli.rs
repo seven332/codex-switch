@@ -61,12 +61,12 @@ pub enum Command {
         #[arg(value_name = "CODEX_ARGS", num_args = 0.., last = true, allow_hyphen_values = true)]
         codex_args: Vec<String>,
     },
-    /// Update codex-switch from GitHub Releases.
+    /// Update the current codex-switch installation.
     Update {
         /// Only check whether an update is available.
         #[arg(long)]
         check: bool,
-        /// Install a specific release version, such as 0.1.10 or v0.1.10.
+        /// Install a specific version, such as 0.1.10 or v0.1.10.
         #[arg(long)]
         version: Option<String>,
     },
