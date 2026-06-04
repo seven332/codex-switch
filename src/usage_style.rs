@@ -8,7 +8,6 @@ const ANSI_RED: &str = "\x1b[31m";
 const ANSI_YELLOW: &str = "\x1b[33m";
 const ANSI_BOLD_GREEN: &str = "\x1b[1;32m";
 const ANSI_BOLD_RED: &str = "\x1b[1;31m";
-const ANSI_BOLD_YELLOW: &str = "\x1b[1;33m";
 const QUOTA_BAR_FILLED_CHAR: char = '\u{2588}';
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -52,7 +51,10 @@ impl UsageOutputStyle {
             return self.wrap(line, ANSI_RED);
         }
         if line == "overall estimate:" {
-            return self.wrap(line, ANSI_BOLD_YELLOW);
+            return self.wrap(line, ANSI_BOLD);
+        }
+        if let Some(line) = self.style_forecast_line(line) {
+            return line;
         }
         if line.starts_with("additional ") {
             return self.wrap(line, ANSI_BOLD);
@@ -71,6 +73,19 @@ impl UsageOutputStyle {
         }
 
         line.to_string()
+    }
+
+    fn style_forecast_line(self, line: &str) -> Option<String> {
+        if line.starts_with("  unavailable: not expected") {
+            return Some(self.wrap(line, ANSI_GREEN));
+        }
+        if line.starts_with("  unavailable: not enough complete usage data") {
+            return None;
+        }
+        if line.starts_with("  unavailable:") {
+            return Some(self.wrap(line, ANSI_YELLOW));
+        }
+        None
     }
 
     fn style_account_header_line(self, line: &str) -> String {
@@ -213,8 +228,8 @@ fn is_usage_account_header_line(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ANSI_BOLD, ANSI_BOLD_GREEN, ANSI_BOLD_RED, ANSI_BOLD_YELLOW, ANSI_DIM, ANSI_GREEN,
-        ANSI_RED, ANSI_RESET, ANSI_YELLOW, UsageOutputStyle, usage_output_style,
+        ANSI_BOLD, ANSI_BOLD_GREEN, ANSI_BOLD_RED, ANSI_DIM, ANSI_GREEN, ANSI_RED, ANSI_RESET,
+        ANSI_YELLOW, UsageOutputStyle, usage_output_style,
     };
 
     #[test]
@@ -261,10 +276,31 @@ mod tests {
             "\n5-hour ┬ quota [{ANSI_GREEN}████{ANSI_RESET}{ANSI_DIM}░░░░{ANSI_RESET}] {ANSI_GREEN}80.0% left{ANSI_RESET}\n"
         )));
         assert!(styled.contains("\n       └ reset [────] 20% remaining\n"));
-        assert!(styled.contains(&format!("{ANSI_BOLD_YELLOW}overall estimate:{ANSI_RESET}")));
+        assert!(styled.contains(&format!("{ANSI_BOLD}overall estimate:{ANSI_RESET}")));
         assert!(styled.contains(&format!(
             "{ANSI_DIM}  unavailable: not enough complete usage data{ANSI_RESET}"
         )));
+    }
+
+    #[test]
+    fn colored_usage_output_style_colors_forecast_status() {
+        let style = UsageOutputStyle::colored();
+
+        let sustainable = style.style_text(
+            "overall estimate:\n  unavailable: not expected within 14d at current pace",
+        );
+        assert!(sustainable.contains(&format!("{ANSI_BOLD}overall estimate:{ANSI_RESET}")));
+        assert!(sustainable.contains(&format!(
+            "{ANSI_GREEN}  unavailable: not expected within 14d at current pace{ANSI_RESET}"
+        )));
+
+        let unavailable = style.style_text(
+            "overall estimate:\n  unavailable: in 4d 19h (Tue 12:54)\n  limited by: weekly",
+        );
+        assert!(unavailable.contains(&format!(
+            "{ANSI_YELLOW}  unavailable: in 4d 19h (Tue 12:54){ANSI_RESET}"
+        )));
+        assert!(unavailable.contains(&format!("{ANSI_DIM}  limited by: weekly{ANSI_RESET}")));
     }
 
     #[test]
