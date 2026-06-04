@@ -1,3 +1,4 @@
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
@@ -7,6 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use reqwest::StatusCode;
 use serde::Deserialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -17,6 +19,7 @@ const UPDATE_PROGRESS_BAR_WIDTH: usize = 24;
 const UPDATE_PROGRESS_FILLED: &str = "\u{2588}";
 const UPDATE_PROGRESS_EMPTY: &str = "\u{2591}";
 const MAX_UPDATE_ASSET_SIZE: u64 = 64 * 1024 * 1024;
+const CRATES_IO_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
 #[derive(Debug)]
 pub struct UpdateOptions {
@@ -45,6 +48,35 @@ pub enum UpdateOutcome {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InstallTarget {
+    ReleaseBinary(PathBuf),
+    CargoInstall {
+        executable_path: PathBuf,
+        install_root: PathBuf,
+    },
+    UnsupportedCargoInstall {
+        executable_path: PathBuf,
+        install_root: PathBuf,
+        package_id: String,
+    },
+    InvalidCargoTracking {
+        executable_path: PathBuf,
+        install_root: PathBuf,
+        message: String,
+    },
+    CargoBuildArtifact(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UpdateInstallTarget {
+    ReleaseBinary(PathBuf),
+    CargoInstall {
+        executable_path: PathBuf,
+        install_root: PathBuf,
+    },
+}
+
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
     tag_name: String,
@@ -56,6 +88,18 @@ struct GitHubReleaseAsset {
     name: String,
     browser_download_url: String,
     digest: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CargoTrackedInstall {
+    package_id: String,
+    source: CargoTrackedInstallSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CargoTrackedInstallSource {
+    CratesIo,
+    Other,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -79,10 +123,10 @@ pub async fn update(options: UpdateOptions) -> Result<UpdateOutcome> {
         .as_deref()
         .map(normalize_release_tag)
         .transpose()?;
-    let executable_path = if options.check {
+    let update_target = if options.check {
         None
     } else {
-        Some(current_executable_update_target()?)
+        Some(current_update_install_target()?)
     };
     let client = update_http_client()?;
     let release = match requested_tag.as_deref() {
@@ -100,18 +144,33 @@ pub async fn update(options: UpdateOptions) -> Result<UpdateOutcome> {
         return Ok(update_check_outcome(current_version, target_version));
     }
 
-    let executable_path = executable_path.context("Update target was not resolved")?;
-    let asset_name = current_platform_asset_name()?;
-    let asset = release_asset(&release, asset_name)?;
-    let binary = download_asset(&client, &asset.browser_download_url, asset_name).await?;
-    verify_asset_digest(&binary, asset)?;
+    let update_target = update_target.context("Update target was not resolved")?;
+    match update_target {
+        UpdateInstallTarget::ReleaseBinary(executable_path) => {
+            let asset_name = current_platform_asset_name()?;
+            let asset = release_asset(&release, asset_name)?;
+            let binary = download_asset(&client, &asset.browser_download_url, asset_name).await?;
+            verify_asset_digest(&binary, asset)?;
 
-    install_update_at(&executable_path, &binary)?;
-    Ok(UpdateOutcome::Updated {
-        previous_version: current_version.to_string(),
-        installed_version: target_version.to_string(),
-        executable_path,
-    })
+            install_update_at(&executable_path, &binary)?;
+            Ok(UpdateOutcome::Updated {
+                previous_version: current_version.to_string(),
+                installed_version: target_version.to_string(),
+                executable_path,
+            })
+        }
+        UpdateInstallTarget::CargoInstall {
+            executable_path,
+            install_root,
+        } => {
+            install_update_with_cargo(target_version, &install_root).await?;
+            Ok(UpdateOutcome::Updated {
+                previous_version: current_version.to_string(),
+                installed_version: target_version.to_string(),
+                executable_path,
+            })
+        }
+    }
 }
 
 fn update_check_outcome(
@@ -471,22 +530,363 @@ fn sha256_hex(content: &[u8]) -> String {
     result
 }
 
-fn current_executable_update_target() -> Result<PathBuf> {
+fn current_update_install_target() -> Result<UpdateInstallTarget> {
     let executable_path =
         std::env::current_exe().context("Failed to resolve current executable path")?;
-    if is_cargo_install_path(&executable_path) {
-        anyhow::bail!(
-            "Current executable appears to be installed by Cargo at {}. Use `cargo install codex-switch --locked --force` instead.",
-            executable_path.display()
-        );
+    update_install_target_for_executable_path(executable_path)
+}
+
+fn update_install_target_for_executable_path(
+    executable_path: PathBuf,
+) -> Result<UpdateInstallTarget> {
+    update_install_target_for_executable_path_with_cargo_bin_dirs(
+        executable_path,
+        &cargo_bin_dirs(),
+    )
+}
+
+fn update_install_target_for_executable_path_with_cargo_bin_dirs(
+    executable_path: PathBuf,
+    cargo_bin_dirs: &[PathBuf],
+) -> Result<UpdateInstallTarget> {
+    match install_target_for_executable_path_with_cargo_bin_dirs(executable_path, cargo_bin_dirs) {
+        InstallTarget::ReleaseBinary(executable_path) => {
+            Ok(UpdateInstallTarget::ReleaseBinary(executable_path))
+        }
+        InstallTarget::CargoInstall {
+            executable_path,
+            install_root,
+        } => Ok(UpdateInstallTarget::CargoInstall {
+            executable_path,
+            install_root,
+        }),
+        InstallTarget::CargoBuildArtifact(executable_path) => {
+            anyhow::bail!(
+                "Current executable appears to be a Cargo build artifact at {}. Install codex-switch before using `codex-switch update`.",
+                executable_path.display()
+            );
+        }
+        InstallTarget::UnsupportedCargoInstall {
+            executable_path,
+            install_root,
+            package_id,
+        } => {
+            anyhow::bail!(
+                "{}",
+                unsupported_cargo_install_message(&executable_path, &install_root, &package_id)
+            );
+        }
+        InstallTarget::InvalidCargoTracking {
+            executable_path,
+            install_root,
+            message,
+        } => {
+            anyhow::bail!(
+                "Current executable appears to be in a Cargo install root at {}, but Cargo tracking metadata could not be read from {}. Refusing to overwrite it as a release binary: {message}",
+                executable_path.display(),
+                install_root.join(".crates2.json").display()
+            );
+        }
+    }
+}
+
+fn install_target_for_executable_path_with_cargo_bin_dirs(
+    executable_path: PathBuf,
+    cargo_bin_dirs: &[PathBuf],
+) -> InstallTarget {
+    match cargo_install_root_for_path(&executable_path, cargo_bin_dirs) {
+        CargoInstallLookup::Install(cargo_install) => {
+            return match cargo_install.source {
+                CargoTrackedInstallSource::CratesIo => InstallTarget::CargoInstall {
+                    executable_path,
+                    install_root: cargo_install.install_root,
+                },
+                CargoTrackedInstallSource::Other => InstallTarget::UnsupportedCargoInstall {
+                    executable_path,
+                    install_root: cargo_install.install_root,
+                    package_id: cargo_install.package_id,
+                },
+            };
+        }
+        CargoInstallLookup::InvalidTracking(problem) => {
+            return InstallTarget::InvalidCargoTracking {
+                executable_path,
+                install_root: problem.install_root,
+                message: problem.message,
+            };
+        }
+        CargoInstallLookup::NotCargoInstall => {}
     }
     if is_cargo_build_artifact_path(&executable_path) {
-        anyhow::bail!(
-            "Current executable appears to be a Cargo build artifact at {}. Install a release binary before using `codex-switch update`.",
-            executable_path.display()
-        );
+        return InstallTarget::CargoBuildArtifact(executable_path);
     }
-    Ok(executable_path)
+    InstallTarget::ReleaseBinary(executable_path)
+}
+
+fn unsupported_cargo_install_message(
+    executable_path: &Path,
+    install_root: &Path,
+    package_id: &str,
+) -> String {
+    let reinstall_args = cargo_reinstall_args(install_root);
+    let reinstall_command = format_command(OsStr::new("cargo"), &reinstall_args);
+    format!(
+        "Current executable appears to be installed by Cargo from an unsupported source at {} ({package_id}). `codex-switch update` can update crates.io Cargo installs only; update this source install manually or reinstall from crates.io with `{reinstall_command}`.",
+        executable_path.display()
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CargoInstallRoot {
+    install_root: PathBuf,
+    package_id: String,
+    source: CargoTrackedInstallSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CargoTrackingProblem {
+    install_root: PathBuf,
+    message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CargoInstallLookup {
+    NotCargoInstall,
+    Install(CargoInstallRoot),
+    InvalidTracking(CargoTrackingProblem),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CargoTrackingLookup {
+    NoTrackingFile,
+    NoMatchingInstall,
+    MatchingInstall(CargoTrackedInstall),
+    Invalid(CargoTrackingProblem),
+}
+
+fn cargo_install_root_for_path(path: &Path, cargo_bin_dirs: &[PathBuf]) -> CargoInstallLookup {
+    if !package_executable_name_matches(path) {
+        return CargoInstallLookup::NotCargoInstall;
+    }
+    if let Some(cargo_bin_dir) = matching_cargo_bin_dir(path, cargo_bin_dirs)
+        && let Some(install_root) = cargo_bin_dir.parent()
+    {
+        return match cargo_tracking_file_install_for_bin(install_root, env!("CARGO_PKG_NAME")) {
+            CargoTrackingLookup::MatchingInstall(tracked_install) => {
+                CargoInstallLookup::Install(CargoInstallRoot {
+                    install_root: install_root.to_path_buf(),
+                    package_id: tracked_install.package_id,
+                    source: tracked_install.source,
+                })
+            }
+            CargoTrackingLookup::Invalid(problem) => CargoInstallLookup::InvalidTracking(problem),
+            CargoTrackingLookup::NoTrackingFile | CargoTrackingLookup::NoMatchingInstall => {
+                CargoInstallLookup::NotCargoInstall
+            }
+        };
+    }
+    tracked_cargo_install_root_for_path(path)
+}
+
+fn tracked_cargo_install_root_for_path(path: &Path) -> CargoInstallLookup {
+    let Some(bin_dir) = path.parent() else {
+        return CargoInstallLookup::NotCargoInstall;
+    };
+    if bin_dir.file_name() != Some(OsStr::new("bin")) {
+        return CargoInstallLookup::NotCargoInstall;
+    }
+    let Some(install_root) = bin_dir.parent().map(Path::to_path_buf) else {
+        return CargoInstallLookup::NotCargoInstall;
+    };
+    match cargo_tracking_file_install_for_bin(&install_root, env!("CARGO_PKG_NAME")) {
+        CargoTrackingLookup::MatchingInstall(tracked_install) => {
+            CargoInstallLookup::Install(CargoInstallRoot {
+                install_root,
+                package_id: tracked_install.package_id,
+                source: tracked_install.source,
+            })
+        }
+        CargoTrackingLookup::Invalid(problem) => CargoInstallLookup::InvalidTracking(problem),
+        CargoTrackingLookup::NoTrackingFile | CargoTrackingLookup::NoMatchingInstall => {
+            CargoInstallLookup::NotCargoInstall
+        }
+    }
+}
+
+fn cargo_tracking_problem(install_root: &Path, message: String) -> CargoTrackingProblem {
+    CargoTrackingProblem {
+        install_root: install_root.to_path_buf(),
+        message,
+    }
+}
+
+fn package_executable_name_matches(path: &Path) -> bool {
+    path.file_name() == Some(OsStr::new(env!("CARGO_PKG_NAME")))
+}
+
+fn cargo_tracking_file_install_for_bin(install_root: &Path, bin_name: &str) -> CargoTrackingLookup {
+    let tracking_path = install_root.join(".crates2.json");
+    let content = match fs::read(&tracking_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return CargoTrackingLookup::NoTrackingFile;
+        }
+        Err(error) => {
+            return CargoTrackingLookup::Invalid(cargo_tracking_problem(
+                install_root,
+                format!("failed to read {}: {error}", tracking_path.display()),
+            ));
+        }
+    };
+    let tracking = match serde_json::from_slice::<Value>(&content) {
+        Ok(tracking) => tracking,
+        Err(error) => {
+            return CargoTrackingLookup::Invalid(cargo_tracking_problem(
+                install_root,
+                format!("failed to parse {}: {error}", tracking_path.display()),
+            ));
+        }
+    };
+    let Some(installs_object) = tracking.get("installs").and_then(Value::as_object) else {
+        return CargoTrackingLookup::Invalid(cargo_tracking_problem(
+            install_root,
+            format!("{} is missing an installs object", tracking_path.display()),
+        ));
+    };
+
+    let mut installs = Vec::new();
+    for (package_id, entry) in installs_object {
+        if !cargo_tracking_package_id_matches(package_id, env!("CARGO_PKG_NAME")) {
+            continue;
+        }
+        let Some(bins) = entry.get("bins").and_then(Value::as_array) else {
+            return CargoTrackingLookup::Invalid(cargo_tracking_problem(
+                install_root,
+                format!("matching Cargo install entry {package_id} has missing or invalid bins"),
+            ));
+        };
+        let mut matches_bin = false;
+        for bin in bins {
+            let Some(bin) = bin.as_str() else {
+                return CargoTrackingLookup::Invalid(cargo_tracking_problem(
+                    install_root,
+                    format!("matching Cargo install entry {package_id} has a non-string bin"),
+                ));
+            };
+            if bin == bin_name {
+                matches_bin = true;
+            }
+        }
+        if matches_bin {
+            installs.push(CargoTrackedInstall {
+                package_id: package_id.clone(),
+                source: cargo_tracking_package_source(package_id),
+            });
+        }
+    }
+    installs.sort_by(|left, right| left.package_id.cmp(&right.package_id));
+    installs
+        .iter()
+        .find(|install| install.source == CargoTrackedInstallSource::Other)
+        .cloned()
+        .or_else(|| installs.into_iter().next())
+        .map_or(CargoTrackingLookup::NoMatchingInstall, |install| {
+            CargoTrackingLookup::MatchingInstall(install)
+        })
+}
+
+fn cargo_tracking_package_id_matches(package_id: &str, package_name: &str) -> bool {
+    package_id
+        .strip_prefix(package_name)
+        .is_some_and(|rest| rest.starts_with(' '))
+}
+
+fn cargo_tracking_package_source(package_id: &str) -> CargoTrackedInstallSource {
+    if cargo_tracking_package_source_value(package_id) == Some(CRATES_IO_REGISTRY_SOURCE) {
+        CargoTrackedInstallSource::CratesIo
+    } else {
+        CargoTrackedInstallSource::Other
+    }
+}
+
+fn cargo_tracking_package_source_value(package_id: &str) -> Option<&str> {
+    package_id.rsplit_once(" (")?.1.strip_suffix(')')
+}
+
+async fn install_update_with_cargo(
+    target_version: ReleaseVersion,
+    install_root: &Path,
+) -> Result<()> {
+    let cargo = cargo_executable();
+    let args = cargo_install_args(target_version, install_root);
+    let command = format_command(&cargo, &args);
+    let status = tokio::process::Command::new(&cargo)
+        .args(&args)
+        .status()
+        .await
+        .with_context(|| format!("Failed to run Cargo update command: `{command}`"))?;
+
+    if !status.success() {
+        anyhow::bail!("Cargo update command failed with status {status}: `{command}`");
+    }
+    Ok(())
+}
+
+fn cargo_executable() -> OsString {
+    non_empty_var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"))
+}
+
+fn cargo_install_args(target_version: ReleaseVersion, install_root: &Path) -> Vec<OsString> {
+    let mut args = cargo_reinstall_args(install_root);
+    args.push(OsString::from("--version"));
+    args.push(OsString::from(format!("={target_version}")));
+    args
+}
+
+fn cargo_reinstall_args(install_root: &Path) -> Vec<OsString> {
+    vec![
+        OsString::from("install"),
+        OsString::from("codex-switch"),
+        OsString::from("--locked"),
+        OsString::from("--force"),
+        OsString::from("--root"),
+        install_root.as_os_str().to_os_string(),
+    ]
+}
+
+fn format_command(command: &OsStr, args: &[OsString]) -> String {
+    let mut formatted = format_command_part(command);
+    for arg in args {
+        formatted.push(' ');
+        formatted.push_str(&format_command_part(arg));
+    }
+    formatted
+}
+
+fn format_command_part(value: &OsStr) -> String {
+    let value = value.to_string_lossy();
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    if value.chars().all(is_unquoted_command_char) {
+        return value.into_owned();
+    }
+
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for value_char in value.chars() {
+        if value_char == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(value_char);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+fn is_unquoted_command_char(value: char) -> bool {
+    value.is_ascii_alphanumeric() || matches!(value, '/' | '.' | '_' | '-' | '+' | ':' | '=')
 }
 
 fn install_update_at(executable_path: &Path, binary: &[u8]) -> Result<()> {
@@ -499,11 +899,12 @@ fn install_update_at(executable_path: &Path, binary: &[u8]) -> Result<()> {
     })
 }
 
-fn is_cargo_install_path(path: &Path) -> bool {
-    let Some(parent) = path.parent() else {
-        return false;
-    };
-    cargo_bin_dir().as_deref() == Some(parent)
+fn matching_cargo_bin_dir<'a>(path: &Path, cargo_bin_dirs: &'a [PathBuf]) -> Option<&'a Path> {
+    let parent = path.parent()?;
+    cargo_bin_dirs
+        .iter()
+        .find(|cargo_bin_dir| cargo_bin_dir.as_path() == parent)
+        .map(PathBuf::as_path)
 }
 
 fn is_cargo_build_artifact_path(path: &Path) -> bool {
@@ -511,17 +912,26 @@ fn is_cargo_build_artifact_path(path: &Path) -> bool {
     path.starts_with(manifest_dir.join("target"))
 }
 
-fn cargo_bin_dir() -> Option<PathBuf> {
-    if let Some(cargo_home) = std::env::var_os("CARGO_HOME") {
-        return Some(PathBuf::from(cargo_home).join("bin"));
+fn cargo_bin_dirs() -> Vec<PathBuf> {
+    let mut bin_dirs = Vec::new();
+    if let Some(install_root) = non_empty_var_os("CARGO_INSTALL_ROOT") {
+        bin_dirs.push(PathBuf::from(install_root).join("bin"));
     }
-    dirs::home_dir().map(|home| home.join(".cargo").join("bin"))
+    if let Some(cargo_home) = non_empty_var_os("CARGO_HOME") {
+        bin_dirs.push(PathBuf::from(cargo_home).join("bin"));
+    } else if let Some(home) = dirs::home_dir() {
+        bin_dirs.push(home.join(".cargo").join("bin"));
+    }
+    bin_dirs.dedup();
+    bin_dirs
+}
+
+fn non_empty_var_os(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(name).filter(|value| !value.is_empty())
 }
 
 fn install_failure_hint(path: &Path) -> String {
-    if is_cargo_install_path(path) {
-        "Use `cargo install codex-switch --locked --force` instead.".to_string()
-    } else if is_cargo_build_artifact_path(path) {
+    if is_cargo_build_artifact_path(path) {
         "Install a release binary before using `codex-switch update`.".to_string()
     } else {
         "The current executable path may not be writable. Re-run your install script or install the release binary with elevated permissions.".to_string()
@@ -587,17 +997,21 @@ fn update_temp_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::{OsStr, OsString};
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use uuid::Uuid;
 
     use super::{
-        GitHubRelease, GitHubReleaseAsset, UpdateOutcome, format_bytes, format_download_progress,
-        format_progress_bar, install_binary_at, is_cargo_build_artifact_path,
+        GitHubRelease, GitHubReleaseAsset, InstallTarget, UpdateInstallTarget, UpdateOutcome,
+        cargo_install_args, format_bytes, format_command, format_download_progress,
+        format_progress_bar, install_binary_at,
+        install_target_for_executable_path_with_cargo_bin_dirs, is_cargo_build_artifact_path,
         normalize_release_tag, parse_asset_sha256_digest, parse_release_version,
-        platform_asset_name, release_asset, sha256_hex, update_check_outcome, update_temp_path,
-        validate_asset_content_length, validate_asset_size, verify_asset_digest,
+        platform_asset_name, release_asset, sha256_hex, unsupported_cargo_install_message,
+        update_check_outcome, update_install_target_for_executable_path_with_cargo_bin_dirs,
+        update_temp_path, validate_asset_content_length, validate_asset_size, verify_asset_digest,
     };
 
     #[test]
@@ -687,9 +1101,292 @@ mod tests {
             .join("codex-switch");
 
         assert!(is_cargo_build_artifact_path(&path));
+        assert!(matches!(
+            install_target_for_executable_path_with_cargo_bin_dirs(path.clone(), &[]),
+            InstallTarget::CargoBuildArtifact(_)
+        ));
+        assert!(update_install_target_for_executable_path_with_cargo_bin_dirs(path, &[]).is_err());
         assert!(!is_cargo_build_artifact_path(
             PathBuf::from("/usr/local/bin/codex-switch").as_path()
         ));
+    }
+
+    #[test]
+    fn cargo_install_path_uses_cargo_install_target() {
+        let install_root = temp_cargo_root("tracked-default-root");
+        write_cargo_tracking_file(
+            &install_root,
+            r#"{"installs":{"codex-switch 0.1.19 (registry+https://github.com/rust-lang/crates.io-index)":{"bins":["codex-switch"]}}}"#,
+        );
+        let path = install_root.join("bin").join("codex-switch");
+
+        assert_eq!(
+            update_install_target_for_executable_path_with_cargo_bin_dirs(
+                path.clone(),
+                &[install_root.join("bin")]
+            )
+            .unwrap(),
+            UpdateInstallTarget::CargoInstall {
+                executable_path: path,
+                install_root: install_root.clone(),
+            }
+        );
+        fs::remove_dir_all(install_root).expect("test root should be removed");
+    }
+
+    #[test]
+    fn cargo_install_path_without_tracking_is_release_binary_target() {
+        let install_root = temp_cargo_root("untracked-default-root");
+        let path = install_root.join("bin").join("codex-switch");
+
+        assert_eq!(
+            install_target_for_executable_path_with_cargo_bin_dirs(
+                path.clone(),
+                &[install_root.join("bin")]
+            ),
+            InstallTarget::ReleaseBinary(path)
+        );
+        fs::remove_dir_all(install_root).expect("test root should be removed");
+    }
+
+    #[test]
+    fn cargo_install_path_ignores_renamed_binary() {
+        let install_root = PathBuf::from("/home/user/.cargo");
+        let path = install_root.join("bin").join("cs");
+
+        assert_eq!(
+            install_target_for_executable_path_with_cargo_bin_dirs(
+                path.clone(),
+                &[install_root.join("bin")]
+            ),
+            InstallTarget::ReleaseBinary(path)
+        );
+    }
+
+    #[test]
+    fn cargo_install_root_path_uses_matching_cargo_install_root() {
+        let default_root = PathBuf::from("/home/user/.cargo");
+        let custom_root = temp_cargo_root("tracked-custom-root");
+        write_cargo_tracking_file(
+            &custom_root,
+            r#"{"installs":{"codex-switch 0.1.19 (registry+https://github.com/rust-lang/crates.io-index)":{"bins":["codex-switch"]}}}"#,
+        );
+        let path = custom_root.join("bin").join("codex-switch");
+
+        assert_eq!(
+            install_target_for_executable_path_with_cargo_bin_dirs(
+                path.clone(),
+                &[default_root.join("bin"), custom_root.join("bin")]
+            ),
+            InstallTarget::CargoInstall {
+                executable_path: path,
+                install_root: custom_root.clone(),
+            }
+        );
+        fs::remove_dir_all(custom_root).expect("test root should be removed");
+    }
+
+    #[test]
+    fn cargo_tracking_file_detects_unconfigured_install_root() {
+        let install_root = temp_cargo_root("unconfigured-root");
+        write_cargo_tracking_file(
+            &install_root,
+            r#"{"installs":{"codex-switch 0.1.19 (registry+https://github.com/rust-lang/crates.io-index)":{"bins":["codex-switch"]}}}"#,
+        );
+        let path = install_root.join("bin").join("codex-switch");
+
+        assert_eq!(
+            install_target_for_executable_path_with_cargo_bin_dirs(path.clone(), &[]),
+            InstallTarget::CargoInstall {
+                executable_path: path,
+                install_root: install_root.clone(),
+            }
+        );
+        fs::remove_dir_all(install_root).expect("test root should be removed");
+    }
+
+    #[test]
+    fn cargo_tracking_file_ignores_other_package_with_same_bin() {
+        let install_root = temp_cargo_root("other-package-same-bin");
+        write_cargo_tracking_file(
+            &install_root,
+            r#"{"installs":{"codex-switcher 0.1.19 (registry+https://github.com/rust-lang/crates.io-index)":{"bins":["codex-switch"]}}}"#,
+        );
+        let path = install_root.join("bin").join("codex-switch");
+
+        assert_eq!(
+            install_target_for_executable_path_with_cargo_bin_dirs(path.clone(), &[]),
+            InstallTarget::ReleaseBinary(path)
+        );
+        fs::remove_dir_all(install_root).expect("test root should be removed");
+    }
+
+    #[test]
+    fn invalid_cargo_tracking_file_is_not_release_binary_target() {
+        let install_root = temp_cargo_root("invalid-tracking");
+        write_cargo_tracking_file(&install_root, "{");
+        let path = install_root.join("bin").join("codex-switch");
+
+        let target = install_target_for_executable_path_with_cargo_bin_dirs(
+            path.clone(),
+            &[install_root.join("bin")],
+        );
+
+        assert!(matches!(
+            &target,
+            InstallTarget::InvalidCargoTracking { .. }
+        ));
+        assert!(
+            update_install_target_for_executable_path_with_cargo_bin_dirs(
+                path,
+                &[install_root.join("bin")]
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("Refusing to overwrite it as a release binary")
+        );
+        fs::remove_dir_all(install_root).expect("test root should be removed");
+    }
+
+    #[test]
+    fn cargo_tracking_file_ignores_malformed_unrelated_entries() {
+        let install_root = temp_cargo_root("malformed-unrelated");
+        write_cargo_tracking_file(
+            &install_root,
+            r#"{"installs":{"other-tool 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)":{"bins":42},"codex-switch 0.1.19 (registry+https://github.com/rust-lang/crates.io-index)":{"bins":["codex-switch"]}}}"#,
+        );
+        let path = install_root.join("bin").join("codex-switch");
+
+        assert_eq!(
+            install_target_for_executable_path_with_cargo_bin_dirs(path.clone(), &[]),
+            InstallTarget::CargoInstall {
+                executable_path: path,
+                install_root: install_root.clone(),
+            }
+        );
+        fs::remove_dir_all(install_root).expect("test root should be removed");
+    }
+
+    #[test]
+    fn cargo_tracking_file_rejects_malformed_matching_entry() {
+        let install_root = temp_cargo_root("malformed-matching");
+        write_cargo_tracking_file(
+            &install_root,
+            r#"{"installs":{"codex-switch 0.1.19 (registry+https://github.com/rust-lang/crates.io-index)":{"bins":42}}}"#,
+        );
+        let path = install_root.join("bin").join("codex-switch");
+
+        assert!(matches!(
+            install_target_for_executable_path_with_cargo_bin_dirs(path, &[]),
+            InstallTarget::InvalidCargoTracking { .. }
+        ));
+        fs::remove_dir_all(install_root).expect("test root should be removed");
+    }
+
+    #[test]
+    fn cargo_tracking_file_rejects_non_registry_source_install() {
+        let install_root = temp_cargo_root("path-source");
+        write_cargo_tracking_file(
+            &install_root,
+            r#"{"installs":{"codex-switch 0.1.19 (path+file:///workspace/codex-switch)":{"bins":["codex-switch"]}}}"#,
+        );
+        let path = install_root.join("bin").join("codex-switch");
+
+        let target = install_target_for_executable_path_with_cargo_bin_dirs(path, &[]);
+
+        assert!(matches!(
+            &target,
+            InstallTarget::UnsupportedCargoInstall { .. }
+        ));
+        assert!(
+            update_install_target_for_executable_path_with_cargo_bin_dirs(
+                install_root.join("bin").join("codex-switch"),
+                &[]
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(install_root).expect("test root should be removed");
+    }
+
+    #[test]
+    fn unsupported_cargo_install_message_keeps_install_root() {
+        let executable_path = PathBuf::from("/opt/codex-switch/bin/codex-switch");
+        let install_root = PathBuf::from("/opt/codex-switch");
+        let message = unsupported_cargo_install_message(
+            &executable_path,
+            &install_root,
+            "codex-switch 0.1.19 (path+file:///workspace/codex-switch)",
+        );
+
+        assert!(message.contains("/opt/codex-switch/bin/codex-switch"));
+        assert!(message.contains("--root /opt/codex-switch"));
+    }
+
+    #[test]
+    fn cargo_tracking_file_prefers_rejecting_ambiguous_source_install() {
+        let install_root = temp_cargo_root("mixed-source");
+        write_cargo_tracking_file(
+            &install_root,
+            r#"{"installs":{"codex-switch 0.1.19 (registry+https://github.com/rust-lang/crates.io-index)":{"bins":["codex-switch"]},"codex-switch 0.1.20 (git+https://github.com/seven332/codex-switch?rev=main)":{"bins":["codex-switch"]}}}"#,
+        );
+        let path = install_root.join("bin").join("codex-switch");
+
+        let target = install_target_for_executable_path_with_cargo_bin_dirs(path, &[]);
+
+        assert!(matches!(
+            &target,
+            InstallTarget::UnsupportedCargoInstall { .. }
+        ));
+        fs::remove_dir_all(install_root).expect("test root should be removed");
+    }
+
+    #[test]
+    fn release_binary_path_uses_release_binary_target() {
+        let path = PathBuf::from("/opt/codex-switch");
+
+        assert_eq!(
+            install_target_for_executable_path_with_cargo_bin_dirs(path.clone(), &[]),
+            InstallTarget::ReleaseBinary(path)
+        );
+    }
+
+    #[test]
+    fn cargo_install_args_use_exact_target_version() {
+        let install_root = PathBuf::from("/home/user/.cargo");
+        let args = cargo_install_args(parse_release_version("0.1.19").unwrap(), &install_root)
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            [
+                "install",
+                "codex-switch",
+                "--locked",
+                "--force",
+                "--root",
+                "/home/user/.cargo",
+                "--version",
+                "=0.1.19"
+            ]
+        );
+    }
+
+    #[test]
+    fn command_format_quotes_ambiguous_arguments() {
+        let command = OsStr::new("/opt/Cargo Home/bin/cargo");
+        let args = [
+            OsString::from("install"),
+            OsString::from("codex-switch"),
+            OsString::from("--root"),
+            OsString::from("/opt/codex switch/user's root"),
+        ];
+
+        assert_eq!(
+            format_command(command, &args),
+            "'/opt/Cargo Home/bin/cargo' install codex-switch --root '/opt/codex switch/user'\\''s root'"
+        );
     }
 
     #[test]
@@ -853,6 +1550,18 @@ mod tests {
         fs::create_dir_all(&dir).expect("temp dir should be created");
         let path = dir.join("codex-switch");
         (dir, path)
+    }
+
+    fn temp_cargo_root(name: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("codex-switch-cargo-{name}-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("bin")).expect("test should create cargo bin dir");
+        root
+    }
+
+    fn write_cargo_tracking_file(install_root: &Path, content: &str) {
+        fs::write(install_root.join(".crates2.json"), content)
+            .expect("test should write cargo tracking file");
     }
 
     fn test_asset(name: &str, digest: Option<&str>) -> GitHubReleaseAsset {

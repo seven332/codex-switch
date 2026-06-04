@@ -147,7 +147,7 @@ Exporting does not change the current Codex auth file.
 
 ## Update
 
-`update` checks GitHub Releases and replaces the current release binary with the matching platform asset:
+`update` checks GitHub Releases and updates the current installation:
 
 ```sh
 codex-switch update --check
@@ -155,11 +155,9 @@ codex-switch update
 codex-switch update --version 0.1.10
 ```
 
-The updater verifies the GitHub release asset SHA-256 digest before replacing the executable. It does not run `sudo`; if the current executable path is not writable, rerun your install script or install the binary with elevated permissions. If codex-switch was installed with Cargo, use:
+For release binaries, the updater verifies the GitHub release asset SHA-256 digest before replacing the executable. It does not run `sudo`; if the current executable path is not writable, rerun your install script or install the binary with elevated permissions.
 
-```sh
-cargo install codex-switch --locked --force
-```
+If codex-switch was installed from crates.io with Cargo in a tracked Cargo install root, `update` delegates to Cargo and installs the exact matching crates.io version into the same root, so `cargo` must be available. Cargo installs from local paths or git sources are not rewritten by `update`; reinstall them manually.
 
 ## Usage
 
