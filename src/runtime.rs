@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use futures_util::stream::SplitSink;
 use futures_util::{Sink, SinkExt, StreamExt};
-use rand::Rng as _;
+use rand::RngExt as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
