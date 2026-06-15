@@ -18,6 +18,8 @@ const UPDATE_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const UPDATE_PROGRESS_BAR_WIDTH: usize = 24;
 const UPDATE_PROGRESS_FILLED: &str = "\u{2588}";
 const UPDATE_PROGRESS_EMPTY: &str = "\u{2591}";
+const TERMINAL_PROGRESS_CLEAR: &str = "\x1b]9;4;0;0\x07";
+const TERMINAL_PROGRESS_INDETERMINATE: &str = "\x1b]9;4;3;0\x07";
 const MAX_UPDATE_ASSET_SIZE: u64 = 64 * 1024 * 1024;
 const CRATES_IO_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
@@ -315,6 +317,7 @@ struct DownloadProgress<'a> {
     mode: DownloadProgressMode,
     last_render: Instant,
     rendered_terminal_line: bool,
+    rendered_terminal_progress: bool,
     finished: bool,
 }
 
@@ -332,6 +335,7 @@ impl<'a> DownloadProgress<'a> {
             mode,
             last_render: Instant::now(),
             rendered_terminal_line: false,
+            rendered_terminal_progress: false,
             finished: false,
         };
         progress.render(false);
@@ -351,6 +355,7 @@ impl<'a> DownloadProgress<'a> {
 
     fn finish(&mut self) {
         self.render(true);
+        self.clear_terminal_progress();
         self.finished = true;
     }
 
@@ -359,11 +364,15 @@ impl<'a> DownloadProgress<'a> {
         match self.mode {
             DownloadProgressMode::Terminal => {
                 let mut stderr = io::stderr().lock();
+                let terminal_progress =
+                    format_terminal_download_progress(self.downloaded, self.total);
+                let _ = stderr.write_all(terminal_progress.as_bytes());
                 let _ = write!(stderr, "\r\x1b[2K{line}");
                 if done {
                     let _ = writeln!(stderr);
                 }
                 self.rendered_terminal_line = true;
+                self.rendered_terminal_progress = true;
             }
             DownloadProgressMode::Plain => {
                 if done || self.downloaded == 0 {
@@ -374,15 +383,24 @@ impl<'a> DownloadProgress<'a> {
         }
         self.last_render = Instant::now();
     }
+
+    fn clear_terminal_progress(&mut self) {
+        if self.mode == DownloadProgressMode::Terminal && self.rendered_terminal_progress {
+            let mut stderr = io::stderr().lock();
+            let _ = stderr.write_all(TERMINAL_PROGRESS_CLEAR.as_bytes());
+            let _ = stderr.flush();
+            self.rendered_terminal_progress = false;
+        }
+    }
 }
 
 impl Drop for DownloadProgress<'_> {
     fn drop(&mut self) {
-        if self.mode == DownloadProgressMode::Terminal
-            && self.rendered_terminal_line
-            && !self.finished
-        {
-            let _ = writeln!(io::stderr());
+        if self.mode == DownloadProgressMode::Terminal && !self.finished {
+            self.clear_terminal_progress();
+            if self.rendered_terminal_line {
+                let _ = writeln!(io::stderr());
+            }
         }
     }
 }
@@ -416,6 +434,16 @@ fn format_progress_bar(downloaded: u64, total: u64) -> String {
         UPDATE_PROGRESS_FILLED.repeat(filled),
         UPDATE_PROGRESS_EMPTY.repeat(empty)
     )
+}
+
+fn format_terminal_download_progress(downloaded: u64, total: Option<u64>) -> String {
+    match total {
+        Some(total) if total > 0 => {
+            let percent = u128::from(downloaded.min(total)) * 100 / u128::from(total);
+            format!("\x1b]9;4;1;{percent}\x07")
+        }
+        _ => TERMINAL_PROGRESS_INDETERMINATE.to_string(),
+    }
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -1006,7 +1034,7 @@ mod tests {
     use super::{
         GitHubRelease, GitHubReleaseAsset, InstallTarget, UpdateInstallTarget, UpdateOutcome,
         cargo_install_args, format_bytes, format_command, format_download_progress,
-        format_progress_bar, install_binary_at,
+        format_progress_bar, format_terminal_download_progress, install_binary_at,
         install_target_for_executable_path_with_cargo_bin_dirs, is_cargo_build_artifact_path,
         normalize_release_tag, parse_asset_sha256_digest, parse_release_version,
         platform_asset_name, release_asset, sha256_hex, unsupported_cargo_install_message,
@@ -1484,6 +1512,30 @@ mod tests {
             format!("{}{}", "\u{2588}".repeat(12), "\u{2591}".repeat(12))
         );
         assert_eq!(format_progress_bar(200, 100), "\u{2588}".repeat(24));
+    }
+
+    #[test]
+    fn terminal_download_progress_formats_osc_9_4_sequences() {
+        assert_eq!(
+            format_terminal_download_progress(0, Some(100)),
+            "\x1b]9;4;1;0\x07"
+        );
+        assert_eq!(
+            format_terminal_download_progress(50, Some(100)),
+            "\x1b]9;4;1;50\x07"
+        );
+        assert_eq!(
+            format_terminal_download_progress(200, Some(100)),
+            "\x1b]9;4;1;100\x07"
+        );
+        assert_eq!(
+            format_terminal_download_progress(1024, None),
+            "\x1b]9;4;3;0\x07"
+        );
+        assert_eq!(
+            format_terminal_download_progress(1024, Some(0)),
+            "\x1b]9;4;3;0\x07"
+        );
     }
 
     #[test]
