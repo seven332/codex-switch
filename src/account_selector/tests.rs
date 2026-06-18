@@ -3596,6 +3596,7 @@ fn usage_info_with_windows(
         has_credits: None,
         unlimited_credits: None,
         credits_balance: None,
+        rate_limit_reset_credits_available: None,
         rate_limit_reached_type: None,
         additional_limits: Vec::new(),
         error: None,

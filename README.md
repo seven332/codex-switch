@@ -26,7 +26,8 @@ Use `codex-switch run` anywhere you would normally start an interactive Codex se
 - Import and export Codex-compatible `auth.json` files.
 - Switch the active Codex account safely when unmanaged Codex processes are not running.
 - Run Codex with runtime auto-switching for ChatGPT OAuth accounts.
-- Show 5-hour, weekly, credit balance when returned, and optional additional usage limits across accounts.
+- Show 5-hour, weekly, credit balance, available rate-limit resets when returned, and optional additional usage limits across accounts.
+- Manually redeem earned ChatGPT rate-limit resets.
 - Prefer accounts with usable quota and avoid accounts that are out of credits, rate-limited, or usage-limited.
 - Keep secrets local under `~/.codex-switch` and write Codex auth files with private Unix permissions.
 
@@ -56,6 +57,7 @@ codex-switch run [--codex-bin <path>] -- [CODEX_ARGS]...
 codex-switch update [--check] [--version <version>]
 codex-switch usage [--show-additional] [name-or-id]
 codex-switch usage --all [--show-additional]
+codex-switch reset-usage [name-or-id] [--yes]
 codex-switch delete <name-or-id>
 codex-switch rename <name-or-id> <new-name>
 ```
@@ -162,6 +164,15 @@ If codex-switch was installed from crates.io with Cargo in a tracked Cargo insta
 ## Usage
 
 Usage reporting is supported for ChatGPT OAuth accounts. API key accounts are listed as unsupported for usage.
+
+When ChatGPT returns earned rate-limit reset credits, `usage` prints the available count for each account. Use `reset-usage` to manually consume one reset for the selected account:
+
+```sh
+codex-switch reset-usage my-account
+codex-switch reset-usage my-account --yes
+```
+
+When no account is passed, `reset-usage` uses the current Codex auth account. The command requires ChatGPT OAuth and asks for confirmation unless `--yes` is passed. It does not run automatically from `run` or `auto-switch`.
 
 `usage --all` also prints an overall estimate for the ChatGPT OAuth account pool based on the current 5-hour and weekly usage snapshot. The estimate starts from the current account when it has usable usage data, periodically reapplies the account selection policy, and reports the estimated 5-hour and weekly usage rates when enough samples are available.
 

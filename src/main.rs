@@ -19,13 +19,15 @@ mod usage_forecast;
 mod usage_style;
 
 use std::collections::HashMap;
+use std::io::{self, IsTerminal, Write};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local, TimeZone, Utc};
 use clap::Parser;
+use uuid::Uuid;
 
 use cli::{Cli, Command};
-use types::{AccountsStore, AuthData, StoredAccount, UsageInfo};
+use types::{AccountsStore, AuthData, ConsumeRateLimitResetCreditCode, StoredAccount, UsageInfo};
 
 const USAGE_BAR_WIDTH: usize = 20;
 const USAGE_LABEL_WIDTH: usize = 6;
@@ -169,6 +171,9 @@ async fn run() -> Result<()> {
                 );
             }
         }
+        Command::ResetUsage { account, yes } => {
+            reset_usage(account.as_deref(), yes).await?;
+        }
         Command::Delete { account } => {
             let removed = store::remove_account_by_selector(&account)?;
             println!(
@@ -187,6 +192,106 @@ async fn run() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+async fn reset_usage(account_selector: Option<&str>, yes: bool) -> Result<()> {
+    let accounts_store = store::load_accounts()?;
+    let current_account_id = match account_selector {
+        Some(_) => auth_json::current_stored_account_id_best_effort(&accounts_store),
+        None => auth_json::current_stored_account_id(&accounts_store)?,
+    };
+    let account = usage_account_from_store(
+        &accounts_store,
+        account_selector,
+        current_account_id.as_deref(),
+    )?;
+    let is_current = current_account_id.as_deref() == Some(account.id.as_str());
+
+    if matches!(account.auth_data, AuthData::ApiKey { .. }) {
+        anyhow::bail!("Rate-limit resets are only supported for ChatGPT OAuth accounts");
+    }
+
+    if !yes && !confirm_rate_limit_reset(&account)? {
+        println!("Cancelled.");
+        return Ok(());
+    }
+
+    let redeem_request_id = Uuid::new_v4().to_string();
+    let response = usage::consume_rate_limit_reset_credit(&account, &redeem_request_id).await?;
+
+    match response.code {
+        ConsumeRateLimitResetCreditCode::Reset => {
+            println!(
+                "Usage reset for {} ({}).",
+                account.name,
+                store::short_id(&account.id)
+            );
+            print_refreshed_usage_after_reset(&account, is_current).await?;
+        }
+        ConsumeRateLimitResetCreditCode::AlreadyRedeemed => {
+            println!(
+                "Usage reset was already redeemed for {} ({}).",
+                account.name,
+                store::short_id(&account.id)
+            );
+            print_refreshed_usage_after_reset(&account, is_current).await?;
+        }
+        ConsumeRateLimitResetCreditCode::NothingToReset => {
+            println!(
+                "Your usage does not need a reset right now for {} ({}).",
+                account.name,
+                store::short_id(&account.id)
+            );
+        }
+        ConsumeRateLimitResetCreditCode::NoCredit => {
+            println!(
+                "No rate-limit resets are available for {} ({}).",
+                account.name,
+                store::short_id(&account.id)
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn confirm_rate_limit_reset(account: &StoredAccount) -> Result<bool> {
+    if !io::stdin().is_terminal() {
+        anyhow::bail!(
+            "Refusing to consume a rate-limit reset without confirmation. Re-run with --yes to confirm."
+        );
+    }
+
+    eprint!(
+        "Use one rate-limit reset for {} ({})? [y/N] ",
+        account.name,
+        store::short_id(&account.id)
+    );
+    io::stderr().flush().context("Failed to flush prompt")?;
+
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .context("Failed to read confirmation")?;
+    let answer = answer.trim();
+    Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
+}
+
+async fn print_refreshed_usage_after_reset(
+    account: &StoredAccount,
+    is_current: bool,
+) -> Result<()> {
+    let fresh_account = store::get_account_by_selector(&account.id)?;
+    let info = usage::get_account_usage(&fresh_account).await?;
+    println!();
+    print_usage(
+        &fresh_account,
+        &info,
+        is_current,
+        Utc::now().timestamp(),
+        false,
+    );
     Ok(())
 }
 
@@ -501,6 +606,9 @@ fn format_usage(
     if let Some(credits) = format_credits(info) {
         lines.push(credits);
     }
+    if let Some(rate_limit_reset_credits) = format_rate_limit_reset_credits(info) {
+        lines.push(rate_limit_reset_credits);
+    }
     if show_additional {
         lines.extend(format_additional_limits(info, now));
     }
@@ -589,6 +697,11 @@ fn format_credits(info: &UsageInfo) -> Option<String> {
     };
 
     Some(format!("credits: {credits}"))
+}
+
+fn format_rate_limit_reset_credits(info: &UsageInfo) -> Option<String> {
+    info.rate_limit_reset_credits_available
+        .map(|available_count| format!("rate-limit resets: {} available", available_count.max(0)))
 }
 
 fn format_additional_limits(info: &UsageInfo, now: i64) -> Vec<String> {
@@ -801,9 +914,10 @@ fn format_reset_duration(seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_limit_status, format_limit_window, format_reset_detail, format_reset_remaining_bar,
-        format_reset_remaining_percent, format_reset_timestamp_option, format_short_reset_datetime,
-        format_usage, format_usage_account_header, format_usage_forecast, format_usage_left_bar,
+        format_limit_status, format_limit_window, format_rate_limit_reset_credits,
+        format_reset_detail, format_reset_remaining_bar, format_reset_remaining_percent,
+        format_reset_timestamp_option, format_short_reset_datetime, format_usage,
+        format_usage_account_header, format_usage_forecast, format_usage_left_bar,
         format_usage_left_percent, has_forecastable_usage_account, usage_account_from_store,
     };
     use crate::store;
@@ -1116,6 +1230,36 @@ mod tests {
     }
 
     #[test]
+    fn usage_output_shows_rate_limit_reset_credits_when_present() {
+        let now = 1_800_000_000;
+        let account = StoredAccount::new_api_key("work".to_string(), "sk-test".to_string());
+        let mut info = usage_info_with_additional_limit(&account.id, now);
+        info.rate_limit_reset_credits_available = Some(2);
+
+        let output = format_usage(&account, &info, true, now, false);
+
+        assert!(output.contains("credits: 42\nrate-limit resets: 2 available"));
+    }
+
+    #[test]
+    fn rate_limit_reset_credits_are_hidden_when_missing() {
+        let info = usage_info_with_additional_limit("account-id", 1_800_000_000);
+
+        assert_eq!(format_rate_limit_reset_credits(&info), None);
+    }
+
+    #[test]
+    fn rate_limit_reset_credits_clamp_negative_values() {
+        let mut info = usage_info_with_additional_limit("account-id", 1_800_000_000);
+        info.rate_limit_reset_credits_available = Some(-1);
+
+        assert_eq!(
+            format_rate_limit_reset_credits(&info).as_deref(),
+            Some("rate-limit resets: 0 available")
+        );
+    }
+
+    #[test]
     fn usage_output_classifies_limited_status_reasons() {
         assert_eq!(
             format_limit_status("rate_limit_reached"),
@@ -1284,6 +1428,7 @@ mod tests {
             has_credits: Some(true),
             unlimited_credits: None,
             credits_balance: Some("42".to_string()),
+            rate_limit_reset_credits_available: None,
             rate_limit_reached_type: None,
             additional_limits: vec![UsageLimitInfo {
                 limit_id: Some("gpt-5.3-codex-spark".to_string()),
