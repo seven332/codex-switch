@@ -81,6 +81,14 @@ pub enum Command {
         /// Account name, full ID, or unique ID prefix. Defaults to the current Codex auth account.
         account: Option<String>,
     },
+    /// Consume one earned ChatGPT rate-limit reset for an account.
+    ResetUsage {
+        /// Account name, full ID, or unique ID prefix. Defaults to the current Codex auth account.
+        account: Option<String>,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Delete a stored account.
     Delete {
         /// Account name, full ID, or unique ID prefix.
@@ -155,5 +163,31 @@ mod tests {
         };
 
         assert_eq!(codex_args, ["--model", "gpt-5"]);
+    }
+
+    #[test]
+    fn reset_usage_defaults_to_confirmation() {
+        let cli = Cli::try_parse_from(["codex-switch", "reset-usage", "work"])
+            .expect("reset-usage should parse");
+
+        let Command::ResetUsage { account, yes } = cli.command else {
+            panic!("expected reset-usage command");
+        };
+
+        assert_eq!(account.as_deref(), Some("work"));
+        assert!(!yes);
+    }
+
+    #[test]
+    fn reset_usage_supports_yes_flag_without_account() {
+        let cli = Cli::try_parse_from(["codex-switch", "reset-usage", "--yes"])
+            .expect("reset-usage --yes should parse");
+
+        let Command::ResetUsage { account, yes } = cli.command else {
+            panic!("expected reset-usage command");
+        };
+
+        assert_eq!(account, None);
+        assert!(yes);
     }
 }

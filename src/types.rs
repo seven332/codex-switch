@@ -374,6 +374,8 @@ pub struct UsageInfo {
     pub has_credits: Option<bool>,
     pub unlimited_credits: Option<bool>,
     pub credits_balance: Option<String>,
+    #[serde(default)]
+    pub rate_limit_reset_credits_available: Option<i64>,
     pub rate_limit_reached_type: Option<String>,
     #[serde(default)]
     pub additional_limits: Vec<UsageLimitInfo>,
@@ -408,6 +410,7 @@ impl UsageInfo {
             has_credits: None,
             unlimited_credits: None,
             credits_balance: None,
+            rate_limit_reset_credits_available: None,
             rate_limit_reached_type: None,
             additional_limits: Vec::new(),
             error: Some(error),
@@ -429,6 +432,7 @@ impl UsageInfo {
             has_credits: None,
             unlimited_credits: None,
             credits_balance: None,
+            rate_limit_reset_credits_available: None,
             rate_limit_reached_type: None,
             additional_limits: Vec::new(),
             error: Some("usage unsupported".to_string()),
@@ -444,10 +448,34 @@ pub struct RateLimitStatusPayload {
     pub rate_limit: Option<Option<Box<RateLimitStatusDetails>>>,
     #[serde(rename = "credits", default)]
     pub credits: Option<Option<Box<CreditStatusDetails>>>,
+    #[serde(rename = "rate_limit_reset_credits", default)]
+    pub rate_limit_reset_credits: Option<RateLimitResetCreditsSummary>,
     #[serde(rename = "additional_rate_limits", default)]
     pub additional_rate_limits: Option<Option<Vec<AdditionalRateLimitDetails>>>,
     #[serde(rename = "rate_limit_reached_type", default)]
     pub rate_limit_reached_type: Option<Option<RateLimitReachedType>>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct RateLimitResetCreditsSummary {
+    #[serde(rename = "available_count")]
+    pub available_count: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ConsumeRateLimitResetCreditResponse {
+    pub code: ConsumeRateLimitResetCreditCode,
+    #[serde(default)]
+    pub windows_reset: i64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsumeRateLimitResetCreditCode {
+    Reset,
+    NothingToReset,
+    NoCredit,
+    AlreadyRedeemed,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -793,6 +821,45 @@ mod tests {
             serde_json::from_str(r#""future_plan""#).expect("plan should deserialize");
 
         assert_eq!(plan.as_str(), "future_plan");
+    }
+
+    #[test]
+    fn consume_rate_limit_reset_credit_response_parses_backend_codes() {
+        let response: ConsumeRateLimitResetCreditResponse = serde_json::from_value(
+            serde_json::json!({ "code": "already_redeemed", "windows_reset": 0 }),
+        )
+        .expect("consume response");
+
+        assert_eq!(
+            response.code,
+            ConsumeRateLimitResetCreditCode::AlreadyRedeemed
+        );
+        assert_eq!(response.windows_reset, 0);
+    }
+
+    #[test]
+    fn usage_info_deserializes_without_rate_limit_reset_credits() {
+        let info: UsageInfo = serde_json::from_value(serde_json::json!({
+            "account_id": "account-id",
+            "limit_id": null,
+            "limit_name": null,
+            "plan_type": "pro",
+            "primary_used_percent": null,
+            "primary_window_minutes": null,
+            "primary_resets_at": null,
+            "secondary_used_percent": null,
+            "secondary_window_minutes": null,
+            "secondary_resets_at": null,
+            "has_credits": null,
+            "unlimited_credits": null,
+            "credits_balance": null,
+            "rate_limit_reached_type": null,
+            "additional_limits": [],
+            "error": null
+        }))
+        .expect("usage info");
+
+        assert_eq!(info.rate_limit_reset_credits_available, None);
     }
 
     #[test]

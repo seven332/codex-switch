@@ -4,14 +4,16 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use futures_util::stream::{self, StreamExt};
 use reqwest::StatusCode;
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use serde::Serialize;
 
 use crate::codex_http;
 use crate::store;
 use crate::token;
 use crate::types::{
-    AdditionalRateLimitDetails, AuthData, CreditStatusDetails, RateLimitStatusDetails,
-    RateLimitStatusPayload, RateLimitWindowSnapshot, StoredAccount, UsageInfo, UsageLimitInfo,
+    AdditionalRateLimitDetails, AuthData, ConsumeRateLimitResetCreditResponse, CreditStatusDetails,
+    RateLimitStatusDetails, RateLimitStatusPayload, RateLimitWindowSnapshot, StoredAccount,
+    UsageInfo, UsageLimitInfo,
 };
 
 const CHATGPT_BACKEND_API: &str = "https://chatgpt.com/backend-api";
@@ -40,6 +42,23 @@ pub async fn get_account_usage(account: &StoredAccount) -> Result<UsageInfo> {
 
 pub async fn get_account_usage_without_auth_write(account: &StoredAccount) -> Result<UsageInfo> {
     get_account_usage_inner(account, false).await
+}
+
+pub async fn consume_rate_limit_reset_credit(
+    account: &StoredAccount,
+    redeem_request_id: &str,
+) -> Result<ConsumeRateLimitResetCreditResponse> {
+    match &account.auth_data {
+        AuthData::ApiKey { .. } => anyhow::bail!("Rate-limit resets require ChatGPT OAuth"),
+        AuthData::ChatGPT { .. } => {
+            if redeem_request_id.trim().is_empty() {
+                anyhow::bail!("redeem request id must not be empty");
+            }
+            let client = usage_http_client()?;
+            consume_rate_limit_reset_credit_with_chatgpt_auth(account, &client, redeem_request_id)
+                .await
+        }
+    }
 }
 
 async fn get_account_usage_inner(
@@ -276,6 +295,67 @@ async fn send_chatgpt_usage_request(
         .context("Failed to send usage request")
 }
 
+#[derive(Debug, Serialize)]
+struct ConsumeRateLimitResetCreditRequest<'a> {
+    redeem_request_id: &'a str,
+}
+
+async fn consume_rate_limit_reset_credit_with_chatgpt_auth(
+    account: &StoredAccount,
+    client: &reqwest::Client,
+    redeem_request_id: &str,
+) -> Result<ConsumeRateLimitResetCreditResponse> {
+    let fresh_account = token::ensure_chatgpt_tokens_fresh(account).await?;
+    let (access_token, account_id, account_is_fedramp) = extract_chatgpt_auth(&fresh_account)?;
+
+    let response = send_chatgpt_rate_limit_reset_request(
+        client,
+        access_token,
+        account_id,
+        account_is_fedramp,
+        redeem_request_id,
+    )
+    .await?;
+    if response.status() == StatusCode::UNAUTHORIZED {
+        let refreshed_account = token::refresh_chatgpt_tokens(&fresh_account).await?;
+        let (retry_token, retry_account_id, retry_is_fedramp) =
+            extract_chatgpt_auth(&refreshed_account)?;
+        let retry_response = send_chatgpt_rate_limit_reset_request(
+            client,
+            retry_token,
+            retry_account_id,
+            retry_is_fedramp,
+            redeem_request_id,
+        )
+        .await?;
+        return parse_rate_limit_reset_consume_response(retry_response).await;
+    }
+
+    parse_rate_limit_reset_consume_response(response).await
+}
+
+async fn send_chatgpt_rate_limit_reset_request(
+    client: &reqwest::Client,
+    access_token: &str,
+    chatgpt_account_id: Option<&str>,
+    chatgpt_account_is_fedramp: bool,
+    redeem_request_id: &str,
+) -> Result<reqwest::Response> {
+    let headers =
+        build_chatgpt_headers(access_token, chatgpt_account_id, chatgpt_account_is_fedramp)?;
+
+    client
+        .post(format!(
+            "{CHATGPT_BACKEND_API}/wham/rate-limit-reset-credits/consume"
+        ))
+        .headers(headers)
+        .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+        .json(&ConsumeRateLimitResetCreditRequest { redeem_request_id })
+        .send()
+        .await
+        .context("Failed to send rate-limit reset request")
+}
+
 fn build_chatgpt_headers(
     access_token: &str,
     chatgpt_account_id: Option<&str>,
@@ -324,6 +404,21 @@ async fn parse_usage_response(account_id: &str, response: reqwest::Response) -> 
         serde_json::from_str(&body).context("Failed to parse usage response")?;
 
     Ok(convert_payload_to_usage_info(account_id, payload))
+}
+
+async fn parse_rate_limit_reset_consume_response(
+    response: reqwest::Response,
+) -> Result<ConsumeRateLimitResetCreditResponse> {
+    let status = response.status();
+    if !status.is_success() {
+        let _body = response.text().await.unwrap_or_default();
+        anyhow::bail!("API error: {status}");
+    }
+
+    response
+        .json::<ConsumeRateLimitResetCreditResponse>()
+        .await
+        .context("Failed to parse rate-limit reset response")
 }
 
 fn fetch_result_for_client_build_error(
@@ -377,6 +472,10 @@ fn convert_payload_to_usage_info(account_id: &str, payload: RateLimitStatusPaylo
         .unwrap_or(0);
     let preferred = snapshots.remove(preferred_index);
     let credits = extract_credits(payload.credits);
+    let rate_limit_reset_credits_available = payload
+        .rate_limit_reset_credits
+        .as_ref()
+        .map(|summary| summary.available_count);
 
     UsageInfo {
         account_id: account_id.to_string(),
@@ -392,6 +491,7 @@ fn convert_payload_to_usage_info(account_id: &str, payload: RateLimitStatusPaylo
         has_credits: credits.as_ref().map(|credits| credits.has_credits),
         unlimited_credits: credits.as_ref().map(|credits| credits.unlimited),
         credits_balance: credits.and_then(|credits| credits.balance.flatten()),
+        rate_limit_reset_credits_available,
         rate_limit_reached_type,
         additional_limits: snapshots,
         error: None,
@@ -470,12 +570,24 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        collect_indexed_account_usage_with, collect_replacement_account_usage,
+        ConsumeRateLimitResetCreditRequest, collect_indexed_account_usage_with,
+        collect_replacement_account_usage, consume_rate_limit_reset_credit,
         convert_payload_to_usage_info,
     };
     use crate::types::RateLimitStatusPayload;
     use crate::types::{StoredAccount, UsageInfo};
     use tokio::time::sleep;
+
+    #[test]
+    fn consume_rate_limit_reset_request_uses_backend_payload_field() {
+        assert_eq!(
+            serde_json::to_value(ConsumeRateLimitResetCreditRequest {
+                redeem_request_id: "redeem-123",
+            })
+            .expect("serialize request"),
+            serde_json::json!({ "redeem_request_id": "redeem-123" })
+        );
+    }
 
     #[test]
     fn usage_payload_accepts_codex_rate_limit_reached_type_field() {
@@ -497,6 +609,9 @@ mod tests {
                 "unlimited": false,
                 "balance": "12.5"
             },
+            "rate_limit_reset_credits": {
+                "available_count": 2
+            },
             "rate_limit_reached_type": {
                 "type": "workspace_member_usage_limit_reached"
             }
@@ -513,6 +628,7 @@ mod tests {
         assert_eq!(info.primary_window_minutes, Some(300));
         assert_eq!(info.primary_resets_at, Some(1_800_000_000));
         assert_eq!(info.credits_balance.as_deref(), Some("12.5"));
+        assert_eq!(info.rate_limit_reset_credits_available, Some(2));
     }
 
     #[tokio::test]
@@ -594,6 +710,15 @@ mod tests {
         assert!(results.iter().all(|result| result.result.is_ok()));
     }
 
+    #[tokio::test]
+    async fn consume_rate_limit_reset_credit_rejects_api_key_account() {
+        let err = consume_rate_limit_reset_credit(&test_account("api-key"), "redeem-123")
+            .await
+            .expect_err("API key accounts should not support resets");
+
+        assert!(err.to_string().contains("ChatGPT OAuth"));
+    }
+
     fn test_account(id: &str) -> StoredAccount {
         let mut account = StoredAccount::new_api_key(id.to_string(), "sk-test".to_string());
         account.id = id.to_string();
@@ -615,6 +740,7 @@ mod tests {
             has_credits: None,
             unlimited_credits: None,
             credits_balance: None,
+            rate_limit_reset_credits_available: None,
             rate_limit_reached_type: None,
             additional_limits: Vec::new(),
             error: None,
