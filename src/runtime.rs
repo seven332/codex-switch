@@ -22,7 +22,10 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, accept_hdr_async, connect_async};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, accept_hdr_async_with_config, connect_async_with_config,
+};
 use uuid::Uuid;
 
 use crate::account_selector::{self, SelectionConfig};
@@ -58,6 +61,8 @@ const TOKEN_PREWARM_MAX_WINDOW: Duration = Duration::from_secs(8 * 60);
 const TOKEN_PREWARM_IDLE_AFTER: Duration = Duration::from_secs(10 * 60);
 const TOKEN_PREWARM_RETRY_DELAY: Duration = Duration::from_secs(60);
 const INTERNAL_REQUEST_ID_PREFIX: &str = "codex-switch/";
+const RUNTIME_WEBSOCKET_MAX_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
+const RUNTIME_WEBSOCKET_MAX_FRAME_SIZE: usize = RUNTIME_WEBSOCKET_MAX_MESSAGE_SIZE;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type ProxyClientStream = WebSocketStream<TcpStream>;
@@ -2173,20 +2178,30 @@ fn random_duration_between(min: Duration, max: Duration) -> Duration {
 #[allow(clippy::result_large_err)]
 async fn accept_proxy_client(stream: TcpStream, token: &str) -> Result<ProxyClientStream> {
     let expected_auth = format!("Bearer {token}");
-    accept_hdr_async(stream, move |request: &Request, response: Response| {
-        let authorized = request
-            .headers()
-            .get(AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value == expected_auth);
-        if authorized {
-            Ok(response)
-        } else {
-            Err(unauthorized_response())
-        }
-    })
+    accept_hdr_async_with_config(
+        stream,
+        move |request: &Request, response: Response| {
+            let authorized = request
+                .headers()
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value == expected_auth);
+            if authorized {
+                Ok(response)
+            } else {
+                Err(unauthorized_response())
+            }
+        },
+        Some(runtime_websocket_config()),
+    )
     .await
     .context("Failed to accept Codex websocket client")
+}
+
+fn runtime_websocket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(RUNTIME_WEBSOCKET_MAX_MESSAGE_SIZE))
+        .max_frame_size(Some(RUNTIME_WEBSOCKET_MAX_FRAME_SIZE))
 }
 
 fn unauthorized_response() -> ErrorResponse {
@@ -2952,9 +2967,10 @@ async fn connect_app_server_websocket(websocket_url: &str, token: &str) -> Resul
             .context("Invalid websocket auth token")?,
     );
 
-    let (websocket, _) = connect_async(request)
-        .await
-        .with_context(|| format!("Failed to connect to Codex app-server at {websocket_url}"))?;
+    let (websocket, _) =
+        connect_async_with_config(request, Some(runtime_websocket_config()), false)
+            .await
+            .with_context(|| format!("Failed to connect to Codex app-server at {websocket_url}"))?;
     Ok(websocket)
 }
 
@@ -3339,7 +3355,8 @@ mod tests {
         ActiveAccountReconcileState, AutoSwitchLoginMode, AutoSwitchResult,
         BackgroundAutoSwitchQueueStatus, BackgroundRuntimeRequest, CurrentAccountSnapshot,
         ExternalAuthPayload, PendingInternalRequest, PendingLoginStatus, PreparedAccountLogin,
-        ProxyState, RateLimitAutoSwitchTrigger, RuntimeAuthState, RuntimeAutoSwitchPriority,
+        ProxyState, RUNTIME_WEBSOCKET_MAX_FRAME_SIZE, RUNTIME_WEBSOCKET_MAX_MESSAGE_SIZE,
+        RateLimitAutoSwitchTrigger, RuntimeAuthState, RuntimeAutoSwitchPriority,
         RuntimeClientNotification, RuntimeCommand, RuntimeCommandSendStatus, RuntimeLoadedAuth,
         RuntimeLoginCommand, RuntimeLoginResult, RuntimeLoginSuccessNotification,
         TOKEN_PREWARM_IDLE_AFTER, TokenPrewarmAttemptResult, TokenPrewarmDecision,
@@ -3354,7 +3371,7 @@ mod tests {
         redact_runtime_log_message, runtime_auth_json_switch_notification,
         runtime_auto_switch_success_notification, runtime_chatgpt_account_matches,
         runtime_client_notification_value, runtime_login_success_client_notification,
-        sanitize_startup_log_message, select_current_kept_login_account,
+        runtime_websocket_config, sanitize_startup_log_message, select_current_kept_login_account,
         shared_runtime_auto_switch_coordinator, token_prewarm_attempt_result_for_login_result,
         token_prewarm_decision, token_prewarm_is_suppressed, try_send_background_runtime_command,
         usage_limit_error_requires_switch, validate_remote_capable_codex_args,
@@ -3389,6 +3406,21 @@ mod tests {
                 .is_some_and(|value| !value.is_empty())
         );
         assert!(request.pointer("/params/capabilities").is_none());
+    }
+
+    #[test]
+    fn runtime_websocket_config_allows_large_app_server_snapshots() {
+        let config = runtime_websocket_config();
+
+        assert_eq!(
+            config.max_message_size,
+            Some(RUNTIME_WEBSOCKET_MAX_MESSAGE_SIZE)
+        );
+        assert_eq!(
+            config.max_frame_size,
+            Some(RUNTIME_WEBSOCKET_MAX_FRAME_SIZE)
+        );
+        assert!(config.max_frame_size.unwrap_or_default() > 16 * 1024 * 1024);
     }
 
     #[test]
