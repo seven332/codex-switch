@@ -4,6 +4,7 @@ mod auto_switch;
 mod cli;
 mod codex_http;
 mod doctor;
+mod json_output;
 mod logs;
 mod oauth;
 mod process;
@@ -50,10 +51,17 @@ async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::List => {
+        Command::List { json } => {
             let store = store::load_accounts()?;
             let current_account_id = auth_json::current_stored_account_id_best_effort(&store);
-            print_accounts(&store, current_account_id.as_deref());
+            if json {
+                print_json(&json_output::list_report(
+                    &store,
+                    current_account_id.as_deref(),
+                ))?;
+            } else {
+                print_accounts(&store, current_account_id.as_deref());
+            }
         }
         Command::Login {
             name,
@@ -152,9 +160,13 @@ async fn run() -> Result<()> {
             let outcome = update::update(update::UpdateOptions { check, version }).await?;
             print_update_outcome(outcome);
         }
-        Command::Doctor { codex_bin } => {
+        Command::Doctor { codex_bin, json } => {
             let report = doctor::run(doctor::DoctorOptions { codex_bin });
-            print!("{}", report.format_human());
+            if json {
+                print_json(&json_output::doctor_report(&report))?;
+            } else {
+                print!("{}", report.format_human());
+            }
             if report.has_errors() {
                 std::process::exit(1);
             }
@@ -173,10 +185,11 @@ async fn run() -> Result<()> {
         Command::Usage {
             all,
             show_additional,
+            json,
             account,
         } => {
             if all {
-                print_all_usage(show_additional).await?;
+                print_all_usage(show_additional, json).await?;
             } else {
                 let accounts_store = store::load_accounts()?;
                 let current_account_id = match account.as_deref() {
@@ -190,13 +203,24 @@ async fn run() -> Result<()> {
                 )?;
                 let is_current = current_account_id.as_deref() == Some(account.id.as_str());
                 let info = usage::get_account_usage(&account).await?;
-                print_usage(
-                    &account,
-                    &info,
-                    is_current,
-                    Utc::now().timestamp(),
-                    show_additional,
-                );
+                let now = Utc::now().timestamp();
+                if json {
+                    let entry = json_output::UsageJsonEntry {
+                        account: &account,
+                        usage: &info,
+                    };
+                    print_json(&json_output::usage_report(
+                        &[entry],
+                        current_account_id.as_deref(),
+                        false,
+                        show_additional,
+                        now,
+                        None,
+                        None,
+                    ))?;
+                } else {
+                    print_usage(&account, &info, is_current, now, show_additional);
+                }
             }
         }
         Command::ResetUsage { account, yes } => {
@@ -220,6 +244,14 @@ async fn run() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
+    let stdout = io::stdout();
+    let mut lock = stdout.lock();
+    serde_json::to_writer_pretty(&mut lock, value).context("Failed to serialize JSON output")?;
+    writeln!(lock).context("Failed to write JSON output")?;
     Ok(())
 }
 
@@ -456,10 +488,22 @@ fn print_update_outcome(outcome: update::UpdateOutcome) {
     }
 }
 
-async fn print_all_usage(show_additional: bool) -> Result<()> {
+async fn print_all_usage(show_additional: bool, json: bool) -> Result<()> {
     let store = store::load_accounts()?;
     if store.accounts.is_empty() {
-        println!("No accounts stored.");
+        if json {
+            print_json(&json_output::usage_report(
+                &[],
+                None,
+                true,
+                show_additional,
+                Utc::now().timestamp(),
+                None,
+                None,
+            ))?;
+        } else {
+            println!("No accounts stored.");
+        }
         return Ok(());
     }
     let current_account_id = auth_json::current_stored_account_id_best_effort(&store);
@@ -471,6 +515,45 @@ async fn print_all_usage(show_additional: bool) -> Result<()> {
         .collect();
     let now = Utc::now().timestamp();
 
+    let has_forecastable_usage = has_forecastable_usage_account(&store);
+    let forecast = if has_forecastable_usage {
+        usage_forecast::forecast_all_usage(
+            &store.accounts,
+            &by_id,
+            current_account_id.as_deref(),
+            now,
+        )
+    } else {
+        None
+    };
+    let forecast_unavailable_reason = if has_forecastable_usage && forecast.is_none() {
+        Some("not enough complete usage data")
+    } else {
+        None
+    };
+
+    if json {
+        let entries = store
+            .accounts
+            .iter()
+            .filter_map(|account| {
+                by_id
+                    .get(&account.id)
+                    .map(|usage| json_output::UsageJsonEntry { account, usage })
+            })
+            .collect::<Vec<_>>();
+        print_json(&json_output::usage_report(
+            &entries,
+            current_account_id.as_deref(),
+            true,
+            show_additional,
+            now,
+            forecast.as_ref(),
+            forecast_unavailable_reason,
+        ))?;
+        return Ok(());
+    }
+
     for (index, account) in store.accounts.iter().enumerate() {
         if index > 0 {
             println!();
@@ -480,13 +563,8 @@ async fn print_all_usage(show_additional: bool) -> Result<()> {
             print_usage(account, info, is_current, now, show_additional);
         }
     }
-    if has_forecastable_usage_account(&store) {
-        if let Some(forecast) = usage_forecast::forecast_all_usage(
-            &store.accounts,
-            &by_id,
-            current_account_id.as_deref(),
-            now,
-        ) {
+    if has_forecastable_usage {
+        if let Some(forecast) = forecast {
             println!();
             print_usage_forecast(&forecast, now);
         } else {

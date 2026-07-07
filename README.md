@@ -46,7 +46,7 @@ cargo install --path .
 ## Commands
 
 ```sh
-codex-switch list
+codex-switch list [--json]
 codex-switch login <name> [--replace] [--device-auth]
 codex-switch import <name> [--file <path>]
 codex-switch export <name-or-id> [--file <path>] [--force]
@@ -57,12 +57,12 @@ codex-switch auto-switch
 codex-switch run [--codex-bin <path>]
 codex-switch run [--codex-bin <path>] -- [CODEX_ARGS]...
 codex-switch update [--check] [--version <version>]
-codex-switch doctor [--codex-bin <path>]
+codex-switch doctor [--codex-bin <path>] [--json]
 codex-switch logs path
 codex-switch logs latest
 codex-switch logs tail [--lines <n>] [--follow]
-codex-switch usage [--show-additional] [name-or-id]
-codex-switch usage --all [--show-additional]
+codex-switch usage [--show-additional] [--json] [name-or-id]
+codex-switch usage --all [--show-additional] [--json]
 codex-switch reset-usage [name-or-id] [--yes]
 codex-switch delete <name-or-id>
 codex-switch rename <name-or-id> <new-name>
@@ -213,6 +213,18 @@ When no account is passed, `reset-usage` uses the current Codex auth account. Th
 `usage --all` also prints an overall estimate for the ChatGPT OAuth account pool based on the current 5-hour and weekly usage snapshot. The estimate starts from the current account when it has usable usage data, periodically reapplies the account selection policy, and reports the estimated 5-hour and weekly usage rates when enough samples are available.
 
 Additional usage limits are hidden by default. Pass `--show-additional` to include them.
+
+## JSON Output
+
+`list`, `usage`, and `doctor` support `--json` for scripts and statusline integrations:
+
+```sh
+codex-switch list --json
+codex-switch usage --all --json
+codex-switch doctor --json
+```
+
+JSON output is printed to stdout, while diagnostics and command errors stay on stderr. Each JSON document includes `schema_version: 1` and omits credentials such as API keys, ID tokens, access tokens, refresh tokens, and raw Codex auth JSON.
 
 ## Release
 
