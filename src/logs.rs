@@ -19,6 +19,10 @@ pub(crate) fn latest_log_path() -> Result<PathBuf> {
     latest_log_path_in_dir(&log_dir)
 }
 
+pub(crate) fn prune(days: u64, dry_run: bool) -> Result<runtime_log::RuntimeLogPruneSummary> {
+    runtime_log::prune_runtime_logs(days, dry_run)
+}
+
 pub(crate) fn latest_log_path_in_dir(path: &Path) -> Result<PathBuf> {
     runtime_log::latest_runtime_log_path_in_dir(path)?
         .with_context(|| format!("No runtime logs found in {}", path.display()))
