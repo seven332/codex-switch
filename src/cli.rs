@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+pub const DEFAULT_LOG_TAIL_LINES: usize = 100;
+
 #[derive(Debug, Parser)]
 #[command(name = "codex-switch")]
 #[command(about = "Multi-account runtime switcher for Codex")]
@@ -86,6 +88,11 @@ pub enum Command {
         #[arg(long, default_value = "codex")]
         codex_bin: String,
     },
+    /// Inspect runtime diagnostic logs.
+    Logs {
+        #[command(subcommand)]
+        command: LogsCommand,
+    },
     /// Show usage for one account, the current Codex auth account, or all accounts.
     Usage {
         /// Query every stored account.
@@ -119,9 +126,26 @@ pub enum Command {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum LogsCommand {
+    /// Print the runtime log directory path.
+    Path,
+    /// Print the latest runtime log file path.
+    Latest,
+    /// Print or follow the latest runtime log.
+    Tail {
+        /// Number of existing lines to print before following.
+        #[arg(long, default_value_t = DEFAULT_LOG_TAIL_LINES)]
+        lines: usize,
+        /// Continue printing appended log output until interrupted.
+        #[arg(long)]
+        follow: bool,
+    },
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command};
+    use super::{Cli, Command, DEFAULT_LOG_TAIL_LINES, LogsCommand};
     use clap::Parser;
 
     #[test]
@@ -227,6 +251,81 @@ mod tests {
             panic!("expected doctor command");
         };
         assert_eq!(codex_bin, "/opt/codex");
+    }
+
+    #[test]
+    fn logs_path_parses() {
+        let cli =
+            Cli::try_parse_from(["codex-switch", "logs", "path"]).expect("logs path should parse");
+
+        let Command::Logs {
+            command: LogsCommand::Path,
+        } = cli.command
+        else {
+            panic!("expected logs path command");
+        };
+    }
+
+    #[test]
+    fn logs_latest_parses() {
+        let cli = Cli::try_parse_from(["codex-switch", "logs", "latest"])
+            .expect("logs latest should parse");
+
+        let Command::Logs {
+            command: LogsCommand::Latest,
+        } = cli.command
+        else {
+            panic!("expected logs latest command");
+        };
+    }
+
+    #[test]
+    fn logs_tail_defaults_to_standard_line_count() {
+        let cli =
+            Cli::try_parse_from(["codex-switch", "logs", "tail"]).expect("logs tail should parse");
+
+        let Command::Logs {
+            command: LogsCommand::Tail { lines, follow },
+        } = cli.command
+        else {
+            panic!("expected logs tail command");
+        };
+
+        assert_eq!(lines, DEFAULT_LOG_TAIL_LINES);
+        assert!(!follow);
+    }
+
+    #[test]
+    fn logs_tail_accepts_lines() {
+        let cli = Cli::try_parse_from(["codex-switch", "logs", "tail", "--lines", "25"])
+            .expect("logs tail --lines should parse");
+
+        let Command::Logs {
+            command: LogsCommand::Tail { lines, follow },
+        } = cli.command
+        else {
+            panic!("expected logs tail command");
+        };
+
+        assert_eq!(lines, 25);
+        assert!(!follow);
+    }
+
+    #[test]
+    fn logs_tail_accepts_follow_and_lines() {
+        let cli =
+            Cli::try_parse_from(["codex-switch", "logs", "tail", "--follow", "--lines", "25"])
+                .expect("logs tail --follow --lines should parse");
+
+        let Command::Logs {
+            command: LogsCommand::Tail { lines, follow },
+        } = cli.command
+        else {
+            panic!("expected logs tail command");
+        };
+
+        assert_eq!(lines, 25);
+        assert!(follow);
     }
 
     #[test]

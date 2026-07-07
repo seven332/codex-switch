@@ -58,6 +58,9 @@ codex-switch run [--codex-bin <path>]
 codex-switch run [--codex-bin <path>] -- [CODEX_ARGS]...
 codex-switch update [--check] [--version <version>]
 codex-switch doctor [--codex-bin <path>]
+codex-switch logs path
+codex-switch logs latest
+codex-switch logs tail [--lines <n>] [--follow]
 codex-switch usage [--show-additional] [name-or-id]
 codex-switch usage --all [--show-additional]
 codex-switch reset-usage [name-or-id] [--yes]
@@ -114,6 +117,16 @@ During a managed session, codex-switch can switch the running Codex app-server t
 Normal rate-limit updates do not block the TUI on usage API calls.
 
 `run` writes diagnostics to a per-process log file under `~/.codex-switch/logs/`. Before handing the terminal to Codex, startup diagnostics are also written to stderr using the default tracing format, including timestamp, level, target, and the log path, so startup hangs can be traced to initial auto-switch, app-server startup, proxy binding, or remote TUI spawn. After Codex TUI starts, codex-switch background diagnostics only go to the log file so they do not corrupt the TUI. Set `CODEX_SWITCH_LOG` to a level such as `off` or `debug`, or to a full tracing filter, to control this output.
+
+Use `logs` to inspect existing runtime logs without starting Codex or creating a new log file:
+
+```sh
+codex-switch logs path
+codex-switch logs latest
+codex-switch logs tail
+codex-switch logs tail --follow
+codex-switch logs tail --lines 200
+```
 
 ```sh
 codex-switch run
