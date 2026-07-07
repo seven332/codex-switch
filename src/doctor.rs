@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 
@@ -11,6 +12,9 @@ use crate::runtime_log;
 use crate::store;
 use crate::token;
 use crate::types::{AccountsStore, AuthData, StoredAccount};
+
+const CODEX_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 pub(crate) struct DoctorOptions {
     pub(crate) codex_bin: String,
@@ -145,26 +149,40 @@ fn add_install_checks(report: &mut DoctorReport) {
 }
 
 fn add_codex_checks(report: &mut DoctorReport, codex_bin: &str) {
-    let version_output = match Command::new(codex_bin).arg("--version").output() {
-        Ok(output) => output,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            report.push(
-                DoctorCheck::error("codex", format!("Codex executable not found: {codex_bin}"))
-                    .with_hint("install Codex or pass --codex-bin <path>"),
-            );
-            return;
-        }
-        Err(err) => {
-            report.push(
-                DoctorCheck::error(
-                    "codex",
-                    format!("failed to run {codex_bin} --version: {err}"),
-                )
-                .with_hint("verify the Codex executable path and permissions"),
-            );
-            return;
-        }
-    };
+    let version_output =
+        match run_command_with_timeout(codex_bin, &["--version"], CODEX_COMMAND_TIMEOUT) {
+            Ok(CommandProbeResult::Completed(output)) => output,
+            Ok(CommandProbeResult::TimedOut) => {
+                report.push(
+                    DoctorCheck::error(
+                        "codex",
+                        format!(
+                            "{codex_bin} --version timed out after {}s",
+                            CODEX_COMMAND_TIMEOUT.as_secs()
+                        ),
+                    )
+                    .with_hint("verify the Codex executable path; wrappers should not block"),
+                );
+                return;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                report.push(
+                    DoctorCheck::error("codex", format!("Codex executable not found: {codex_bin}"))
+                        .with_hint("install Codex or pass --codex-bin <path>"),
+                );
+                return;
+            }
+            Err(err) => {
+                report.push(
+                    DoctorCheck::error(
+                        "codex",
+                        format!("failed to run {codex_bin} --version: {err}"),
+                    )
+                    .with_hint("verify the Codex executable path and permissions"),
+                );
+                return;
+            }
+        };
 
     if !version_output.status.success() {
         report.push(
@@ -199,8 +217,22 @@ fn add_codex_checks(report: &mut DoctorReport, codex_bin: &str) {
 }
 
 fn add_codex_remote_support_check(report: &mut DoctorReport, codex_bin: &str) {
-    let help_output = match Command::new(codex_bin).arg("--help").output() {
-        Ok(output) => output,
+    let help_output = match run_command_with_timeout(codex_bin, &["--help"], CODEX_COMMAND_TIMEOUT)
+    {
+        Ok(CommandProbeResult::Completed(output)) => output,
+        Ok(CommandProbeResult::TimedOut) => {
+            report.push(
+                DoctorCheck::warn(
+                    "codex",
+                    format!(
+                        "{codex_bin} --help timed out after {}s during remote support check",
+                        CODEX_COMMAND_TIMEOUT.as_secs()
+                    ),
+                )
+                .with_hint("codex-switch run requires Codex --remote support"),
+            );
+            return;
+        }
         Err(err) => {
             report.push(
                 DoctorCheck::warn(
@@ -241,6 +273,38 @@ fn add_codex_remote_support_check(report: &mut DoctorReport, codex_bin: &str) {
             )
             .with_hint("upgrade Codex or pass --codex-bin <path> for a compatible Codex CLI"),
         );
+    }
+}
+
+enum CommandProbeResult {
+    Completed(Output),
+    TimedOut,
+}
+
+fn run_command_with_timeout(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> std::io::Result<CommandProbeResult> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output().map(CommandProbeResult::Completed);
+        }
+
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait_with_output();
+            return Ok(CommandProbeResult::TimedOut);
+        }
+
+        std::thread::sleep(COMMAND_POLL_INTERVAL);
     }
 }
 
