@@ -1,4 +1,3 @@
-use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::auto_switch;
@@ -54,10 +53,10 @@ struct AccountJson {
     auto_switch_disabled: bool,
     current: bool,
     chatgpt_account_is_fedramp: bool,
-    created_at: DateTime<Utc>,
-    last_used_at: Option<DateTime<Utc>>,
-    token_last_refresh_at: Option<DateTime<Utc>>,
-    subscription_expires_at: Option<DateTime<Utc>>,
+    created_at: i64,
+    last_used_at: Option<i64>,
+    token_last_refresh_at: Option<i64>,
+    subscription_expires_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -204,10 +203,12 @@ fn account_json(account: &StoredAccount, current_account_id: Option<&str>) -> Ac
         auto_switch_disabled: account.auto_switch_disabled,
         current: current_account_id == Some(account.id.as_str()),
         chatgpt_account_is_fedramp: account.chatgpt_account_is_fedramp,
-        created_at: account.created_at,
-        last_used_at: account.last_used_at,
-        token_last_refresh_at: account.token_last_refresh_at,
-        subscription_expires_at: account.subscription_expires_at,
+        created_at: account.created_at.timestamp(),
+        last_used_at: account.last_used_at.map(|value| value.timestamp()),
+        token_last_refresh_at: account.token_last_refresh_at.map(|value| value.timestamp()),
+        subscription_expires_at: account
+            .subscription_expires_at
+            .map(|value| value.timestamp()),
     }
 }
 
@@ -418,6 +419,13 @@ mod tests {
         assert!(!json.contains("id-token-secret-json-output"));
         assert!(!json.contains("access-token-secret-json-output"));
         assert!(!json.contains("refresh-token-secret-json-output"));
+
+        let value: Value = serde_json::from_str(&json).expect("list JSON should parse");
+        assert_eq!(value["accounts"][0]["created_at"], json!(1_700_000_000));
+        assert_eq!(
+            value["accounts"][1]["token_last_refresh_at"],
+            json!(1_700_000_010)
+        );
     }
 
     #[test]
