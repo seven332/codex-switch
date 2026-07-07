@@ -26,8 +26,12 @@ pub(crate) struct DoctorReport {
 }
 
 impl DoctorReport {
-    fn push(&mut self, check: DoctorCheck) {
+    pub(crate) fn push(&mut self, check: DoctorCheck) {
         self.checks.push(check);
+    }
+
+    pub(crate) fn checks(&self) -> &[DoctorCheck] {
+        &self.checks
     }
 
     pub(crate) fn has_errors(&self) -> bool {
@@ -54,23 +58,23 @@ impl DoctorReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DoctorCheck {
-    severity: DoctorSeverity,
-    category: &'static str,
-    message: String,
-    hints: Vec<String>,
+pub(crate) struct DoctorCheck {
+    pub(crate) severity: DoctorSeverity,
+    pub(crate) category: &'static str,
+    pub(crate) message: String,
+    pub(crate) hints: Vec<String>,
 }
 
 impl DoctorCheck {
-    fn ok(category: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn ok(category: &'static str, message: impl Into<String>) -> Self {
         Self::new(DoctorSeverity::Ok, category, message)
     }
 
-    fn warn(category: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn warn(category: &'static str, message: impl Into<String>) -> Self {
         Self::new(DoctorSeverity::Warn, category, message)
     }
 
-    fn error(category: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn error(category: &'static str, message: impl Into<String>) -> Self {
         Self::new(DoctorSeverity::Error, category, message)
     }
 
@@ -83,21 +87,21 @@ impl DoctorCheck {
         }
     }
 
-    fn with_hint(mut self, hint: impl Into<String>) -> Self {
+    pub(crate) fn with_hint(mut self, hint: impl Into<String>) -> Self {
         self.hints.push(hint.into());
         self
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DoctorSeverity {
+pub(crate) enum DoctorSeverity {
     Ok,
     Warn,
     Error,
 }
 
 impl DoctorSeverity {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Ok => "ok",
             Self::Warn => "warn",

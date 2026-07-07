@@ -16,7 +16,11 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// List stored accounts.
-    List,
+    List {
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Log in with ChatGPT/OpenAI OAuth and save the account.
     Login {
         /// Account display name.
@@ -87,6 +91,9 @@ pub enum Command {
         /// Codex executable to inspect.
         #[arg(long, default_value = "codex")]
         codex_bin: String,
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Inspect runtime diagnostic logs.
     Logs {
@@ -101,6 +108,9 @@ pub enum Command {
         /// Include additional usage limits.
         #[arg(long = "show-additional")]
         show_additional: bool,
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
         /// Account name, full ID, or unique ID prefix. Defaults to the current Codex auth account.
         account: Option<String>,
     },
@@ -147,6 +157,18 @@ pub enum LogsCommand {
 mod tests {
     use super::{Cli, Command, DEFAULT_LOG_TAIL_LINES, LogsCommand};
     use clap::Parser;
+
+    #[test]
+    fn list_accepts_json_flag() {
+        let cli =
+            Cli::try_parse_from(["codex-switch", "list", "--json"]).expect("list should parse");
+
+        let Command::List { json } = cli.command else {
+            panic!("expected list command");
+        };
+
+        assert!(json);
+    }
 
     #[test]
     fn run_args_require_double_dash_separator() {
@@ -236,10 +258,11 @@ mod tests {
         let cli = Cli::try_parse_from(["codex-switch", "doctor"])
             .expect("doctor should parse without options");
 
-        let Command::Doctor { codex_bin } = cli.command else {
+        let Command::Doctor { codex_bin, json } = cli.command else {
             panic!("expected doctor command");
         };
         assert_eq!(codex_bin, "codex");
+        assert!(!json);
     }
 
     #[test]
@@ -247,10 +270,65 @@ mod tests {
         let cli = Cli::try_parse_from(["codex-switch", "doctor", "--codex-bin", "/opt/codex"])
             .expect("doctor --codex-bin should parse");
 
-        let Command::Doctor { codex_bin } = cli.command else {
+        let Command::Doctor { codex_bin, json } = cli.command else {
             panic!("expected doctor command");
         };
         assert_eq!(codex_bin, "/opt/codex");
+        assert!(!json);
+    }
+
+    #[test]
+    fn doctor_accepts_json_flag() {
+        let cli = Cli::try_parse_from(["codex-switch", "doctor", "--json"])
+            .expect("doctor --json should parse");
+
+        let Command::Doctor { codex_bin, json } = cli.command else {
+            panic!("expected doctor command");
+        };
+        assert_eq!(codex_bin, "codex");
+        assert!(json);
+    }
+
+    #[test]
+    fn usage_accepts_json_flag() {
+        let cli = Cli::try_parse_from(["codex-switch", "usage", "work", "--json"])
+            .expect("usage --json should parse");
+
+        let Command::Usage {
+            all,
+            show_additional,
+            json,
+            account,
+        } = cli.command
+        else {
+            panic!("expected usage command");
+        };
+
+        assert!(!all);
+        assert!(!show_additional);
+        assert!(json);
+        assert_eq!(account.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn usage_all_accepts_json_flag() {
+        let cli = Cli::try_parse_from(["codex-switch", "usage", "--all", "--json"])
+            .expect("usage --all --json should parse");
+
+        let Command::Usage {
+            all,
+            show_additional,
+            json,
+            account,
+        } = cli.command
+        else {
+            panic!("expected usage command");
+        };
+
+        assert!(all);
+        assert!(!show_additional);
+        assert!(json);
+        assert_eq!(account, None);
     }
 
     #[test]
