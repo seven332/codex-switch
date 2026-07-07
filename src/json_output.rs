@@ -429,6 +429,18 @@ mod tests {
     }
 
     #[test]
+    fn list_json_handles_empty_store() {
+        let store = AccountsStore::default();
+
+        let value = serde_json::to_value(list_report(&store, None))
+            .expect("empty list JSON should serialize");
+
+        assert_eq!(value["schema_version"], json!(1));
+        assert_eq!(value["command"], json!("list"));
+        assert_eq!(value["accounts"], json!([]));
+    }
+
+    #[test]
     fn usage_json_reports_statuses_and_hides_additional_limits_by_default() {
         let now = 1_800_000_000;
         let mut account = StoredAccount::new_api_key("work".to_string(), "sk-test".to_string());
@@ -464,6 +476,20 @@ mod tests {
             json!(90.0)
         );
         assert!(value["accounts"][0]["usage"]["additional_limits"].is_null());
+    }
+
+    #[test]
+    fn usage_json_handles_empty_account_set() {
+        let report = usage_report(&[], None, true, false, 1_800_000_000, None, None);
+        let value = serde_json::to_value(report).expect("empty usage JSON should serialize");
+
+        assert_eq!(value["schema_version"], json!(1));
+        assert_eq!(value["command"], json!("usage"));
+        assert_eq!(value["all"], json!(true));
+        assert_eq!(value["generated_at"], json!(1_800_000_000));
+        assert_eq!(value["current_account_id"], Value::Null);
+        assert_eq!(value["accounts"], json!([]));
+        assert!(value["forecast"].is_null());
     }
 
     #[test]
