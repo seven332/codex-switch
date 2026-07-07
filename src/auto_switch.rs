@@ -770,6 +770,30 @@ mod tests {
     }
 
     #[test]
+    fn policy_selection_replaces_disabled_unavailable_current() {
+        let mut current = chatgpt_account("current");
+        current.auto_switch_disabled = true;
+        let replacement = chatgpt_account("replacement");
+        let evaluations = vec![
+            AccountUsageEvaluation {
+                account: current,
+                usage: usage_info_with_limits("current", 100.0, 20.0, 10, 1_000),
+                decision: UsageDecision::Unavailable("5-hour usage is 100.0%".to_string()),
+            },
+            AccountUsageEvaluation {
+                account: replacement,
+                usage: usage_info_with_limits("replacement", 10.0, 10.0, 500, 1_000),
+                decision: UsageDecision::Usable("usage is available".to_string()),
+            },
+        ];
+
+        let selected = select_usable_account_by_policy(&evaluations, Some("current"))
+            .expect("policy should select an enabled replacement");
+
+        assert_eq!(selected.account.id, "replacement");
+    }
+
+    #[test]
     fn current_disabled_usable_account_is_kept() {
         let mut current = chatgpt_account("current");
         current.auto_switch_disabled = true;
