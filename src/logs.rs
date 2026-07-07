@@ -90,7 +90,7 @@ fn read_last_lines_from_file(mut file: File, lines: usize) -> Result<(String, Fi
     }
 
     let mut reader = BufReader::new(file);
-    let mut ring = VecDeque::with_capacity(lines);
+    let mut ring = VecDeque::new();
 
     loop {
         let mut line = String::new();
@@ -212,6 +212,18 @@ mod tests {
         assert_eq!(
             tail_lines_from_path(&path, 0).expect("tail should read"),
             ""
+        );
+
+        fs::remove_dir_all(&dir).expect("test log dir should be removed");
+    }
+
+    #[test]
+    fn tail_lines_large_requested_count_does_not_preallocate_requested_capacity() {
+        let (dir, path) = temp_log("huge-request", "one\n");
+
+        assert_eq!(
+            tail_lines_from_path(&path, usize::MAX).expect("tail should read"),
+            "one\n"
         );
 
         fs::remove_dir_all(&dir).expect("test log dir should be removed");
