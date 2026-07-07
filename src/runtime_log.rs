@@ -129,6 +129,53 @@ fn runtime_log_dir() -> Result<PathBuf> {
     Ok(store::config_dir()?.join("logs"))
 }
 
+pub(crate) fn runtime_log_dir_path() -> Result<PathBuf> {
+    runtime_log_dir()
+}
+
+pub(crate) fn latest_runtime_log_path() -> Result<Option<PathBuf>> {
+    latest_runtime_log_path_in_dir(&runtime_log_dir()?)
+}
+
+pub(crate) fn latest_runtime_log_path_in_dir(path: &Path) -> Result<Option<PathBuf>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let mut latest: Option<(String, PathBuf)> = None;
+    for entry in fs::read_dir(path)
+        .with_context(|| format!("Failed to read runtime log directory: {}", path.display()))?
+    {
+        let entry = entry
+            .with_context(|| format!("Failed to read runtime log entry in {}", path.display()))?;
+        let file_type = entry.file_type().with_context(|| {
+            format!(
+                "Failed to inspect runtime log entry: {}",
+                entry.path().display()
+            )
+        })?;
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if !file_name.starts_with("codex-switch-run-") || !file_name.ends_with(".log") {
+            continue;
+        }
+
+        let path = entry.path();
+        match latest {
+            Some((ref latest_name, _)) if file_name <= latest_name.as_str() => {}
+            _ => latest = Some((file_name.to_string(), path)),
+        }
+    }
+
+    Ok(latest.map(|(_, path)| path))
+}
+
 fn create_private_log_dir(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -300,6 +347,24 @@ mod tests {
             run_log_file_name(timestamp, "dev/container", 123, uuid),
             "codex-switch-run-20260519-123456-dev-container-123-aaaaaaaabbbbccccddddeeeeeeeeeeee.log"
         );
+    }
+
+    #[test]
+    fn latest_runtime_log_path_picks_newest_named_log() {
+        let dir = std::env::temp_dir().join(format!("codex-switch-log-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("test log dir should be created");
+        let older = dir.join("codex-switch-run-20260101-000000-host-1-a.log");
+        let newer = dir.join("codex-switch-run-20260102-000000-host-1-b.log");
+        let ignored = dir.join("other.log");
+        File::create(&older).expect("older log should be created");
+        File::create(&newer).expect("newer log should be created");
+        File::create(&ignored).expect("ignored log should be created");
+
+        let latest =
+            latest_runtime_log_path_in_dir(&dir).expect("latest log lookup should succeed");
+
+        assert_eq!(latest.as_deref(), Some(newer.as_path()));
+        fs::remove_dir_all(&dir).expect("test log dir should be removed");
     }
 
     #[cfg(unix)]

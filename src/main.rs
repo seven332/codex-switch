@@ -3,6 +3,7 @@ mod auth_json;
 mod auto_switch;
 mod cli;
 mod codex_http;
+mod doctor;
 mod oauth;
 mod process;
 mod redaction;
@@ -141,6 +142,13 @@ async fn run() -> Result<()> {
         Command::Update { check, version } => {
             let outcome = update::update(update::UpdateOptions { check, version }).await?;
             print_update_outcome(outcome);
+        }
+        Command::Doctor { codex_bin } => {
+            let report = doctor::run(doctor::DoctorOptions { codex_bin });
+            print!("{}", report.format_human());
+            if report.has_errors() {
+                std::process::exit(1);
+            }
         }
         Command::Usage {
             all,

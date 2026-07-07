@@ -55,6 +55,7 @@ codex-switch auto-switch
 codex-switch run [--codex-bin <path>]
 codex-switch run [--codex-bin <path>] -- [CODEX_ARGS]...
 codex-switch update [--check] [--version <version>]
+codex-switch doctor [--codex-bin <path>]
 codex-switch usage [--show-additional] [name-or-id]
 codex-switch usage --all [--show-additional]
 codex-switch reset-usage [name-or-id] [--yes]
@@ -111,6 +112,17 @@ codex-switch run -- resume <session-id>
 ```
 
 `run` supports Codex interactive commands that accept `--remote`: the default TUI, `resume`, and `fork`. ChatGPT OAuth accounts are required for runtime switching. API key accounts are not usage-checkable and cannot be applied to the running app-server. Switching to an API key account still updates `auth.json` for the next Codex start, but existing managed `run` sessions keep their current runtime auth. The runtime switch applies through Codex's app-server auth API; an in-flight request may continue with the auth it already started with, so the request that first reports a usage-limit error may still fail before the next turn uses the replacement account.
+
+## Doctor
+
+`doctor` prints a local diagnostics report for the codex-switch installation, Codex CLI, account store, current Codex `auth.json`, sensitive file permissions, process detection, and runtime logs:
+
+```sh
+codex-switch doctor
+codex-switch doctor --codex-bin /path/to/codex
+```
+
+The default checks are local-only and read-only. They do not call ChatGPT usage APIs, refresh tokens, write `accounts.json`, write Codex `auth.json`, consume rate-limit reset credits, or switch accounts. Run `doctor` before debugging `codex-switch run` startup hangs, unexpected account matching, unsafe permissions, or missing Codex remote TUI support.
 
 ## Login
 

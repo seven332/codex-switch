@@ -136,7 +136,7 @@ fn detect_codex_version_from_bin(codex_bin: &str) -> Option<String> {
     parse_codex_version_output(&format!("{stdout}\n{stderr}"))
 }
 
-fn parse_codex_version_output(output: &str) -> Option<String> {
+pub(crate) fn parse_codex_version_output(output: &str) -> Option<String> {
     output
         .lines()
         .filter(|line| line.to_ascii_lowercase().contains("codex"))
