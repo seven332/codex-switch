@@ -351,7 +351,7 @@ fn runtime_log_timestamp_from_file_name(file_name: &str) -> Option<DateTime<Utc>
         return None;
     }
 
-    let timestamp = &body[..RUN_LOG_TIMESTAMP_LEN];
+    let timestamp = body.get(..RUN_LOG_TIMESTAMP_LEN)?;
     let remainder = body.get(RUN_LOG_TIMESTAMP_LEN..)?;
     let remainder = remainder.strip_prefix('-')?;
     let mut parts = remainder.rsplitn(3, '-');
@@ -584,6 +584,12 @@ mod tests {
         assert!(
             runtime_log_timestamp_from_file_name(
                 "codex-switch-run-20260102-030405-dev-host-abc-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.log"
+            )
+            .is_none()
+        );
+        assert!(
+            runtime_log_timestamp_from_file_name(
+                "codex-switch-run-é-é-é-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.log"
             )
             .is_none()
         );
