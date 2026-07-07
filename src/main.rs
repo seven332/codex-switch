@@ -4,6 +4,7 @@ mod auto_switch;
 mod cli;
 mod codex_http;
 mod doctor;
+mod logs;
 mod oauth;
 mod process;
 mod redaction;
@@ -27,7 +28,7 @@ use chrono::{DateTime, Datelike, Local, TimeZone, Utc};
 use clap::Parser;
 use uuid::Uuid;
 
-use cli::{Cli, Command};
+use cli::{Cli, Command, LogsCommand};
 use types::{AccountsStore, AuthData, ConsumeRateLimitResetCreditCode, StoredAccount, UsageInfo};
 
 const USAGE_BAR_WIDTH: usize = 20;
@@ -158,6 +159,17 @@ async fn run() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        Command::Logs { command } => match command {
+            LogsCommand::Path => {
+                println!("{}", logs::runtime_log_dir_path()?.display());
+            }
+            LogsCommand::Latest => {
+                println!("{}", logs::latest_log_path()?.display());
+            }
+            LogsCommand::Tail { lines, follow } => {
+                logs::tail_latest(lines, follow).await?;
+            }
+        },
         Command::Usage {
             all,
             show_additional,
