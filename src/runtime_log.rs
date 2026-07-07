@@ -274,7 +274,9 @@ fn prune_runtime_logs_in_dir_with_remover(
         i64::try_from(retention_days).context("Runtime log retention days are too large")?;
     let retention = Duration::try_days(retention_days)
         .context("Runtime log retention duration is too large")?;
-    let cutoff = now - retention;
+    let cutoff = now
+        .checked_sub_signed(retention)
+        .context("Runtime log retention cutoff is out of range")?;
     let mut summary = RuntimeLogPruneSummary::default();
     let mut candidates = Vec::new();
 
@@ -665,6 +667,20 @@ mod tests {
         assert_eq!(summary.candidates, 1);
         assert_eq!(summary.removed, 0);
         assert_eq!(summary.ignored_missing, 1);
+        fs::remove_dir_all(&dir).expect("test log dir should be removed");
+    }
+
+    #[test]
+    fn prune_runtime_logs_rejects_out_of_range_retention_without_panicking() {
+        let dir = temp_log_dir("prune-huge-retention");
+        create_test_log(&dir, "20251231-235959", "old");
+        let now = test_time("2026-01-08T00:00:00Z");
+
+        let err = prune_runtime_logs_in_dir(&dir, now, i64::MAX as u64, None, false)
+            .expect_err("out-of-range retention should error");
+
+        let message = err.to_string();
+        assert!(message.contains("too large") || message.contains("out of range"));
         fs::remove_dir_all(&dir).expect("test log dir should be removed");
     }
 
