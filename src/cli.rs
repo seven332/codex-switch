@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use crate::runtime_log::DEFAULT_RUNTIME_LOG_RETENTION_DAYS;
+
 pub const DEFAULT_LOG_TAIL_LINES: usize = 100;
 
 #[derive(Debug, Parser)]
@@ -151,11 +153,21 @@ pub enum LogsCommand {
         #[arg(long)]
         follow: bool,
     },
+    /// Delete old runtime logs.
+    Prune {
+        /// Keep runtime logs from this many recent days.
+        #[arg(long, default_value_t = DEFAULT_RUNTIME_LOG_RETENTION_DAYS, value_parser = clap::value_parser!(u64).range(1..))]
+        days: u64,
+        /// Print what would be deleted without removing files.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Cli, Command, DEFAULT_LOG_TAIL_LINES, LogsCommand};
+    use crate::runtime_log::DEFAULT_RUNTIME_LOG_RETENTION_DAYS;
     use clap::Parser;
 
     #[test]
@@ -404,6 +416,47 @@ mod tests {
 
         assert_eq!(lines, 25);
         assert!(follow);
+    }
+
+    #[test]
+    fn logs_prune_defaults_to_standard_retention() {
+        let cli = Cli::try_parse_from(["codex-switch", "logs", "prune"])
+            .expect("logs prune should parse");
+
+        let Command::Logs {
+            command: LogsCommand::Prune { days, dry_run },
+        } = cli.command
+        else {
+            panic!("expected logs prune command");
+        };
+
+        assert_eq!(days, DEFAULT_RUNTIME_LOG_RETENTION_DAYS);
+        assert!(!dry_run);
+    }
+
+    #[test]
+    fn logs_prune_accepts_days_and_dry_run() {
+        let cli =
+            Cli::try_parse_from(["codex-switch", "logs", "prune", "--days", "14", "--dry-run"])
+                .expect("logs prune options should parse");
+
+        let Command::Logs {
+            command: LogsCommand::Prune { days, dry_run },
+        } = cli.command
+        else {
+            panic!("expected logs prune command");
+        };
+
+        assert_eq!(days, 14);
+        assert!(dry_run);
+    }
+
+    #[test]
+    fn logs_prune_rejects_zero_days() {
+        let err = Cli::try_parse_from(["codex-switch", "logs", "prune", "--days", "0"])
+            .expect_err("zero-day retention should be rejected");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]

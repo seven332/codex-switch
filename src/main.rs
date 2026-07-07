@@ -181,6 +181,10 @@ async fn run() -> Result<()> {
             LogsCommand::Tail { lines, follow } => {
                 logs::tail_latest(lines, follow).await?;
             }
+            LogsCommand::Prune { days, dry_run } => {
+                let summary = logs::prune(days, dry_run)?;
+                print_log_prune_summary(summary, days, dry_run);
+            }
         },
         Command::Usage {
             all,
@@ -485,6 +489,22 @@ fn print_update_outcome(outcome: update::UpdateOutcome) {
                 );
             }
         }
+    }
+}
+
+fn print_log_prune_summary(summary: runtime_log::RuntimeLogPruneSummary, days: u64, dry_run: bool) {
+    let action = if dry_run { "Would remove" } else { "Removed" };
+    let count = if dry_run {
+        summary.candidates
+    } else {
+        summary.removed
+    };
+    println!("{action} {count} runtime log(s) older than {days} day(s).");
+    if summary.ignored_missing > 0 {
+        println!(
+            "Ignored {} runtime log(s) already removed by another process.",
+            summary.ignored_missing
+        );
     }
 }
 
