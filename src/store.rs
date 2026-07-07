@@ -211,10 +211,13 @@ pub fn find_matching_account<'a>(
     store
         .accounts
         .iter()
-        .find(|existing| has_same_auth_identity(existing, account))
+        .find(|existing| accounts_have_same_auth_identity(existing, account))
 }
 
-fn has_same_auth_identity(left: &StoredAccount, right: &StoredAccount) -> bool {
+pub(crate) fn accounts_have_same_auth_identity(
+    left: &StoredAccount,
+    right: &StoredAccount,
+) -> bool {
     match (&left.auth_data, &right.auth_data) {
         (AuthData::ApiKey { key: left_key }, AuthData::ApiKey { key: right_key }) => {
             left_key == right_key
@@ -350,7 +353,7 @@ fn add_account_to_store(
     if let Some(existing) = store
         .accounts
         .iter()
-        .find(|existing| has_same_auth_identity(existing, &account))
+        .find(|existing| accounts_have_same_auth_identity(existing, &account))
     {
         anyhow::bail!(
             "account is already stored as {} ({})",
@@ -378,7 +381,7 @@ fn replace_chatgpt_account_by_name_in_store(
             .iter()
             .enumerate()
             .find_map(|(existing_index, existing)| {
-                (existing_index != index && has_same_auth_identity(existing, &account))
+                (existing_index != index && accounts_have_same_auth_identity(existing, &account))
                     .then_some(existing)
             })
     {
@@ -596,7 +599,7 @@ mod tests {
         let left = StoredAccount::new_api_key("left".to_string(), "sk-test".to_string());
         let right = StoredAccount::new_api_key("right".to_string(), "sk-test".to_string());
 
-        assert!(has_same_auth_identity(&left, &right));
+        assert!(accounts_have_same_auth_identity(&left, &right));
     }
 
     #[test]
@@ -604,7 +607,7 @@ mod tests {
         let left = chatgpt_account("left", Some("account-id"), "refresh-left", "id-left");
         let right = chatgpt_account("right", Some("account-id"), "refresh-right", "id-right");
 
-        assert!(has_same_auth_identity(&left, &right));
+        assert!(accounts_have_same_auth_identity(&left, &right));
     }
 
     #[test]
@@ -612,7 +615,7 @@ mod tests {
         let left = chatgpt_account("left", None, "refresh-token", "id-left");
         let right = chatgpt_account("right", None, "refresh-token", "id-right");
 
-        assert!(has_same_auth_identity(&left, &right));
+        assert!(accounts_have_same_auth_identity(&left, &right));
     }
 
     #[test]
@@ -620,7 +623,7 @@ mod tests {
         let left = chatgpt_account("left", Some("left-account"), "left-refresh", "left-id");
         let right = chatgpt_account("right", Some("right-account"), "right-refresh", "right-id");
 
-        assert!(!has_same_auth_identity(&left, &right));
+        assert!(!accounts_have_same_auth_identity(&left, &right));
     }
 
     #[test]

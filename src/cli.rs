@@ -70,6 +70,12 @@ pub enum Command {
         #[arg(long)]
         version: Option<String>,
     },
+    /// Diagnose local codex-switch and Codex configuration.
+    Doctor {
+        /// Codex executable to inspect.
+        #[arg(long, default_value = "codex")]
+        codex_bin: String,
+    },
     /// Show usage for one account, the current Codex auth account, or all accounts.
     Usage {
         /// Query every stored account.
@@ -189,5 +195,27 @@ mod tests {
 
         assert_eq!(account, None);
         assert!(yes);
+    }
+
+    #[test]
+    fn doctor_defaults_to_codex_binary() {
+        let cli = Cli::try_parse_from(["codex-switch", "doctor"])
+            .expect("doctor should parse without options");
+
+        let Command::Doctor { codex_bin } = cli.command else {
+            panic!("expected doctor command");
+        };
+        assert_eq!(codex_bin, "codex");
+    }
+
+    #[test]
+    fn doctor_accepts_codex_bin() {
+        let cli = Cli::try_parse_from(["codex-switch", "doctor", "--codex-bin", "/opt/codex"])
+            .expect("doctor --codex-bin should parse");
+
+        let Command::Doctor { codex_bin } = cli.command else {
+            panic!("expected doctor command");
+        };
+        assert_eq!(codex_bin, "/opt/codex");
     }
 }
