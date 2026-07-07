@@ -105,6 +105,7 @@ async fn collect_replacement_account_usage_inner(
         .iter()
         .enumerate()
         .filter(|(_, account)| Some(account.id.as_str()) != current_account_id)
+        .filter(|(_, account)| account.auto_switch_enabled())
         .collect::<Vec<_>>();
 
     collect_indexed_account_usage(indexed_accounts, write_current_auth_on_refresh).await
@@ -699,6 +700,24 @@ mod tests {
         ];
 
         let results = collect_replacement_account_usage(&accounts, Some("current")).await;
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| (result.index, result.account_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, "first"), (2, "third")]
+        );
+        assert!(results.iter().all(|result| result.result.is_ok()));
+    }
+
+    #[tokio::test]
+    async fn replacement_usage_collection_excludes_disabled_accounts() {
+        let mut disabled = test_account("disabled");
+        disabled.auto_switch_disabled = true;
+        let accounts = vec![test_account("first"), disabled, test_account("third")];
+
+        let results = collect_replacement_account_usage(&accounts, None).await;
 
         assert_eq!(
             results

@@ -74,6 +74,8 @@ pub struct StoredAccount {
     pub subscription_expires_at: Option<DateTime<Utc>>,
     pub auth_mode: AuthMode,
     pub auth_data: AuthData,
+    #[serde(default)]
+    pub auto_switch_disabled: bool,
     pub created_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
 }
@@ -93,6 +95,7 @@ impl StoredAccount {
             auth_data: AuthData::ApiKey {
                 key: RedactedString::new(api_key),
             },
+            auto_switch_disabled: false,
             created_at: Utc::now(),
             last_used_at: None,
         }
@@ -115,9 +118,14 @@ impl StoredAccount {
                 refresh_token: account.refresh_token,
                 account_id: account.account_id,
             },
+            auto_switch_disabled: false,
             created_at: Utc::now(),
             last_used_at: None,
         }
+    }
+
+    pub fn auto_switch_enabled(&self) -> bool {
+        !self.auto_switch_disabled
     }
 }
 
@@ -813,6 +821,52 @@ mod tests {
 
         assert!(store.accounts.is_empty());
         assert!(store.masked_account_ids.is_empty());
+    }
+
+    #[test]
+    fn stored_account_defaults_auto_switch_disabled_to_false() {
+        let account: StoredAccount = serde_json::from_value(serde_json::json!({
+            "id": "account-id",
+            "name": "api",
+            "email": null,
+            "plan_type": null,
+            "chatgpt_user_id": null,
+            "chatgpt_account_is_fedramp": false,
+            "token_last_refresh_at": null,
+            "subscription_expires_at": null,
+            "auth_mode": "api_key",
+            "auth_data": {
+                "type": "api_key",
+                "key": "sk-test"
+            },
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_used_at": null
+        }))
+        .expect("legacy account should deserialize");
+
+        assert!(!account.auto_switch_disabled);
+        assert!(account.auto_switch_enabled());
+    }
+
+    #[test]
+    fn new_accounts_are_auto_switch_enabled() {
+        let api_account = StoredAccount::new_api_key("api".to_string(), "sk-test".to_string());
+        let chatgpt_account = StoredAccount::new_chatgpt(NewChatGptAccount {
+            name: "chatgpt".to_string(),
+            email: None,
+            plan_type: Some("pro".to_string()),
+            chatgpt_user_id: None,
+            chatgpt_account_is_fedramp: false,
+            token_last_refresh_at: Utc::now(),
+            subscription_expires_at: None,
+            id_token: test_id_token().into(),
+            access_token: "access-token".into(),
+            refresh_token: "refresh-token".into(),
+            account_id: Some("account-id".to_string()),
+        });
+
+        assert!(api_account.auto_switch_enabled());
+        assert!(chatgpt_account.auto_switch_enabled());
     }
 
     #[test]

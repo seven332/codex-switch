@@ -916,6 +916,7 @@ mod tests {
                 refresh_token: RedactedString::new("refresh-token"),
                 account_id: Some(account_id.to_string()),
             },
+            auto_switch_disabled: false,
             created_at: now,
             last_used_at: None,
         }

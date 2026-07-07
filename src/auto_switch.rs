@@ -142,7 +142,7 @@ async fn plan_auto_switch(write_current_auth_on_refresh: bool) -> Result<AutoSwi
         current_id.and_then(|id| store.accounts.iter().position(|account| account.id == id));
     let mut evaluations = empty_evaluation_slots(store.accounts.len());
     let mut current_decision = None;
-    let mut skipped = Vec::new();
+    let mut skipped = disabled_replacement_skips(&store.accounts, current_id);
 
     if let Some(index) = current_index {
         let account = &store.accounts[index];
@@ -155,7 +155,12 @@ async fn plan_auto_switch(write_current_auth_on_refresh: bool) -> Result<AutoSwi
 
         match apply_current_usage_result(account, index, info, &mut evaluations)? {
             CurrentUsageOutcome::Terminal(result) => return Ok(result),
-            CurrentUsageOutcome::Continue(decision) => current_decision = Some(decision),
+            CurrentUsageOutcome::Continue(decision) => {
+                if let Some(plan) = current_disabled_usable_plan(account, &decision) {
+                    return Ok(plan);
+                }
+                current_decision = Some(decision);
+            }
         }
     }
 
@@ -212,6 +217,28 @@ async fn plan_auto_switch(write_current_auth_on_refresh: bool) -> Result<AutoSwi
     }
 
     Err(no_selectable_account_error(current_decision, &skipped))
+}
+
+fn disabled_replacement_skips(accounts: &[StoredAccount], current_id: Option<&str>) -> Vec<String> {
+    accounts
+        .iter()
+        .filter(|account| Some(account.id.as_str()) != current_id && account.auto_switch_disabled)
+        .map(|account| format!("{}: disabled", account.name))
+        .collect()
+}
+
+fn current_disabled_usable_plan(
+    account: &StoredAccount,
+    decision: &UsageDecision,
+) -> Option<AutoSwitchPlan> {
+    if account.auto_switch_disabled && matches!(decision, UsageDecision::Usable(_)) {
+        Some(AutoSwitchPlan::CurrentKept {
+            account: Box::new(account.clone()),
+            reason: "current account is disabled for auto-switch; usage is available".to_string(),
+        })
+    } else {
+        None
+    }
 }
 
 async fn get_account_usage_for_plan(
@@ -478,8 +505,8 @@ mod tests {
     use super::{
         AccountUsageEvaluation, AutoSwitchPlan, CurrentUsageOutcome, NoUsableReplacement,
         UsageDecision, apply_current_usage_result, apply_replacement_usage_results, assess_usage,
-        empty_evaluation_slots, no_selectable_account_error, ordered_evaluations,
-        select_usable_account_by_policy,
+        current_disabled_usable_plan, disabled_replacement_skips, empty_evaluation_slots,
+        no_selectable_account_error, ordered_evaluations, select_usable_account_by_policy,
     };
     use crate::types::{AuthData, AuthMode, StoredAccount, UsageInfo};
     use crate::usage::AccountUsageFetch;
@@ -719,6 +746,66 @@ mod tests {
     }
 
     #[test]
+    fn policy_selection_ignores_disabled_replacements() {
+        let active = chatgpt_account("active");
+        let mut disabled = chatgpt_account("disabled");
+        disabled.auto_switch_disabled = true;
+        let evaluations = vec![
+            AccountUsageEvaluation {
+                account: active,
+                usage: usage_info_with_limits("active", 95.0, 20.0, 10, 1_000),
+                decision: UsageDecision::Usable("usage is available".to_string()),
+            },
+            AccountUsageEvaluation {
+                account: disabled,
+                usage: usage_info_with_limits("disabled", 10.0, 10.0, 500, 1_000),
+                decision: UsageDecision::Usable("usage is available".to_string()),
+            },
+        ];
+
+        let selected = select_usable_account_by_policy(&evaluations, Some("active"))
+            .expect("policy should select the enabled account");
+
+        assert_eq!(selected.account.id, "active");
+    }
+
+    #[test]
+    fn current_disabled_usable_account_is_kept() {
+        let mut current = chatgpt_account("current");
+        current.auto_switch_disabled = true;
+
+        let plan = current_disabled_usable_plan(
+            &current,
+            &UsageDecision::Usable("usage is available".to_string()),
+        )
+        .expect("disabled usable current should be kept");
+
+        match plan {
+            AutoSwitchPlan::CurrentKept { account, reason } => {
+                assert_eq!(account.id, "current");
+                assert_eq!(
+                    reason,
+                    "current account is disabled for auto-switch; usage is available"
+                );
+            }
+            _ => panic!("disabled usable current should be kept"),
+        }
+    }
+
+    #[test]
+    fn disabled_replacements_are_reported_as_skipped() {
+        let current = chatgpt_account("current");
+        let mut disabled = chatgpt_account("disabled");
+        disabled.auto_switch_disabled = true;
+        let accounts = vec![current, disabled];
+
+        assert_eq!(
+            disabled_replacement_skips(&accounts, Some("current")),
+            vec!["disabled: disabled"]
+        );
+    }
+
+    #[test]
     fn current_unsupported_usage_short_circuits_without_recording_candidate() {
         let current = chatgpt_account("current");
         let mut evaluations = empty_evaluation_slots(1);
@@ -905,6 +992,7 @@ mod tests {
                 refresh_token: "refresh-token".into(),
                 account_id: Some(id.to_string()),
             },
+            auto_switch_disabled: false,
             created_at: Utc::now(),
             last_used_at: None,
         }

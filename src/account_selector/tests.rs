@@ -3531,6 +3531,7 @@ fn chatgpt_account(id: &str, last_used_at: Option<chrono::DateTime<Utc>>) -> Sto
             refresh_token: "refresh-token".into(),
             account_id: Some(id.to_string()),
         },
+        auto_switch_disabled: false,
         created_at: Utc::now(),
         last_used_at,
     }
@@ -3550,6 +3551,7 @@ fn api_key_account(id: &str) -> StoredAccount {
         auth_data: AuthData::ApiKey {
             key: "api-key".into(),
         },
+        auto_switch_disabled: false,
         created_at: Utc::now(),
         last_used_at: None,
     }

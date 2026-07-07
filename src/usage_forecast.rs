@@ -116,6 +116,10 @@ fn build_forecast<'a>(
     let mut fallback_unavailable_limit = None;
 
     for account in accounts {
+        if !account.auto_switch_enabled() {
+            continue;
+        }
+
         if !matches!(account.auth_data, AuthData::ChatGPT { .. }) {
             continue;
         }
@@ -801,6 +805,32 @@ mod tests {
     }
 
     #[test]
+    fn disabled_accounts_do_not_contribute_capacity_or_rate_samples() {
+        let enabled = chatgpt_account("enabled");
+        let mut disabled = chatgpt_account("disabled");
+        disabled.auto_switch_disabled = true;
+        let accounts = vec![enabled, disabled];
+        let usage_by_id = HashMap::from([
+            (
+                accounts[0].id.clone(),
+                usage_info(&accounts[0].id, 50.0, 20.0, 240, 9_000),
+            ),
+            (
+                accounts[1].id.clone(),
+                usage_info(&accounts[1].id, 90.0, 90.0, 60, 360),
+            ),
+        ]);
+
+        let forecast = build_forecast(&accounts, &usage_by_id, NOW).expect("forecast input");
+        let rates = forecast.rates.expect("forecast rates");
+
+        assert_eq!(forecast.accounts.len(), 1);
+        assert_eq!(forecast.accounts[0].account.id, "enabled");
+        assert_eq!(rates.five_hour_percent_per_hour, 50.0);
+        assert!((rates.weekly_percent_per_hour - 1.111_111_111_111_111_2).abs() < 1e-12);
+    }
+
+    #[test]
     fn zero_used_elapsed_windows_do_not_dilute_positive_rate_samples() {
         let accounts = vec![chatgpt_account("active"), chatgpt_account("idle")];
         let usage_by_id = HashMap::from([
@@ -1471,6 +1501,7 @@ mod tests {
                 refresh_token: RedactedString::new("refresh-token"),
                 account_id: Some(id.to_string()),
             },
+            auto_switch_disabled: false,
             created_at: Utc::now(),
             last_used_at: None,
         }

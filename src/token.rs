@@ -661,6 +661,7 @@ mod tests {
                 refresh_token: "refresh-token".into(),
                 account_id: None,
             },
+            auto_switch_disabled: false,
             created_at: Utc::now(),
             last_used_at: None,
         }

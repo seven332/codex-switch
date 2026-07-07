@@ -14,6 +14,12 @@ enum StoreUpdate<T> {
     Unchanged(T),
 }
 
+#[derive(Debug, Clone)]
+pub struct AccountDisableUpdate {
+    pub account: StoredAccount,
+    pub changed: bool,
+}
+
 pub fn config_dir() -> Result<PathBuf> {
     let home = dirs::home_dir().context("Could not find home directory")?;
     Ok(home.join(".codex-switch"))
@@ -317,6 +323,18 @@ pub fn rename_account_by_selector(selector: &str, new_name: String) -> Result<St
     mutate_accounts(|store| rename_account_by_selector_in_store(store, selector, new_name))
 }
 
+pub fn disable_account_by_selector(selector: &str) -> Result<AccountDisableUpdate> {
+    mutate_accounts(|store| {
+        set_account_auto_switch_disabled_by_selector_in_store(store, selector, true)
+    })
+}
+
+pub fn enable_account_by_selector(selector: &str) -> Result<AccountDisableUpdate> {
+    mutate_accounts(|store| {
+        set_account_auto_switch_disabled_by_selector_in_store(store, selector, false)
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatGptTokenUpdate {
     pub id_token: Option<RedactedString>,
@@ -398,6 +416,7 @@ fn replace_chatgpt_account_by_name_in_store(
     replacement.name = existing.name.clone();
     replacement.created_at = existing.created_at;
     replacement.last_used_at = existing.last_used_at;
+    replacement.auto_switch_disabled = existing.auto_switch_disabled;
 
     let stored = replacement.clone();
     store.accounts[index] = replacement;
@@ -477,6 +496,32 @@ fn rename_account_by_selector_in_store(
         .context("Account not found after resolving selector")?;
     account.name = new_name;
     Ok(StoreUpdate::Changed(account.clone()))
+}
+
+fn set_account_auto_switch_disabled_by_selector_in_store(
+    store: &mut AccountsStore,
+    selector: &str,
+    disabled: bool,
+) -> Result<StoreUpdate<AccountDisableUpdate>> {
+    let account_id = resolve_account_id(store, selector)?;
+    let account = store
+        .accounts
+        .iter_mut()
+        .find(|account| account.id == account_id)
+        .context("Account not found after resolving selector")?;
+
+    if account.auto_switch_disabled == disabled {
+        return Ok(StoreUpdate::Unchanged(AccountDisableUpdate {
+            account: account.clone(),
+            changed: false,
+        }));
+    }
+
+    account.auto_switch_disabled = disabled;
+    Ok(StoreUpdate::Changed(AccountDisableUpdate {
+        account: account.clone(),
+        changed: true,
+    }))
 }
 
 fn update_account_chatgpt_tokens_in_store(
@@ -758,10 +803,76 @@ mod tests {
     }
 
     #[test]
+    fn disable_and_enable_account_by_selector_updates_auto_switch_state() {
+        let mut account = chatgpt_account("account", Some("account-id"), "refresh", "id");
+        account.id = "account-id".to_string();
+        let mut store = store_with_accounts(vec![account]);
+
+        let disabled = match set_account_auto_switch_disabled_by_selector_in_store(
+            &mut store, "account", true,
+        )
+        .expect("disable should succeed")
+        {
+            StoreUpdate::Changed(update) => update,
+            StoreUpdate::Unchanged(_) => panic!("disable should save the store"),
+        };
+
+        assert!(disabled.changed);
+        assert!(disabled.account.auto_switch_disabled);
+        assert!(store.accounts[0].auto_switch_disabled);
+
+        let enabled = match set_account_auto_switch_disabled_by_selector_in_store(
+            &mut store, "account-", false,
+        )
+        .expect("enable by id prefix should succeed")
+        {
+            StoreUpdate::Changed(update) => update,
+            StoreUpdate::Unchanged(_) => panic!("enable should save the store"),
+        };
+
+        assert!(enabled.changed);
+        assert!(!enabled.account.auto_switch_disabled);
+        assert!(!store.accounts[0].auto_switch_disabled);
+    }
+
+    #[test]
+    fn disable_and_enable_account_by_selector_are_idempotent() {
+        let mut account = chatgpt_account("account", Some("account-id"), "refresh", "id");
+        account.auto_switch_disabled = true;
+        let mut store = store_with_accounts(vec![account]);
+
+        let disabled = match set_account_auto_switch_disabled_by_selector_in_store(
+            &mut store, "account", true,
+        )
+        .expect("disable should succeed")
+        {
+            StoreUpdate::Changed(_) => panic!("idempotent disable should not save"),
+            StoreUpdate::Unchanged(update) => update,
+        };
+
+        assert!(!disabled.changed);
+        assert!(disabled.account.auto_switch_disabled);
+
+        store.accounts[0].auto_switch_disabled = false;
+        let enabled = match set_account_auto_switch_disabled_by_selector_in_store(
+            &mut store, "account", false,
+        )
+        .expect("enable should succeed")
+        {
+            StoreUpdate::Changed(_) => panic!("idempotent enable should not save"),
+            StoreUpdate::Unchanged(update) => update,
+        };
+
+        assert!(!enabled.changed);
+        assert!(!enabled.account.auto_switch_disabled);
+    }
+
+    #[test]
     fn replace_account_preserves_local_identity_and_updates_login() {
         let mut account = chatgpt_account("account", Some("old-account"), "old-refresh", "old-id");
         account.email = Some("old@example.com".to_string());
         account.plan_type = Some("free".to_string());
+        account.auto_switch_disabled = true;
         account.created_at = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .expect("timestamp should parse")
             .with_timezone(&Utc);
@@ -794,6 +905,7 @@ mod tests {
         assert_eq!(stored.last_used_at, last_used_at);
         assert_eq!(stored.email.as_deref(), Some("new@example.com"));
         assert_eq!(stored.plan_type.as_deref(), Some("pro"));
+        assert!(stored.auto_switch_disabled);
         assert_eq!(store.accounts.len(), 1);
 
         match &stored.auth_data {
