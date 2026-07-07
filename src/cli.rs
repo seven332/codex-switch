@@ -50,6 +50,16 @@ pub enum Command {
         /// Account name, full ID, or unique ID prefix.
         account: String,
     },
+    /// Exclude a stored account from automatic account selection.
+    Disable {
+        /// Account name, full ID, or unique ID prefix.
+        account: String,
+    },
+    /// Re-include a stored account in automatic account selection.
+    Enable {
+        /// Account name, full ID, or unique ID prefix.
+        account: String,
+    },
     /// Switch to a usable account when the current Codex auth account is out of usage.
     AutoSwitch,
     /// Run Codex with runtime account auto-switching.
@@ -217,5 +227,27 @@ mod tests {
             panic!("expected doctor command");
         };
         assert_eq!(codex_bin, "/opt/codex");
+    }
+
+    #[test]
+    fn disable_accepts_account_selector() {
+        let cli =
+            Cli::try_parse_from(["codex-switch", "disable", "work"]).expect("disable should parse");
+
+        let Command::Disable { account } = cli.command else {
+            panic!("expected disable command");
+        };
+        assert_eq!(account, "work");
+    }
+
+    #[test]
+    fn enable_accepts_account_selector() {
+        let cli =
+            Cli::try_parse_from(["codex-switch", "enable", "work"]).expect("enable should parse");
+
+        let Command::Enable { account } = cli.command else {
+            panic!("expected enable command");
+        };
+        assert_eq!(account, "work");
     }
 }

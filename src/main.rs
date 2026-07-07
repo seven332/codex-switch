@@ -126,6 +126,14 @@ async fn run() -> Result<()> {
                 store::short_id(&active.id)
             );
         }
+        Command::Disable { account } => {
+            let update = store::disable_account_by_selector(&account)?;
+            print_account_disable_update(update, "Disabled", "disabled");
+        }
+        Command::Enable { account } => {
+            let update = store::enable_account_by_selector(&account)?;
+            print_account_disable_update(update, "Enabled", "enabled");
+        }
         Command::AutoSwitch => {
             let result = auto_switch::auto_switch().await?;
             print_auto_switch_result(result);
@@ -372,6 +380,26 @@ fn print_auto_switch_result(result: auto_switch::AutoSwitchResult) {
     }
 }
 
+fn print_account_disable_update(
+    update: store::AccountDisableUpdate,
+    changed_action: &str,
+    state: &str,
+) {
+    if update.changed {
+        println!(
+            "{changed_action} {} ({})",
+            update.account.name,
+            store::short_id(&update.account.id)
+        );
+    } else {
+        println!(
+            "{} ({}) is already {state}",
+            update.account.name,
+            store::short_id(&update.account.id)
+        );
+    }
+}
+
 fn print_update_outcome(outcome: update::UpdateOutcome) {
     match outcome {
         update::UpdateOutcome::UpToDate {
@@ -459,10 +487,9 @@ async fn print_all_usage(show_additional: bool) -> Result<()> {
 }
 
 fn has_forecastable_usage_account(store: &AccountsStore) -> bool {
-    store
-        .accounts
-        .iter()
-        .any(|account| matches!(account.auth_data, AuthData::ChatGPT { .. }))
+    store.accounts.iter().any(|account| {
+        account.auto_switch_enabled() && matches!(account.auth_data, AuthData::ChatGPT { .. })
+    })
 }
 
 fn print_accounts(store: &AccountsStore, current_account_id: Option<&str>) {
@@ -472,8 +499,8 @@ fn print_accounts(store: &AccountsStore, current_account_id: Option<&str>) {
     }
 
     println!(
-        "{:<3} {:<8} {:<22} {:<32} {:<10} {:<10} LAST USED",
-        "", "ID", "NAME", "EMAIL", "PLAN", "AUTH"
+        "{:<3} {:<8} {:<22} {:<32} {:<10} {:<10} {:<10} LAST USED",
+        "", "ID", "NAME", "EMAIL", "PLAN", "AUTH", "STATUS"
     );
     for account in &store.accounts {
         let current_marker = if current_account_id == Some(account.id.as_str()) {
@@ -482,15 +509,24 @@ fn print_accounts(store: &AccountsStore, current_account_id: Option<&str>) {
             ""
         };
         println!(
-            "{:<3} {:<8} {:<22} {:<32} {:<10} {:<10} {}",
+            "{:<3} {:<8} {:<22} {:<32} {:<10} {:<10} {:<10} {}",
             current_marker,
             store::short_id(&account.id),
             account.name,
             account.email.as_deref().unwrap_or("-"),
             account.plan_type.as_deref().unwrap_or("-"),
             account.auth_mode,
+            format_account_status(account),
             format_datetime_option(account.last_used_at.as_ref())
         );
+    }
+}
+
+fn format_account_status(account: &StoredAccount) -> &'static str {
+    if account.auto_switch_disabled {
+        "disabled"
+    } else {
+        "-"
     }
 }
 
@@ -630,9 +666,14 @@ fn format_usage_account_header(
     is_limited: bool,
 ) -> String {
     let marker = if is_current { "* " } else { "" };
-    let status = if is_limited { " [UNAVAILABLE]" } else { "" };
+    let disabled_status = if account.auto_switch_disabled {
+        " [DISABLED]"
+    } else {
+        ""
+    };
+    let unavailable_status = if is_limited { " [UNAVAILABLE]" } else { "" };
     format!(
-        "{marker}{} ({}){status}",
+        "{marker}{} ({}){disabled_status}{unavailable_status}",
         account.name,
         store::short_id(&account.id)
     )
@@ -922,10 +963,10 @@ fn format_reset_duration(seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_limit_status, format_limit_window, format_rate_limit_reset_credits,
-        format_reset_detail, format_reset_remaining_bar, format_reset_remaining_percent,
-        format_reset_timestamp_option, format_short_reset_datetime, format_usage,
-        format_usage_account_header, format_usage_forecast, format_usage_left_bar,
+        format_account_status, format_limit_status, format_limit_window,
+        format_rate_limit_reset_credits, format_reset_detail, format_reset_remaining_bar,
+        format_reset_remaining_percent, format_reset_timestamp_option, format_short_reset_datetime,
+        format_usage, format_usage_account_header, format_usage_forecast, format_usage_left_bar,
         format_usage_left_percent, has_forecastable_usage_account, usage_account_from_store,
     };
     use crate::store;
@@ -1183,6 +1224,40 @@ mod tests {
     }
 
     #[test]
+    fn usage_header_marks_disabled_accounts() {
+        let mut account = StoredAccount::new_api_key("work".to_string(), "sk-test".to_string());
+        account.auto_switch_disabled = true;
+
+        assert_eq!(
+            format_usage_account_header(&account, false, false),
+            format!("work ({}) [DISABLED]", store::short_id(&account.id))
+        );
+    }
+
+    #[test]
+    fn usage_header_marks_disabled_unavailable_accounts() {
+        let mut account = StoredAccount::new_api_key("work".to_string(), "sk-test".to_string());
+        account.auto_switch_disabled = true;
+
+        assert_eq!(
+            format_usage_account_header(&account, false, true),
+            format!(
+                "work ({}) [DISABLED] [UNAVAILABLE]",
+                store::short_id(&account.id)
+            )
+        );
+    }
+
+    #[test]
+    fn account_status_marks_disabled_accounts() {
+        let mut account = StoredAccount::new_api_key("work".to_string(), "sk-test".to_string());
+
+        assert_eq!(format_account_status(&account), "-");
+        account.auto_switch_disabled = true;
+        assert_eq!(format_account_status(&account), "disabled");
+    }
+
+    #[test]
     fn usage_output_marks_limited_accounts() {
         let now = 1_800_000_000;
         let account = StoredAccount::new_api_key("work".to_string(), "sk-test".to_string());
@@ -1378,6 +1453,10 @@ mod tests {
         };
 
         assert!(has_forecastable_usage_account(&chatgpt_store));
+
+        let mut disabled_chatgpt_store = chatgpt_store;
+        disabled_chatgpt_store.accounts[0].auto_switch_disabled = true;
+        assert!(!has_forecastable_usage_account(&disabled_chatgpt_store));
     }
 
     #[test]

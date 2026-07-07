@@ -195,6 +195,9 @@ fn evaluate_candidate(
     min_safe_headroom: f64,
     weekly_to_five_hour_ratio: f64,
 ) -> Option<UsageSelectionMetrics> {
+    if !account.auto_switch_enabled() {
+        return None;
+    }
     if !matches!(account.auth_data, AuthData::ChatGPT { .. }) {
         return None;
     }

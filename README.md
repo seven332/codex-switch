@@ -51,6 +51,8 @@ codex-switch login <name> [--replace] [--device-auth]
 codex-switch import <name> [--file <path>]
 codex-switch export <name-or-id> [--file <path>] [--force]
 codex-switch switch <name-or-id>
+codex-switch disable <name-or-id>
+codex-switch enable <name-or-id>
 codex-switch auto-switch
 codex-switch run [--codex-bin <path>]
 codex-switch run [--codex-bin <path>] -- [CODEX_ARGS]...
@@ -88,6 +90,15 @@ On Unix, both files are written with `0600` permissions.
 `switch` refuses to write Codex auth data while unmanaged active Codex processes are detected. Close regular Codex sessions before switching accounts. Sessions launched through `codex-switch run` are managed by the local proxy, so `switch` is allowed while those sessions are running.
 
 `auto-switch` also refuses to switch while Codex is running. When Codex is not running, it checks stored ChatGPT OAuth accounts and switches to the account selected by the quota-aware policy. Accounts that are out of credits, rate-limited, usage-limited, or at 100% usage are not selectable. API key accounts are not usage-checkable and are skipped as replacement candidates.
+
+Use `disable` to keep an account stored but exclude it from automatic selection:
+
+```sh
+codex-switch disable work
+codex-switch enable work
+```
+
+Disabled accounts are skipped by `auto-switch`, managed `run` runtime switching, and `usage --all` overall forecast capacity. They are not deleted and still work for explicit `switch`, `usage`, `export`, `rename`, and `delete` commands.
 
 `run` is the runtime auto-switching entrypoint. It checks accounts before startup, starts `codex app-server`, launches Codex as a remote TUI through a local websocket proxy, and passes arguments after `--` to `codex`.
 
