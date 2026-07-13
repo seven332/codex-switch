@@ -2220,6 +2220,7 @@ async fn proxy_websockets(
     let (mut client_write, mut client_read) = client_websocket.split();
     let (mut app_server_write, mut app_server_read) = app_server_websocket.split();
     let mut runtime_commands_open = true;
+    let mut experimental_api_capability_pending = true;
 
     loop {
         tokio::select! {
@@ -2244,7 +2245,11 @@ async fn proxy_websockets(
                 };
                 let message = message.context("Failed to read Codex websocket client message")?;
                 state.mark_activity(Instant::now());
-                if !handle_client_proxy_message(message, &mut app_server_write).await? {
+                if !handle_client_proxy_message(
+                    message,
+                    &mut app_server_write,
+                    &mut experimental_api_capability_pending,
+                ).await? {
                     return Ok(());
                 }
             }
@@ -2748,19 +2753,38 @@ fn complete_pending_internal_request(pending: PendingInternalRequest, result: Ru
 async fn handle_client_proxy_message(
     mut message: Message,
     app_server_write: &mut SplitSink<WsStream, Message>,
+    experimental_api_capability_pending: &mut bool,
 ) -> Result<bool> {
-    if let Message::Text(text) = &message
-        && let Ok(mut value) = serde_json::from_str::<Value>(text.as_str())
-        && enable_experimental_api_capability(&mut value)
-    {
-        message = Message::Text(value.to_string().into());
-    }
+    enable_experimental_api_capability_for_message(
+        &mut message,
+        experimental_api_capability_pending,
+    );
     let should_continue = !matches!(message, Message::Close(_));
     app_server_write
         .send(message)
         .await
         .context("Failed to forward Codex client message to app-server")?;
     Ok(should_continue)
+}
+
+fn enable_experimental_api_capability_for_message(
+    message: &mut Message,
+    capability_pending: &mut bool,
+) {
+    if !*capability_pending {
+        return;
+    }
+    let Message::Text(text) = message else {
+        return;
+    };
+    let Ok(mut value) = serde_json::from_str::<Value>(text.as_str()) else {
+        return;
+    };
+    if !enable_experimental_api_capability(&mut value) {
+        return;
+    }
+    *message = Message::Text(value.to_string().into());
+    *capability_pending = false;
 }
 
 fn enable_experimental_api_capability(value: &mut Value) -> bool {
@@ -3391,11 +3415,12 @@ mod tests {
         codex_args_with_default_cwd, current_account_auth_marker,
         current_account_has_newer_access_token, current_account_snapshot_for_account,
         duration_until_utc, enable_experimental_api_capability,
-        external_auth_payload_from_fresh_account, finish_background_auto_switch,
-        format_auto_switch_result_for_log, format_codex_args_summary_for_log, has_cwd_arg,
-        initial_auto_switch_nonfatal_reason, initialize_app_server_request,
-        prewarm_snapshot_for_matching_auth, queue_background_auto_switch, queue_hard_auto_switch,
-        random_duration_between, redact_runtime_log_message, runtime_auth_json_switch_notification,
+        enable_experimental_api_capability_for_message, external_auth_payload_from_fresh_account,
+        finish_background_auto_switch, format_auto_switch_result_for_log,
+        format_codex_args_summary_for_log, has_cwd_arg, initial_auto_switch_nonfatal_reason,
+        initialize_app_server_request, prewarm_snapshot_for_matching_auth,
+        queue_background_auto_switch, queue_hard_auto_switch, random_duration_between,
+        redact_runtime_log_message, runtime_auth_json_switch_notification,
         runtime_auto_switch_success_notification, runtime_chatgpt_account_matches,
         runtime_client_notification_value, runtime_login_success_client_notification,
         runtime_websocket_config, sanitize_startup_log_message, select_current_kept_login_account,
@@ -3404,6 +3429,7 @@ mod tests {
         usage_limit_error_requires_switch, validate_remote_capable_codex_args,
     };
     use crate::types::{AuthData, NewChatGptAccount, StoredAccount};
+    use tokio_tungstenite::tungstenite::Message;
 
     #[test]
     fn app_server_probe_uses_codex_daemon_identity_and_experimental_api() {
@@ -3499,6 +3525,61 @@ mod tests {
 
         assert!(!enable_experimental_api_capability(&mut request));
         assert_eq!(request, original);
+    }
+
+    #[test]
+    fn proxy_only_inspects_client_messages_until_initialize_is_enabled() {
+        let mut capability_pending = true;
+        let mut non_initialize = Message::Text(
+            json!({
+                "id": 1,
+                "method": "thread/start",
+                "params": {}
+            })
+            .to_string()
+            .into(),
+        );
+        let original_non_initialize = non_initialize.clone();
+
+        enable_experimental_api_capability_for_message(
+            &mut non_initialize,
+            &mut capability_pending,
+        );
+
+        assert!(capability_pending);
+        assert_eq!(non_initialize, original_non_initialize);
+
+        let mut initialize = Message::Text(
+            json!({
+                "id": 2,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {
+                        "name": "codex-tui",
+                        "version": "1.0.0"
+                    }
+                }
+            })
+            .to_string()
+            .into(),
+        );
+
+        enable_experimental_api_capability_for_message(&mut initialize, &mut capability_pending);
+
+        assert!(!capability_pending);
+        let Message::Text(initialize) = initialize else {
+            panic!("initialize should remain a text message");
+        };
+        let initialize: serde_json::Value =
+            serde_json::from_str(initialize.as_str()).expect("initialize should remain valid JSON");
+        assert_eq!(
+            initialize.pointer("/params/capabilities/experimentalApi"),
+            Some(&json!(true))
+        );
+
+        let mut later_message = Message::Text("not-json".into());
+        enable_experimental_api_capability_for_message(&mut later_message, &mut capability_pending);
+        assert_eq!(later_message, Message::Text("not-json".into()));
     }
 
     #[test]
