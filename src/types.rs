@@ -402,7 +402,171 @@ pub struct UsageLimitInfo {
     pub secondary_resets_at: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageWindowSlot {
+    Primary,
+    Secondary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageWindowKind {
+    FiveHour,
+    Daily,
+    Weekly,
+    Monthly,
+    Annual,
+    Other,
+}
+
+impl UsageWindowKind {
+    pub fn from_window_minutes(window_minutes: Option<i64>) -> Self {
+        const FIVE_HOUR_MINUTES: i64 = 5 * 60;
+        const DAILY_MINUTES: i64 = 24 * 60;
+        const WEEKLY_MINUTES: i64 = 7 * DAILY_MINUTES;
+        const MONTHLY_MINUTES: i64 = 30 * DAILY_MINUTES;
+        const ANNUAL_MINUTES: i64 = 365 * DAILY_MINUTES;
+
+        let Some(window_minutes) = window_minutes.filter(|minutes| *minutes >= 0) else {
+            return Self::Other;
+        };
+
+        if is_approximate_window(window_minutes, FIVE_HOUR_MINUTES) {
+            Self::FiveHour
+        } else if is_approximate_window(window_minutes, DAILY_MINUTES) {
+            Self::Daily
+        } else if is_approximate_window(window_minutes, WEEKLY_MINUTES) {
+            Self::Weekly
+        } else if is_approximate_window(window_minutes, MONTHLY_MINUTES) {
+            Self::Monthly
+        } else if is_approximate_window(window_minutes, ANNUAL_MINUTES) {
+            Self::Annual
+        } else {
+            Self::Other
+        }
+    }
+
+    pub fn label(self) -> Option<&'static str> {
+        match self {
+            Self::FiveHour => Some("5-hour"),
+            Self::Daily => Some("daily"),
+            Self::Weekly => Some("weekly"),
+            Self::Monthly => Some("monthly"),
+            Self::Annual => Some("annual"),
+            Self::Other => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UsageWindowData {
+    pub slot: UsageWindowSlot,
+    pub used_percent: Option<f64>,
+    pub window_minutes: Option<i64>,
+    pub resets_at: Option<i64>,
+}
+
+impl UsageWindowData {
+    pub fn kind(self) -> UsageWindowKind {
+        UsageWindowKind::from_window_minutes(self.window_minutes)
+    }
+
+    pub fn label(self) -> String {
+        if let Some(label) = self.kind().label() {
+            return label.to_string();
+        }
+
+        match self.window_minutes.filter(|minutes| *minutes > 0) {
+            Some(minutes) if minutes % (24 * 60) == 0 => {
+                format!("{}-day", minutes / (24 * 60))
+            }
+            Some(minutes) if minutes % 60 == 0 => format!("{}-hour", minutes / 60),
+            Some(minutes) => format!("{minutes}-min"),
+            None => match self.slot {
+                UsageWindowSlot::Primary => "window 1".to_string(),
+                UsageWindowSlot::Secondary => "window 2".to_string(),
+            },
+        }
+    }
+}
+
+fn is_approximate_window(minutes: i64, expected_minutes: i64) -> bool {
+    let tolerance = expected_minutes / 20;
+    (expected_minutes - tolerance..=expected_minutes + tolerance).contains(&minutes)
+}
+
+fn usage_windows(
+    primary_used_percent: Option<f64>,
+    primary_window_minutes: Option<i64>,
+    primary_resets_at: Option<i64>,
+    secondary_used_percent: Option<f64>,
+    secondary_window_minutes: Option<i64>,
+    secondary_resets_at: Option<i64>,
+) -> [Option<UsageWindowData>; 2] {
+    [
+        usage_window(
+            UsageWindowSlot::Primary,
+            primary_used_percent,
+            primary_window_minutes,
+            primary_resets_at,
+        ),
+        usage_window(
+            UsageWindowSlot::Secondary,
+            secondary_used_percent,
+            secondary_window_minutes,
+            secondary_resets_at,
+        ),
+    ]
+}
+
+fn usage_window(
+    slot: UsageWindowSlot,
+    used_percent: Option<f64>,
+    window_minutes: Option<i64>,
+    resets_at: Option<i64>,
+) -> Option<UsageWindowData> {
+    if used_percent.is_none() && window_minutes.is_none() && resets_at.is_none() {
+        return None;
+    }
+
+    Some(UsageWindowData {
+        slot,
+        used_percent,
+        window_minutes,
+        resets_at,
+    })
+}
+
+fn unique_window(
+    windows: impl Iterator<Item = UsageWindowData>,
+    kind: UsageWindowKind,
+) -> Option<UsageWindowData> {
+    let mut matching = windows.filter(|window| window.kind() == kind);
+    let window = matching.next()?;
+    matching.next().is_none().then_some(window)
+}
+
 impl UsageInfo {
+    pub fn windows(&self) -> impl Iterator<Item = UsageWindowData> {
+        usage_windows(
+            self.primary_used_percent,
+            self.primary_window_minutes,
+            self.primary_resets_at,
+            self.secondary_used_percent,
+            self.secondary_window_minutes,
+            self.secondary_resets_at,
+        )
+        .into_iter()
+        .flatten()
+    }
+
+    pub fn five_hour_window(&self) -> Option<UsageWindowData> {
+        unique_window(self.windows(), UsageWindowKind::FiveHour)
+    }
+
+    pub fn weekly_window(&self) -> Option<UsageWindowData> {
+        unique_window(self.windows(), UsageWindowKind::Weekly)
+    }
+
     pub fn error(account_id: String, error: String) -> Self {
         Self {
             account_id,
@@ -445,6 +609,29 @@ impl UsageInfo {
             additional_limits: Vec::new(),
             error: Some("usage unsupported".to_string()),
         }
+    }
+}
+
+impl UsageLimitInfo {
+    pub fn windows(&self) -> impl Iterator<Item = UsageWindowData> {
+        usage_windows(
+            self.primary_used_percent,
+            self.primary_window_minutes,
+            self.primary_resets_at,
+            self.secondary_used_percent,
+            self.secondary_window_minutes,
+            self.secondary_resets_at,
+        )
+        .into_iter()
+        .flatten()
+    }
+
+    pub fn five_hour_window(&self) -> Option<UsageWindowData> {
+        unique_window(self.windows(), UsageWindowKind::FiveHour)
+    }
+
+    pub fn weekly_window(&self) -> Option<UsageWindowData> {
+        unique_window(self.windows(), UsageWindowKind::Weekly)
     }
 }
 
@@ -875,6 +1062,112 @@ mod tests {
             serde_json::from_str(r#""future_plan""#).expect("plan should deserialize");
 
         assert_eq!(plan.as_str(), "future_plan");
+    }
+
+    #[test]
+    fn usage_window_kind_uses_upstream_tolerance_boundaries() {
+        assert_eq!(
+            UsageWindowKind::from_window_minutes(Some(285)),
+            UsageWindowKind::FiveHour
+        );
+        assert_eq!(
+            UsageWindowKind::from_window_minutes(Some(315)),
+            UsageWindowKind::FiveHour
+        );
+        assert_eq!(
+            UsageWindowKind::from_window_minutes(Some(284)),
+            UsageWindowKind::Other
+        );
+        assert_eq!(
+            UsageWindowKind::from_window_minutes(Some(316)),
+            UsageWindowKind::Other
+        );
+        assert_eq!(
+            UsageWindowKind::from_window_minutes(Some(9_576)),
+            UsageWindowKind::Weekly
+        );
+        assert_eq!(
+            UsageWindowKind::from_window_minutes(Some(10_584)),
+            UsageWindowKind::Weekly
+        );
+        assert_eq!(
+            UsageWindowKind::from_window_minutes(None),
+            UsageWindowKind::Other
+        );
+    }
+
+    #[test]
+    fn usage_window_labels_known_and_custom_durations() {
+        let window = |slot, window_minutes| UsageWindowData {
+            slot,
+            used_percent: Some(10.0),
+            window_minutes,
+            resets_at: None,
+        };
+
+        assert_eq!(
+            window(UsageWindowSlot::Primary, Some(300)).label(),
+            "5-hour"
+        );
+        assert_eq!(
+            window(UsageWindowSlot::Primary, Some(1_440)).label(),
+            "daily"
+        );
+        assert_eq!(
+            window(UsageWindowSlot::Primary, Some(10_080)).label(),
+            "weekly"
+        );
+        assert_eq!(
+            window(UsageWindowSlot::Primary, Some(43_200)).label(),
+            "monthly"
+        );
+        assert_eq!(
+            window(UsageWindowSlot::Primary, Some(525_600)).label(),
+            "annual"
+        );
+        assert_eq!(
+            window(UsageWindowSlot::Primary, Some(120)).label(),
+            "2-hour"
+        );
+        assert_eq!(window(UsageWindowSlot::Primary, Some(90)).label(), "90-min");
+        assert_eq!(window(UsageWindowSlot::Primary, None).label(), "window 1");
+        assert_eq!(window(UsageWindowSlot::Secondary, None).label(), "window 2");
+    }
+
+    #[test]
+    fn usage_info_finds_canonical_windows_in_either_slot() {
+        let mut info = UsageInfo::error("account-id".to_string(), "unused".to_string());
+        info.primary_used_percent = Some(20.0);
+        info.primary_window_minutes = Some(10_080);
+        info.primary_resets_at = Some(20_000);
+        info.secondary_used_percent = Some(10.0);
+        info.secondary_window_minutes = Some(300);
+        info.secondary_resets_at = Some(10_000);
+
+        let five_hour = info.five_hour_window().expect("5-hour window");
+        let weekly = info.weekly_window().expect("weekly window");
+
+        assert_eq!(five_hour.slot, UsageWindowSlot::Secondary);
+        assert_eq!(five_hour.used_percent, Some(10.0));
+        assert_eq!(weekly.slot, UsageWindowSlot::Primary);
+        assert_eq!(weekly.used_percent, Some(20.0));
+    }
+
+    #[test]
+    fn usage_info_omits_absent_slots_and_rejects_duplicate_canonical_windows() {
+        let mut info = UsageInfo::error("account-id".to_string(), "unused".to_string());
+        info.primary_used_percent = Some(10.0);
+        info.primary_window_minutes = Some(300);
+
+        assert_eq!(info.windows().count(), 1);
+        assert!(info.five_hour_window().is_some());
+        assert!(info.weekly_window().is_none());
+
+        info.secondary_used_percent = Some(20.0);
+        info.secondary_window_minutes = Some(300);
+
+        assert_eq!(info.windows().count(), 2);
+        assert!(info.five_hour_window().is_none());
     }
 
     #[test]

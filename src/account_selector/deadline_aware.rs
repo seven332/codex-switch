@@ -139,7 +139,7 @@ fn cold_activation_interval_seconds(evaluated: &[EvaluatedCandidate<'_>]) -> Opt
 
     let window_minutes = evaluated
         .iter()
-        .filter_map(|candidate| candidate.usage.primary_window_minutes)
+        .filter_map(|candidate| candidate.five_hour.window_minutes)
         .filter(|window_minutes| *window_minutes > 0)
         .min()?;
     let window_seconds = window_minutes.checked_mul(60)?;
@@ -174,14 +174,14 @@ fn candidate_activity_timestamp(candidate: &EvaluatedCandidate<'_>) -> Option<i6
 fn inferred_usage_timestamps(candidate: &EvaluatedCandidate<'_>) -> impl Iterator<Item = i64> {
     [
         (
-            candidate.usage.primary_used_percent,
-            candidate.usage.primary_window_minutes,
-            candidate.usage.primary_resets_at,
+            candidate.five_hour.used_percent,
+            candidate.five_hour.window_minutes,
+            candidate.five_hour.resets_at,
         ),
         (
-            candidate.usage.secondary_used_percent,
-            candidate.usage.secondary_window_minutes,
-            candidate.usage.secondary_resets_at,
+            candidate.weekly.used_percent,
+            candidate.weekly.window_minutes,
+            candidate.weekly.resets_at,
         ),
     ]
     .into_iter()
@@ -208,8 +208,7 @@ fn compare_cold_activation_candidates(
 }
 
 fn is_cold_candidate(candidate: &EvaluatedCandidate<'_>) -> bool {
-    is_zero_usage(candidate.usage.primary_used_percent)
-        && is_zero_usage(candidate.usage.secondary_used_percent)
+    is_zero_usage(candidate.five_hour.used_percent) && is_zero_usage(candidate.weekly.used_percent)
 }
 
 fn is_zero_usage(used_percent: Option<f64>) -> bool {

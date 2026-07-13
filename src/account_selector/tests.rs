@@ -525,6 +525,60 @@ fn weekly_headroom_is_scaled_to_five_hour_units() {
 }
 
 #[test]
+fn swapped_window_slots_preserve_selection_metrics() {
+    let account = chatgpt_account("account", None);
+    let canonical = usage_info("account", 70.0, 90.0, 100, 200);
+    let canonical_selection = select_account(
+        &[candidate(&account, &canonical)],
+        SelectionConfig::default(),
+    )
+    .expect("canonical usage should be selectable");
+    let mut swapped = canonical.clone();
+    std::mem::swap(
+        &mut swapped.primary_used_percent,
+        &mut swapped.secondary_used_percent,
+    );
+    std::mem::swap(
+        &mut swapped.primary_window_minutes,
+        &mut swapped.secondary_window_minutes,
+    );
+    std::mem::swap(
+        &mut swapped.primary_resets_at,
+        &mut swapped.secondary_resets_at,
+    );
+
+    let swapped_selection =
+        select_account(&[candidate(&account, &swapped)], SelectionConfig::default())
+            .expect("swapped usage should be selectable");
+
+    assert_eq!(swapped_selection.metrics, canonical_selection.metrics);
+}
+
+#[test]
+fn ambiguous_or_noncanonical_windows_fail_selection_closed() {
+    let account = chatgpt_account("account", None);
+    let mut duplicate = usage_info("account", 10.0, 20.0, 100, 200);
+    duplicate.secondary_window_minutes = Some(300);
+    assert!(
+        select_account(
+            &[candidate(&account, &duplicate)],
+            SelectionConfig::default(),
+        )
+        .is_none()
+    );
+
+    let mut noncanonical = usage_info("account", 10.0, 20.0, 100, 200);
+    noncanonical.primary_window_minutes = Some(120);
+    assert!(
+        select_account(
+            &[candidate(&account, &noncanonical)],
+            SelectionConfig::default(),
+        )
+        .is_none()
+    );
+}
+
+#[test]
 fn all_accounts_over_soft_threshold_still_selects_least_risky_account() {
     let first = chatgpt_account("first", None);
     let second = chatgpt_account("second", None);
@@ -973,12 +1027,12 @@ fn cold_last_used_at_does_not_delay_activation_without_real_usage() {
 }
 
 #[test]
-fn deadline_aware_missing_window_does_not_force_cold_activation_after_activity() {
+fn deadline_aware_ignores_cold_account_with_unclassified_window() {
     let last_used_at = Utc.with_ymd_and_hms(2026, 5, 10, 0, 0, 0).unwrap();
     let active = chatgpt_account("active", Some(last_used_at));
     let cold = chatgpt_account("cold", None);
     let context_now = last_used_at.timestamp() + 60;
-    let mut active_info = usage_info(
+    let active_info = usage_info(
         "active",
         20.0,
         20.0,
@@ -992,7 +1046,6 @@ fn deadline_aware_missing_window_does_not_force_cold_activation_after_activity()
         context_now + 60,
         context_now + WEEKLY_WINDOW_MINUTES * 60,
     );
-    active_info.primary_window_minutes = None;
     cold_info.primary_window_minutes = None;
     let candidates = [
         candidate(&active, &active_info),

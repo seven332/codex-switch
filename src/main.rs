@@ -30,7 +30,10 @@ use clap::Parser;
 use uuid::Uuid;
 
 use cli::{Cli, Command, LogsCommand};
-use types::{AccountsStore, AuthData, ConsumeRateLimitResetCreditCode, StoredAccount, UsageInfo};
+use types::{
+    AccountsStore, AuthData, ConsumeRateLimitResetCreditCode, StoredAccount, UsageInfo,
+    UsageWindowData,
+};
 
 const USAGE_BAR_WIDTH: usize = 20;
 const USAGE_LABEL_WIDTH: usize = 6;
@@ -743,20 +746,7 @@ fn format_usage(
     if let Some(status) = unavailable_status {
         lines.push(status);
     }
-    lines.push(format_limit_window(
-        "5-hour",
-        info.primary_used_percent,
-        info.primary_window_minutes,
-        info.primary_resets_at,
-        now,
-    ));
-    lines.push(format_limit_window(
-        "weekly",
-        info.secondary_used_percent,
-        info.secondary_window_minutes,
-        info.secondary_resets_at,
-        now,
-    ));
+    lines.extend(format_limit_windows(info.windows(), "", now));
     if let Some(credits) = format_credits(info) {
         lines.push(credits);
     }
@@ -822,12 +812,13 @@ fn format_limit_window(
     window_minutes: Option<i64>,
     resets_at: Option<i64>,
     now: i64,
+    label_width: usize,
 ) -> String {
     let left = format_usage_left_percent(used_percent);
     let quota_bar = format_usage_left_bar(used_percent);
     let reset_bar = format_reset_remaining_bar(resets_at, window_minutes, now);
     let reset = format_reset_detail(resets_at, window_minutes, now);
-    let label_width = USAGE_LABEL_WIDTH.max(label.len());
+    let label_width = label_width.max(USAGE_LABEL_WIDTH).max(label.len());
 
     format!(
         "{:<width$} ┬ quota [{quota_bar}] {left}\n{:<width$} └ reset [{reset_bar}] {reset}",
@@ -835,6 +826,37 @@ fn format_limit_window(
         "",
         width = label_width
     )
+}
+
+fn format_limit_windows(
+    windows: impl IntoIterator<Item = UsageWindowData>,
+    label_prefix: &str,
+    now: i64,
+) -> Vec<String> {
+    let windows = windows
+        .into_iter()
+        .map(|window| (format!("{label_prefix}{}", window.label()), window))
+        .collect::<Vec<_>>();
+    let label_width = windows
+        .iter()
+        .map(|(label, _)| label.len())
+        .max()
+        .unwrap_or(USAGE_LABEL_WIDTH)
+        .max(USAGE_LABEL_WIDTH);
+
+    windows
+        .into_iter()
+        .map(|(label, window)| {
+            format_limit_window(
+                &label,
+                window.used_percent,
+                window.window_minutes,
+                window.resets_at,
+                now,
+                label_width,
+            )
+        })
+        .collect()
 }
 
 fn format_credits(info: &UsageInfo) -> Option<String> {
@@ -867,26 +889,17 @@ fn format_additional_limits(info: &UsageInfo, now: i64) -> Vec<String> {
     let mut lines = Vec::new();
 
     for limit in &info.additional_limits {
+        let windows = limit.windows().collect::<Vec<_>>();
+        if windows.is_empty() {
+            continue;
+        }
         let label = limit
             .limit_name
             .as_deref()
             .or(limit.limit_id.as_deref())
             .unwrap_or("additional");
         lines.push(format!("additional {label}:"));
-        lines.push(format_limit_window(
-            "  5-hour",
-            limit.primary_used_percent,
-            limit.primary_window_minutes,
-            limit.primary_resets_at,
-            now,
-        ));
-        lines.push(format_limit_window(
-            "  weekly",
-            limit.secondary_used_percent,
-            limit.secondary_window_minutes,
-            limit.secondary_resets_at,
-            now,
-        ));
+        lines.extend(format_limit_windows(windows, "  ", now));
     }
 
     lines
@@ -1287,7 +1300,7 @@ mod tests {
         let reset = now + 2 * 60 * 60 + 15 * 60;
 
         assert_eq!(
-            format_limit_window("weekly", Some(92.0), Some(10_080), Some(reset), now),
+            format_limit_window("weekly", Some(92.0), Some(10_080), Some(reset), now, 6),
             format!(
                 "weekly ┬ quota [{}] 8.0% left\n       └ reset [{}] 1% remaining, {}",
                 format_usage_left_bar(Some(92.0)),
@@ -1303,7 +1316,7 @@ mod tests {
         let reset = now + 60 * 60;
 
         assert_eq!(
-            format_limit_window("  5-hour", Some(20.0), Some(300), Some(reset), now),
+            format_limit_window("  5-hour", Some(20.0), Some(300), Some(reset), now, 8),
             format!(
                 "  5-hour ┬ quota [{}] 80.0% left\n         └ reset [{}] 20% remaining, {}",
                 format_usage_left_bar(Some(20.0)),
@@ -1311,6 +1324,85 @@ mod tests {
                 format_reset_timestamp_option(Some(reset), now)
             )
         );
+    }
+
+    #[test]
+    fn usage_output_omits_absent_windows_from_either_slot() {
+        let now = 1_800_000_000;
+        let account = StoredAccount::new_api_key("work".to_string(), "sk-test".to_string());
+        let mut without_secondary = usage_info_with_additional_limit(&account.id, now);
+        without_secondary.secondary_used_percent = None;
+        without_secondary.secondary_window_minutes = None;
+        without_secondary.secondary_resets_at = None;
+        without_secondary.primary_window_minutes = Some(10_080);
+
+        let output = format_usage(&account, &without_secondary, true, now, false);
+        assert!(output.contains("weekly ┬ quota"));
+        assert!(!output.contains("5-hour ┬ quota"));
+        assert_eq!(output.matches("┬ quota").count(), 1);
+
+        let mut without_primary = usage_info_with_additional_limit(&account.id, now);
+        without_primary.primary_used_percent = None;
+        without_primary.primary_window_minutes = None;
+        without_primary.primary_resets_at = None;
+        without_primary.secondary_window_minutes = Some(300);
+
+        let output = format_usage(&account, &without_primary, true, now, false);
+        assert!(output.contains("5-hour ┬ quota"));
+        assert!(!output.contains("weekly ┬ quota"));
+        assert_eq!(output.matches("┬ quota").count(), 1);
+    }
+
+    #[test]
+    fn usage_output_omits_all_window_rows_when_both_slots_are_absent() {
+        let now = 1_800_000_000;
+        let account = StoredAccount::new_api_key("work".to_string(), "sk-test".to_string());
+        let mut info = usage_info_with_additional_limit(&account.id, now);
+        info.primary_used_percent = None;
+        info.primary_window_minutes = None;
+        info.primary_resets_at = None;
+        info.secondary_used_percent = None;
+        info.secondary_window_minutes = None;
+        info.secondary_resets_at = None;
+
+        let output = format_usage(&account, &info, true, now, false);
+
+        assert!(!output.contains("┬ quota"));
+        assert!(output.contains("plan: pro"));
+        assert!(output.contains("credits: 42"));
+    }
+
+    #[test]
+    fn usage_output_aligns_dynamic_labels_with_shared_width() {
+        let now = 1_800_000_000;
+        let account = StoredAccount::new_api_key("work".to_string(), "sk-test".to_string());
+        let mut info = usage_info_with_additional_limit(&account.id, now);
+        info.primary_window_minutes = Some(120);
+        info.secondary_window_minutes = Some(43_200);
+
+        let output = format_usage(&account, &info, true, now, false);
+
+        assert!(output.contains("2-hour  ┬ quota"));
+        assert!(output.contains("monthly ┬ quota"));
+        assert_eq!(output.matches("       └ reset").count(), 2);
+    }
+
+    #[test]
+    fn usage_output_uses_neutral_label_when_duration_is_missing() {
+        let now = 1_800_000_000;
+        let account = StoredAccount::new_api_key("work".to_string(), "sk-test".to_string());
+        let mut info = usage_info_with_additional_limit(&account.id, now);
+        info.primary_window_minutes = None;
+        info.secondary_used_percent = None;
+        info.secondary_window_minutes = None;
+        info.secondary_resets_at = None;
+
+        let output = format_usage(&account, &info, true, now, false);
+
+        assert!(output.contains("window 1 ┬ quota"));
+        assert!(!output.contains("5-hour ┬ quota"));
+        assert!(!output.contains("weekly ┬ quota"));
+        assert_eq!(output.matches("┬ quota").count(), 1);
     }
 
     #[test]
