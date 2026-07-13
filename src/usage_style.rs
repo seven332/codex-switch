@@ -212,8 +212,6 @@ fn usage_left_risk_style(left_percent: f64) -> Option<&'static str> {
 fn is_usage_account_header_line(line: &str) -> bool {
     !line.starts_with(' ')
         && !line.starts_with("additional ")
-        && !line.starts_with("5-hour ")
-        && !line.starts_with("weekly ")
         && !line.starts_with("plan:")
         && !line.starts_with("status:")
         && !line.starts_with("usage:")
@@ -325,6 +323,11 @@ mod tests {
         let exhausted = style.style_text("weekly ┬ quota [░░░░░░░░] 0.0% left");
         assert!(exhausted.contains(&format!(
             "weekly ┬ quota [{ANSI_DIM}░░░░░░░░{ANSI_RESET}] {ANSI_BOLD_RED}0.0% left{ANSI_RESET}"
+        )));
+
+        let dynamic = style.style_text("monthly ┬ quota [████░░░░] 50.0% left");
+        assert!(dynamic.contains(&format!(
+            "monthly ┬ quota [{ANSI_GREEN}████{ANSI_RESET}{ANSI_DIM}░░░░{ANSI_RESET}] {ANSI_GREEN}50.0% left{ANSI_RESET}"
         )));
     }
 

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::account_selector::{self, AccountUsageCandidate, SelectionConfig, SelectionContext};
 use crate::runtime::{AUTO_SWITCH_MAINTENANCE_MAX_INTERVAL, AUTO_SWITCH_MAINTENANCE_MIN_INTERVAL};
-use crate::types::{AuthData, StoredAccount, UsageInfo};
+use crate::types::{AuthData, StoredAccount, UsageInfo, UsageWindowKind};
 
 const FORECAST_HORIZON_SECONDS: i64 = 14 * 24 * 60 * 60;
 const MAX_SIMULATION_STEPS: usize = 10_000;
@@ -142,10 +142,16 @@ fn build_forecast<'a>(
         }
         let additional_block = additional_hard_limit_block(usage, now);
 
+        let Some(five_hour_window) = usage.five_hour_window() else {
+            if let Some(limit) = known_limit {
+                record_fallback_limit(&mut fallback_unavailable_limit, limit);
+            }
+            continue;
+        };
         let Some(mut five_hour) = make_window(
-            usage.primary_used_percent,
-            usage.primary_window_minutes,
-            usage.primary_resets_at,
+            five_hour_window.used_percent,
+            five_hour_window.window_minutes,
+            five_hour_window.resets_at,
             now,
         ) else {
             if let Some(limit) = known_limit {
@@ -153,10 +159,16 @@ fn build_forecast<'a>(
             }
             continue;
         };
+        let Some(weekly_window) = usage.weekly_window() else {
+            if let Some(limit) = known_limit {
+                record_fallback_limit(&mut fallback_unavailable_limit, limit);
+            }
+            continue;
+        };
         let Some(mut weekly) = make_window(
-            usage.secondary_used_percent,
-            usage.secondary_window_minutes,
-            usage.secondary_resets_at,
+            weekly_window.used_percent,
+            weekly_window.window_minutes,
+            weekly_window.resets_at,
             now,
         ) else {
             if let Some(limit) = known_limit {
@@ -581,16 +593,28 @@ fn explicit_unavailable_limit(info: &UsageInfo) -> Option<ForecastLimit> {
 }
 
 fn hard_usage_limit(info: &UsageInfo, now: i64) -> Option<ForecastLimit> {
-    let five_hour = active_hard_usage(info.primary_used_percent, info.primary_resets_at, now);
-    let weekly = active_hard_usage(info.secondary_used_percent, info.secondary_resets_at, now);
-    let primary_limit = match (five_hour, weekly) {
+    let five_hour_window = info.five_hour_window();
+    let weekly_window = info.weekly_window();
+    let five_hour = five_hour_window
+        .is_some_and(|window| active_hard_usage(window.used_percent, window.resets_at, now));
+    let weekly = weekly_window
+        .is_some_and(|window| active_hard_usage(window.used_percent, window.resets_at, now));
+    let unclassified = info.windows().any(|window| {
+        active_hard_usage(window.used_percent, window.resets_at, now)
+            && match window.kind() {
+                UsageWindowKind::FiveHour => five_hour_window.is_none(),
+                UsageWindowKind::Weekly => weekly_window.is_none(),
+                _ => true,
+            }
+    });
+    let usage_limit = match (five_hour, weekly) {
         (true, true) => Some(ForecastLimit::FiveHourAndWeekly),
         (true, false) => Some(ForecastLimit::FiveHour),
         (false, true) => Some(ForecastLimit::Weekly),
-        (false, false) => None,
+        (false, false) => unclassified.then_some(ForecastLimit::Unknown),
     };
     match (
-        primary_limit,
+        usage_limit,
         additional_hard_limit_block(info, now).map(|_| ForecastLimit::Additional),
     ) {
         (Some(left), Some(right)) => Some(combine_limits(left, right)),
@@ -608,10 +632,9 @@ fn additional_hard_limit_block(info: &UsageInfo, now: i64) -> Option<AdditionalL
     let mut found = false;
     let mut recovery_at = Some(now);
     for limit in &info.additional_limits {
-        for (used_percent, resets_at) in [
-            (limit.primary_used_percent, limit.primary_resets_at),
-            (limit.secondary_used_percent, limit.secondary_resets_at),
-        ] {
+        for window in limit.windows() {
+            let used_percent = window.used_percent;
+            let resets_at = window.resets_at;
             if !used_percent.is_some_and(|used| used.is_finite() && used >= LIMIT_PERCENT) {
                 continue;
             }
@@ -802,6 +825,76 @@ mod tests {
 
         assert_eq!(rates.five_hour_percent_per_hour, 30.0);
         assert!((rates.weekly_percent_per_hour - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn swapped_window_slots_preserve_forecast() {
+        let accounts = vec![chatgpt_account("a")];
+        let canonical = usage_info(&accounts[0].id, 30.0, 40.0, 180, 4_320);
+        let canonical_forecast = forecast_all_usage(
+            &accounts,
+            &HashMap::from([(accounts[0].id.clone(), canonical.clone())]),
+            Some(accounts[0].id.as_str()),
+            NOW,
+        )
+        .expect("canonical forecast");
+        let mut swapped = canonical;
+        std::mem::swap(
+            &mut swapped.primary_used_percent,
+            &mut swapped.secondary_used_percent,
+        );
+        std::mem::swap(
+            &mut swapped.primary_window_minutes,
+            &mut swapped.secondary_window_minutes,
+        );
+        std::mem::swap(
+            &mut swapped.primary_resets_at,
+            &mut swapped.secondary_resets_at,
+        );
+
+        let swapped_forecast = forecast_all_usage(
+            &accounts,
+            &HashMap::from([(accounts[0].id.clone(), swapped)]),
+            Some(accounts[0].id.as_str()),
+            NOW,
+        )
+        .expect("swapped forecast");
+
+        assert_eq!(swapped_forecast, canonical_forecast);
+    }
+
+    #[test]
+    fn noncanonical_window_returns_no_forecast() {
+        let accounts = vec![chatgpt_account("a")];
+        let mut info = usage_info(&accounts[0].id, 30.0, 40.0, 180, 4_320);
+        info.primary_window_minutes = Some(120);
+        let usage_by_id = HashMap::from([(accounts[0].id.clone(), info)]);
+
+        assert!(
+            forecast_all_usage(&accounts, &usage_by_id, Some(accounts[0].id.as_str()), NOW,)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn noncanonical_hard_limit_is_reported_as_unknown() {
+        let accounts = vec![chatgpt_account("a")];
+        let mut info = usage_info(&accounts[0].id, 100.0, 40.0, 180, 4_320);
+        info.primary_window_minutes = Some(120);
+        let usage_by_id = HashMap::from([(accounts[0].id.clone(), info)]);
+
+        let forecast =
+            forecast_all_usage(&accounts, &usage_by_id, Some(accounts[0].id.as_str()), NOW)
+                .expect("hard limit should produce a forecast");
+
+        assert_eq!(
+            forecast.outcome,
+            UsageForecastOutcome::Unavailable {
+                at: NOW,
+                limited_by: ForecastLimit::Unknown,
+                recovery_at: None,
+            }
+        );
     }
 
     #[test]

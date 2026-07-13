@@ -3,7 +3,7 @@ use serde::Serialize;
 use crate::auto_switch;
 use crate::doctor::DoctorReport;
 use crate::store;
-use crate::types::{AccountsStore, StoredAccount, UsageInfo, UsageLimitInfo};
+use crate::types::{AccountsStore, StoredAccount, UsageInfo, UsageLimitInfo, UsageWindowData};
 use crate::usage_forecast::{UsageForecast, UsageForecastOutcome, UsageForecastRates};
 
 const SCHEMA_VERSION: u32 = 1;
@@ -235,16 +235,8 @@ fn usage_info_json(info: &UsageInfo, show_additional: bool) -> UsageInfoJson {
         error: info.error.clone(),
         unavailable_reason,
         rate_limit_reached_type: info.rate_limit_reached_type.clone(),
-        five_hour: usage_window_json(
-            info.primary_used_percent,
-            info.primary_window_minutes,
-            info.primary_resets_at,
-        ),
-        weekly: usage_window_json(
-            info.secondary_used_percent,
-            info.secondary_window_minutes,
-            info.secondary_resets_at,
-        ),
+        five_hour: usage_window_data_json(info.five_hour_window()),
+        weekly: usage_window_data_json(info.weekly_window()),
         credits: credits_json(info),
         rate_limit_reset_credits_available: info
             .rate_limit_reset_credits_available
@@ -287,6 +279,13 @@ fn usage_window_json(
     }
 }
 
+fn usage_window_data_json(window: Option<UsageWindowData>) -> UsageWindowJson {
+    window.map_or_else(
+        || usage_window_json(None, None, None),
+        |window| usage_window_json(window.used_percent, window.window_minutes, window.resets_at),
+    )
+}
+
 fn finite_percent(value: Option<f64>) -> Option<f64> {
     value.filter(|value| value.is_finite())
 }
@@ -314,16 +313,8 @@ fn additional_limit_json(limit: &UsageLimitInfo) -> AdditionalLimitJson {
     AdditionalLimitJson {
         limit_id: limit.limit_id.clone(),
         limit_name: limit.limit_name.clone(),
-        five_hour: usage_window_json(
-            limit.primary_used_percent,
-            limit.primary_window_minutes,
-            limit.primary_resets_at,
-        ),
-        weekly: usage_window_json(
-            limit.secondary_used_percent,
-            limit.secondary_window_minutes,
-            limit.secondary_resets_at,
-        ),
+        five_hour: usage_window_data_json(limit.five_hour_window()),
+        weekly: usage_window_data_json(limit.weekly_window()),
     }
 }
 
@@ -476,6 +467,47 @@ mod tests {
             json!(90.0)
         );
         assert!(value["accounts"][0]["usage"]["additional_limits"].is_null());
+    }
+
+    #[test]
+    fn usage_json_maps_canonical_windows_by_duration() {
+        let now = 1_800_000_000;
+        let mut info = usage_info_with_additional_limit("account-id", now);
+        std::mem::swap(
+            &mut info.primary_used_percent,
+            &mut info.secondary_used_percent,
+        );
+        std::mem::swap(
+            &mut info.primary_window_minutes,
+            &mut info.secondary_window_minutes,
+        );
+        std::mem::swap(&mut info.primary_resets_at, &mut info.secondary_resets_at);
+
+        let value = serde_json::to_value(usage_info_json(&info, false))
+            .expect("usage JSON should serialize");
+
+        assert_eq!(value["five_hour"]["used_percent"], json!(10.0));
+        assert_eq!(value["five_hour"]["window_minutes"], json!(300));
+        assert_eq!(value["weekly"]["used_percent"], json!(20.0));
+        assert_eq!(value["weekly"]["window_minutes"], json!(10_080));
+    }
+
+    #[test]
+    fn usage_json_keeps_missing_canonical_window_objects_compatible() {
+        let now = 1_800_000_000;
+        let mut info = usage_info_with_additional_limit("account-id", now);
+        info.primary_window_minutes = Some(120);
+        info.secondary_used_percent = None;
+        info.secondary_window_minutes = None;
+        info.secondary_resets_at = None;
+
+        let value = serde_json::to_value(usage_info_json(&info, false))
+            .expect("usage JSON should serialize");
+
+        assert!(value["five_hour"].is_object());
+        assert!(value["five_hour"]["used_percent"].is_null());
+        assert!(value["weekly"].is_object());
+        assert!(value["weekly"]["used_percent"].is_null());
     }
 
     #[test]

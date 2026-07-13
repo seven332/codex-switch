@@ -204,7 +204,7 @@ If codex-switch was installed from crates.io with Cargo in a tracked Cargo insta
 
 ## Usage
 
-Usage reporting is supported for ChatGPT OAuth accounts. API key accounts are listed as unsupported for usage.
+Usage reporting is supported for ChatGPT OAuth accounts. API key accounts are listed as unsupported for usage. The command displays only the limit windows returned by ChatGPT and identifies known 5-hour, daily, weekly, monthly, and annual windows from their reported duration rather than their primary/secondary response position.
 
 When ChatGPT returns earned rate-limit reset credits, `usage` prints the available count for each account. Use `reset-usage` to manually consume one reset for the selected account:
 

@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 use chrono::{DateTime, Utc};
 
-use crate::types::{AuthData, StoredAccount, UsageInfo};
+use crate::types::{AuthData, StoredAccount, UsageInfo, UsageWindowData};
 
 mod deadline_aware;
 mod demand_aware_hysteresis;
@@ -107,9 +107,16 @@ impl<'a> SelectionContext<'a> {
 
 struct EvaluatedCandidate<'a> {
     account: &'a StoredAccount,
-    usage: &'a UsageInfo,
+    five_hour: UsageWindowData,
+    weekly: UsageWindowData,
     metrics: UsageSelectionMetrics,
     order: usize,
+}
+
+struct EvaluatedUsage {
+    five_hour: UsageWindowData,
+    weekly: UsageWindowData,
+    metrics: UsageSelectionMetrics,
 }
 
 pub trait AccountSelectionPolicy {
@@ -159,6 +166,7 @@ pub fn usage_selection_metrics(
         normalized_min_safe_headroom(config.min_safe_headroom),
         normalized_weekly_to_five_hour_ratio(config.weekly_to_five_hour_ratio),
     )
+    .map(|evaluated| evaluated.metrics)
 }
 
 fn evaluated_candidates<'a>(
@@ -179,10 +187,11 @@ fn evaluated_candidates<'a>(
                 min_safe_headroom,
                 weekly_to_five_hour_ratio,
             )
-            .map(|metrics| EvaluatedCandidate {
+            .map(|evaluated| EvaluatedCandidate {
                 account: candidate.account,
-                usage: candidate.usage,
-                metrics,
+                five_hour: evaluated.five_hour,
+                weekly: evaluated.weekly,
+                metrics: evaluated.metrics,
                 order,
             })
         })
@@ -194,7 +203,7 @@ fn evaluate_candidate(
     usage: &UsageInfo,
     min_safe_headroom: f64,
     weekly_to_five_hour_ratio: f64,
-) -> Option<UsageSelectionMetrics> {
+) -> Option<EvaluatedUsage> {
     if !account.auto_switch_enabled() {
         return None;
     }
@@ -208,13 +217,15 @@ fn evaluate_usage(
     usage: &UsageInfo,
     min_safe_headroom: f64,
     weekly_to_five_hour_ratio: f64,
-) -> Option<UsageSelectionMetrics> {
+) -> Option<EvaluatedUsage> {
     if usage.error.is_some() || usage.rate_limit_reached_type.is_some() {
         return None;
     }
 
-    let five_hour_used = usage.primary_used_percent?;
-    let weekly_used = usage.secondary_used_percent?;
+    let five_hour = usage.five_hour_window()?;
+    let weekly = usage.weekly_window()?;
+    let five_hour_used = five_hour.used_percent?;
+    let weekly_used = weekly.used_percent?;
     if !five_hour_used.is_finite() || !weekly_used.is_finite() {
         return None;
     }
@@ -231,25 +242,25 @@ fn evaluate_usage(
             (
                 UsageWindow::FiveHour,
                 five_hour_headroom_units,
-                usage.primary_resets_at,
+                five_hour.resets_at,
             )
         } else {
-            (
-                UsageWindow::Weekly,
-                weekly_headroom_units,
-                usage.secondary_resets_at,
-            )
+            (UsageWindow::Weekly, weekly_headroom_units, weekly.resets_at)
         };
 
-    Some(UsageSelectionMetrics {
-        five_hour_headroom,
-        weekly_headroom,
-        five_hour_headroom_units,
-        weekly_headroom_units,
-        bottleneck,
-        bottleneck_headroom,
-        bottleneck_resets_at,
-        safe_for_reset_priority: bottleneck_headroom >= min_safe_headroom,
+    Some(EvaluatedUsage {
+        five_hour,
+        weekly,
+        metrics: UsageSelectionMetrics {
+            five_hour_headroom,
+            weekly_headroom,
+            five_hour_headroom_units,
+            weekly_headroom_units,
+            bottleneck,
+            bottleneck_headroom,
+            bottleneck_resets_at,
+            safe_for_reset_priority: bottleneck_headroom >= min_safe_headroom,
+        },
     })
 }
 

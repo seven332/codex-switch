@@ -468,34 +468,30 @@ fn credits_depleted(info: &UsageInfo) -> bool {
 }
 
 fn hard_limit_reason(info: &UsageInfo) -> Option<String> {
-    [
-        ("5-hour".to_string(), info.primary_used_percent),
-        ("weekly".to_string(), info.secondary_used_percent),
-    ]
-    .into_iter()
-    .chain(info.additional_limits.iter().flat_map(additional_windows))
-    .find_map(|(label, value)| {
-        value.and_then(|used| {
-            if used >= HARD_USAGE_LIMIT_PERCENT {
-                Some(format!("{label} usage is {used:.1}%"))
-            } else {
-                None
-            }
+    info.windows()
+        .map(|window| (window.label(), window.used_percent))
+        .chain(info.additional_limits.iter().flat_map(additional_windows))
+        .find_map(|(label, value)| {
+            value.and_then(|used| {
+                if used >= HARD_USAGE_LIMIT_PERCENT {
+                    Some(format!("{label} usage is {used:.1}%"))
+                } else {
+                    None
+                }
+            })
         })
-    })
 }
 
-fn additional_windows(limit: &UsageLimitInfo) -> [(String, Option<f64>); 2] {
+fn additional_windows(limit: &UsageLimitInfo) -> impl Iterator<Item = (String, Option<f64>)> + '_ {
     let label = limit
         .limit_name
         .as_deref()
         .or(limit.limit_id.as_deref())
         .unwrap_or("additional")
         .to_string();
-    [
-        (format!("{label} 5-hour"), limit.primary_used_percent),
-        (format!("{label} weekly"), limit.secondary_used_percent),
-    ]
+    limit
+        .windows()
+        .map(move |window| (format!("{label} {}", window.label()), window.used_percent))
 }
 
 #[cfg(test)]
@@ -543,12 +539,56 @@ mod tests {
     fn usage_is_unavailable_when_hard_limit_is_reached() {
         let info = UsageInfo {
             primary_used_percent: Some(100.0),
+            primary_window_minutes: Some(300),
             ..usage_info()
         };
 
         assert_eq!(
             assess_usage(&info),
             UsageDecision::Unavailable("5-hour usage is 100.0%".to_string())
+        );
+    }
+
+    #[test]
+    fn hard_limit_reason_uses_reported_window_duration() {
+        let info = UsageInfo {
+            primary_used_percent: Some(100.0),
+            primary_window_minutes: Some(10_080),
+            secondary_used_percent: Some(50.0),
+            secondary_window_minutes: Some(300),
+            ..usage_info()
+        };
+
+        assert_eq!(
+            assess_usage(&info),
+            UsageDecision::Unavailable("weekly usage is 100.0%".to_string())
+        );
+    }
+
+    #[test]
+    fn unknown_duration_hard_limit_uses_dynamic_label() {
+        let info = UsageInfo {
+            primary_used_percent: Some(100.0),
+            primary_window_minutes: Some(120),
+            ..usage_info()
+        };
+
+        assert_eq!(
+            assess_usage(&info),
+            UsageDecision::Unavailable("2-hour usage is 100.0%".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_duration_hard_limit_uses_slot_label() {
+        let info = UsageInfo {
+            primary_used_percent: Some(100.0),
+            ..usage_info()
+        };
+
+        assert_eq!(
+            assess_usage(&info),
+            UsageDecision::Unavailable("window 1 usage is 100.0%".to_string())
         );
     }
 

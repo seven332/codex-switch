@@ -104,15 +104,15 @@ fn shadow_price_score(
     let weekly_to_five_hour_ratio =
         normalized_weekly_to_five_hour_ratio(config.weekly_to_five_hour_ratio);
     shadow_window_price(
-        candidate.usage.primary_used_percent,
-        candidate.usage.primary_window_minutes,
-        candidate.usage.primary_resets_at,
+        candidate.five_hour.used_percent,
+        candidate.five_hour.window_minutes,
+        candidate.five_hour.resets_at,
         1.0,
         context,
     ) + shadow_window_price(
-        candidate.usage.secondary_used_percent,
-        candidate.usage.secondary_window_minutes,
-        candidate.usage.secondary_resets_at,
+        candidate.weekly.used_percent,
+        candidate.weekly.window_minutes,
+        candidate.weekly.resets_at,
         weekly_to_five_hour_ratio,
         context,
     )

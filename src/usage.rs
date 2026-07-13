@@ -576,7 +576,7 @@ mod tests {
         convert_payload_to_usage_info,
     };
     use crate::types::RateLimitStatusPayload;
-    use crate::types::{StoredAccount, UsageInfo};
+    use crate::types::{StoredAccount, UsageInfo, UsageWindowSlot};
     use tokio::time::sleep;
 
     #[test]
@@ -630,6 +630,95 @@ mod tests {
         assert_eq!(info.primary_resets_at, Some(1_800_000_000));
         assert_eq!(info.credits_balance.as_deref(), Some("12.5"));
         assert_eq!(info.rate_limit_reset_credits_available, Some(2));
+    }
+
+    #[test]
+    fn usage_payload_classifies_swapped_windows_by_duration() {
+        let payload: RateLimitStatusPayload = serde_json::from_value(serde_json::json!({
+            "plan_type": "plus",
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary_window": {
+                    "used_percent": 20,
+                    "limit_window_seconds": 604800,
+                    "reset_after_seconds": 300,
+                    "reset_at": 1_800_500_000
+                },
+                "secondary_window": {
+                    "used_percent": 10,
+                    "limit_window_seconds": 18000,
+                    "reset_after_seconds": 300,
+                    "reset_at": 1_800_000_000
+                }
+            }
+        }))
+        .expect("payload should parse");
+
+        let info = convert_payload_to_usage_info("account-id", payload);
+        let five_hour = info.five_hour_window().expect("5-hour window");
+        let weekly = info.weekly_window().expect("weekly window");
+
+        assert_eq!(five_hour.slot, UsageWindowSlot::Secondary);
+        assert_eq!(five_hour.used_percent, Some(10.0));
+        assert_eq!(weekly.slot, UsageWindowSlot::Primary);
+        assert_eq!(weekly.used_percent, Some(20.0));
+    }
+
+    #[test]
+    fn usage_payload_classifies_a_single_secondary_window() {
+        let payload: RateLimitStatusPayload = serde_json::from_value(serde_json::json!({
+            "plan_type": "plus",
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary_window": null,
+                "secondary_window": {
+                    "used_percent": 10,
+                    "limit_window_seconds": 18000,
+                    "reset_after_seconds": 300,
+                    "reset_at": 1_800_000_000
+                }
+            }
+        }))
+        .expect("payload should parse");
+
+        let info = convert_payload_to_usage_info("account-id", payload);
+
+        assert_eq!(info.windows().count(), 1);
+        assert_eq!(
+            info.five_hour_window().expect("5-hour window").slot,
+            UsageWindowSlot::Secondary
+        );
+        assert!(info.weekly_window().is_none());
+    }
+
+    #[test]
+    fn usage_payload_classifies_a_single_primary_window() {
+        let payload: RateLimitStatusPayload = serde_json::from_value(serde_json::json!({
+            "plan_type": "plus",
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary_window": {
+                    "used_percent": 20,
+                    "limit_window_seconds": 604800,
+                    "reset_after_seconds": 300,
+                    "reset_at": 1_800_500_000
+                },
+                "secondary_window": null
+            }
+        }))
+        .expect("payload should parse");
+
+        let info = convert_payload_to_usage_info("account-id", payload);
+
+        assert_eq!(info.windows().count(), 1);
+        assert_eq!(
+            info.weekly_window().expect("weekly window").slot,
+            UsageWindowSlot::Primary
+        );
+        assert!(info.five_hour_window().is_none());
     }
 
     #[tokio::test]

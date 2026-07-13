@@ -2904,12 +2904,15 @@ fn soft_headroom_units(
     config: SelectionConfig,
 ) -> [Option<f64>; 2] {
     [
-        info.primary_used_percent
+        info.five_hour_window()
+            .and_then(|window| window.used_percent)
             .and_then(headroom_from_used_percent),
-        info.secondary_used_percent.and_then(|used| {
-            headroom_from_used_percent(used)
-                .map(|headroom| headroom * config.weekly_to_five_hour_ratio)
-        }),
+        info.weekly_window()
+            .and_then(|window| window.used_percent)
+            .and_then(|used| {
+                headroom_from_used_percent(used)
+                    .map(|headroom| headroom * config.weekly_to_five_hour_ratio)
+            }),
     ]
 }
 
@@ -3730,6 +3733,46 @@ mod tests {
         assert_eq!(
             classify_rate_limit_notification(&notification),
             RateLimitAutoSwitchTrigger::Soft
+        );
+    }
+
+    #[test]
+    fn rate_limit_notification_scales_swapped_windows_by_duration() {
+        let notification = rate_limit_notification_with_windows(
+            Some((98.0, Some(10_080))),
+            Some((94.0, Some(300))),
+            None,
+        );
+
+        assert_eq!(
+            classify_rate_limit_notification(&notification),
+            RateLimitAutoSwitchTrigger::None
+        );
+    }
+
+    #[test]
+    fn secondary_five_hour_window_can_trigger_soft_switch() {
+        let notification =
+            rate_limit_notification_with_windows(None, Some((95.0, Some(300))), None);
+
+        assert_eq!(
+            classify_rate_limit_notification(&notification),
+            RateLimitAutoSwitchTrigger::Soft
+        );
+    }
+
+    #[test]
+    fn missing_duration_window_only_triggers_at_hard_limit() {
+        let soft = rate_limit_notification_with_windows(Some((99.0, None)), None, None);
+        let hard = rate_limit_notification_with_windows(Some((100.0, None)), None, None);
+
+        assert_eq!(
+            classify_rate_limit_notification(&soft),
+            RateLimitAutoSwitchTrigger::None
+        );
+        assert_eq!(
+            classify_rate_limit_notification(&hard),
+            RateLimitAutoSwitchTrigger::Hard
         );
     }
 
@@ -5400,23 +5443,35 @@ mod tests {
         secondary_used_percent: Option<f64>,
         rate_limit_reached_type: Option<&str>,
     ) -> serde_json::Value {
+        rate_limit_notification_with_windows(
+            primary_used_percent.map(|used_percent| (used_percent, Some(300))),
+            secondary_used_percent.map(|used_percent| (used_percent, Some(10_080))),
+            rate_limit_reached_type,
+        )
+    }
+
+    fn rate_limit_notification_with_windows(
+        primary: Option<(f64, Option<i64>)>,
+        secondary: Option<(f64, Option<i64>)>,
+        rate_limit_reached_type: Option<&str>,
+    ) -> serde_json::Value {
         json!({
             "method": "account/rateLimits/updated",
             "params": {
                 "rateLimits": {
                     "limitId": "codex",
                     "limitName": null,
-                    "primary": primary_used_percent.map(|used_percent| {
+                    "primary": primary.map(|(used_percent, window_duration_mins)| {
                         json!({
                             "usedPercent": used_percent,
-                            "windowDurationMins": 300,
+                            "windowDurationMins": window_duration_mins,
                             "resetsAt": 1_800_000_000
                         })
                     }),
-                    "secondary": secondary_used_percent.map(|used_percent| {
+                    "secondary": secondary.map(|(used_percent, window_duration_mins)| {
                         json!({
                             "usedPercent": used_percent,
-                            "windowDurationMins": 10080,
+                            "windowDurationMins": window_duration_mins,
                             "resetsAt": 1_800_500_000
                         })
                     }),

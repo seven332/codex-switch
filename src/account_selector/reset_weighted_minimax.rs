@@ -106,8 +106,8 @@ fn reset_weighted_minimax_score(
 
 fn bottleneck_window_minutes(candidate: &EvaluatedCandidate<'_>) -> Option<i64> {
     match candidate.metrics.bottleneck {
-        UsageWindow::FiveHour => candidate.usage.primary_window_minutes,
-        UsageWindow::Weekly => candidate.usage.secondary_window_minutes,
+        UsageWindow::FiveHour => candidate.five_hour.window_minutes,
+        UsageWindow::Weekly => candidate.weekly.window_minutes,
     }
 }
 
