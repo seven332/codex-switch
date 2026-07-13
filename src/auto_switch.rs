@@ -1,6 +1,6 @@
 use std::fmt;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::account_selector::{self, AccountUsageCandidate, SelectionConfig, SelectionContext};
 use crate::auth_json;
@@ -146,12 +146,9 @@ async fn plan_auto_switch(write_current_auth_on_refresh: bool) -> Result<AutoSwi
 
     if let Some(index) = current_index {
         let account = &store.accounts[index];
-        let info = match get_account_usage_for_plan(account, write_current_auth_on_refresh).await {
-            Ok(info) => info,
-            Err(err) => {
-                anyhow::bail!("Failed to get usage for {}: {err}", account.name);
-            }
-        };
+        let info = get_account_usage_for_plan(account, write_current_auth_on_refresh)
+            .await
+            .with_context(|| format!("Failed to get usage for {}", account.name))?;
 
         match apply_current_usage_result(account, index, info, &mut evaluations)? {
             CurrentUsageOutcome::Terminal(result) => return Ok(result),

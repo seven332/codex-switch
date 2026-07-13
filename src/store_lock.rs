@@ -9,7 +9,7 @@ use chrono::Utc;
 use uuid::Uuid;
 
 const ACCOUNTS_LOCK_RETRY_DELAY: Duration = Duration::from_millis(250);
-const ACCOUNTS_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+const ACCOUNTS_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) struct AccountsFileLock {
     path: PathBuf,
@@ -119,10 +119,18 @@ fn accounts_lock_belongs_to_owner(content: &str, lock_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::time::Duration;
 
     use uuid::Uuid;
 
-    use super::{accounts_lock_belongs_to_owner, acquire_accounts_file_lock};
+    use super::{
+        ACCOUNTS_LOCK_WAIT_TIMEOUT, accounts_lock_belongs_to_owner, acquire_accounts_file_lock,
+    };
+
+    #[test]
+    fn accounts_lock_wait_timeout_is_thirty_seconds() {
+        assert_eq!(ACCOUNTS_LOCK_WAIT_TIMEOUT, Duration::from_secs(30));
+    }
 
     #[test]
     fn stale_guard_does_not_remove_replaced_lock_file() {
