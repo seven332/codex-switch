@@ -443,11 +443,28 @@ async fn parse_usage_response_and_sync_metadata(
     response: reqwest::Response,
 ) -> Result<UsageInfo> {
     let info = parse_usage_response(account_id, response).await?;
+    Ok(sync_usage_metadata_best_effort_with(
+        info,
+        |account_id, plan_type| {
+            store::update_account_usage_metadata(account_id, plan_type).map(|_| ())
+        },
+    ))
+}
+
+fn sync_usage_metadata_best_effort_with(
+    info: UsageInfo,
+    sync: impl FnOnce(&str, Option<String>) -> Result<()>,
+) -> UsageInfo {
     if info.error.is_none() {
-        store::update_account_usage_metadata(account_id, info.plan_type.clone())
-            .context("Failed to save account usage metadata")?;
+        let result = sync(&info.account_id, info.plan_type.clone());
+        if let Err(err) = result {
+            tracing::warn!(
+                target: "codex_switch",
+                "failed to save account usage metadata; continuing with fetched usage: {err:#}"
+            );
+        }
     }
-    Ok(info)
+    info
 }
 
 fn convert_payload_to_usage_info(account_id: &str, payload: RateLimitStatusPayload) -> UsageInfo {
@@ -573,7 +590,7 @@ mod tests {
     use super::{
         ConsumeRateLimitResetCreditRequest, collect_indexed_account_usage_with,
         collect_replacement_account_usage, consume_rate_limit_reset_credit,
-        convert_payload_to_usage_info,
+        convert_payload_to_usage_info, sync_usage_metadata_best_effort_with,
     };
     use crate::types::RateLimitStatusPayload;
     use crate::types::{StoredAccount, UsageInfo, UsageWindowSlot};
@@ -630,6 +647,21 @@ mod tests {
         assert_eq!(info.primary_resets_at, Some(1_800_000_000));
         assert_eq!(info.credits_balance.as_deref(), Some("12.5"));
         assert_eq!(info.rate_limit_reset_credits_available, Some(2));
+    }
+
+    #[test]
+    fn usage_metadata_sync_failure_keeps_fetched_usage() {
+        let info = test_usage_info("account-id");
+
+        let info = sync_usage_metadata_best_effort_with(info, |account_id, plan_type| {
+            assert_eq!(account_id, "account-id");
+            assert_eq!(plan_type.as_deref(), Some("pro"));
+            anyhow::bail!("accounts lock timed out")
+        });
+
+        assert_eq!(info.account_id, "account-id");
+        assert_eq!(info.plan_type.as_deref(), Some("pro"));
+        assert!(info.error.is_none());
     }
 
     #[test]
