@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 use super::{
     AccountSelection, AccountSelectionPolicy, AccountUsageCandidate, EvaluatedCandidate,
-    SelectionConfig, SelectionContext, SelectionPolicyKind, UsageWindow, compare_bool_desc,
+    SelectionConfig, SelectionContext, SelectionPolicyKind, compare_bool_desc,
     compare_headroom_desc, compare_last_used, compare_optional_reset, evaluated_candidates,
     reset_delay_ratio,
 };
@@ -105,10 +105,9 @@ fn reset_weighted_minimax_score(
 }
 
 fn bottleneck_window_minutes(candidate: &EvaluatedCandidate<'_>) -> Option<i64> {
-    match candidate.metrics.bottleneck {
-        UsageWindow::FiveHour => candidate.five_hour.window_minutes,
-        UsageWindow::Weekly => candidate.weekly.window_minutes,
-    }
+    candidate
+        .window(candidate.metrics.bottleneck)
+        .and_then(|window| window.data.window_minutes)
 }
 
 fn reset_weighted_minimax_reset_factor(

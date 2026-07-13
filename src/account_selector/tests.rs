@@ -13,7 +13,9 @@ use super::{
     SelectionPolicyKind, ShadowPricePolicy, UsageWindow, compare_headroom_desc, compare_last_used,
     compare_optional_reset, evaluated_candidates, select_account, select_account_with_context,
 };
-use crate::types::{AuthData, AuthMode, StoredAccount, UsageInfo};
+use crate::types::{
+    AuthData, AuthMode, StoredAccount, UsageInfo, UsageWindowKind, UsageWindowSlot,
+};
 
 #[derive(Debug, Clone, Default)]
 struct DrainFirstPolicy {
@@ -178,6 +180,12 @@ const SIMULATED_POLICY_NAMES: &[&str] = &[
 const POLICY_COUNT: usize = SIMULATED_POLICY_NAMES.len();
 const DEFAULT_POLICY_NAME: &str = DEADLINE_AWARE_POLICY_NAME;
 const RUNTIME_REPLACEMENT_CANDIDATES: &[SelectionPolicyKind] = &[
+    SelectionPolicyKind::ShadowPrice,
+    SelectionPolicyKind::ResetWeightedMinimax,
+    SelectionPolicyKind::DemandAwareHysteresis,
+];
+const ALL_SELECTION_POLICY_KINDS: [SelectionPolicyKind; 4] = [
+    SelectionPolicyKind::DeadlineAware,
     SelectionPolicyKind::ShadowPrice,
     SelectionPolicyKind::ResetWeightedMinimax,
     SelectionPolicyKind::DemandAwareHysteresis,
@@ -516,10 +524,10 @@ fn weekly_headroom_is_scaled_to_five_hour_units() {
     let selection = select_account(&candidates, SelectionConfig::default())
         .expect("usable account should be selected");
 
-    assert_eq!(selection.metrics.five_hour_headroom, 30.0);
-    assert_eq!(selection.metrics.weekly_headroom, 10.0);
-    assert_eq!(selection.metrics.five_hour_headroom_units, 30.0);
-    assert_eq!(selection.metrics.weekly_headroom_units, 50.0);
+    assert_eq!(selection.metrics.five_hour_headroom, Some(30.0));
+    assert_eq!(selection.metrics.weekly_headroom, Some(10.0));
+    assert_eq!(selection.metrics.five_hour_headroom_units, Some(30.0));
+    assert_eq!(selection.metrics.weekly_headroom_units, Some(50.0));
     assert_eq!(selection.metrics.bottleneck, UsageWindow::FiveHour);
     assert_eq!(selection.metrics.bottleneck_headroom, 30.0);
 }
@@ -576,6 +584,313 @@ fn ambiguous_or_noncanonical_windows_fail_selection_closed() {
         )
         .is_none()
     );
+}
+
+#[test]
+fn all_policies_rank_weekly_only_candidates_by_weekly_usage() {
+    let lower_usage = chatgpt_account("lower-usage", None);
+    let higher_usage = chatgpt_account("higher-usage", None);
+    let lower_usage_info = single_window_usage_info(
+        "lower-usage",
+        20.0,
+        UsageWindowKind::Weekly,
+        1_000,
+        UsageWindowSlot::Primary,
+    );
+    let higher_usage_info = single_window_usage_info(
+        "higher-usage",
+        80.0,
+        UsageWindowKind::Weekly,
+        1_000,
+        UsageWindowSlot::Secondary,
+    );
+    let candidates = [
+        candidate(&higher_usage, &higher_usage_info),
+        candidate(&lower_usage, &lower_usage_info),
+    ];
+
+    for policy in ALL_SELECTION_POLICY_KINDS {
+        let selection = select_account(
+            &candidates,
+            SelectionConfig {
+                policy,
+                ..SelectionConfig::default()
+            },
+        )
+        .unwrap_or_else(|| panic!("{policy:?} should rank a weekly-only cohort"));
+
+        assert_eq!(selection.account.id, "lower-usage", "policy: {policy:?}");
+        assert_eq!(selection.metrics.five_hour_headroom, None);
+        assert_eq!(selection.metrics.weekly_headroom, Some(80.0));
+        assert_eq!(selection.metrics.bottleneck, UsageWindow::Weekly);
+    }
+}
+
+#[test]
+fn all_policies_rank_five_hour_only_candidates_by_five_hour_usage() {
+    let lower_usage = chatgpt_account("lower-usage", None);
+    let higher_usage = chatgpt_account("higher-usage", None);
+    let lower_usage_info = single_window_usage_info(
+        "lower-usage",
+        20.0,
+        UsageWindowKind::FiveHour,
+        1_000,
+        UsageWindowSlot::Secondary,
+    );
+    let higher_usage_info = single_window_usage_info(
+        "higher-usage",
+        80.0,
+        UsageWindowKind::FiveHour,
+        1_000,
+        UsageWindowSlot::Primary,
+    );
+    let candidates = [
+        candidate(&higher_usage, &higher_usage_info),
+        candidate(&lower_usage, &lower_usage_info),
+    ];
+
+    for policy in ALL_SELECTION_POLICY_KINDS {
+        let selection = select_account(
+            &candidates,
+            SelectionConfig {
+                policy,
+                ..SelectionConfig::default()
+            },
+        )
+        .unwrap_or_else(|| panic!("{policy:?} should rank a 5-hour-only cohort"));
+
+        assert_eq!(selection.account.id, "lower-usage", "policy: {policy:?}");
+        assert_eq!(selection.metrics.five_hour_headroom, Some(80.0));
+        assert_eq!(selection.metrics.weekly_headroom, None);
+        assert_eq!(selection.metrics.bottleneck, UsageWindow::FiveHour);
+    }
+}
+
+#[test]
+fn mixed_complete_and_weekly_only_candidates_compare_on_weekly_usage() {
+    let complete = chatgpt_account("complete", None);
+    let weekly_only = chatgpt_account("weekly-only", None);
+    let complete_info = usage_info("complete", 0.0, 80.0, 1_000, 1_000);
+    let weekly_only_info = single_window_usage_info(
+        "weekly-only",
+        20.0,
+        UsageWindowKind::Weekly,
+        1_000,
+        UsageWindowSlot::Primary,
+    );
+    let candidates = [
+        candidate(&complete, &complete_info),
+        candidate(&weekly_only, &weekly_only_info),
+    ];
+
+    for policy in ALL_SELECTION_POLICY_KINDS {
+        let selection = select_account(
+            &candidates,
+            SelectionConfig {
+                policy,
+                ..SelectionConfig::default()
+            },
+        )
+        .unwrap_or_else(|| panic!("{policy:?} should rank the shared weekly window"));
+
+        assert_eq!(selection.account.id, "weekly-only", "policy: {policy:?}");
+        assert_eq!(selection.metrics.five_hour_headroom, None);
+        assert_eq!(selection.metrics.weekly_headroom, Some(80.0));
+    }
+}
+
+#[test]
+fn candidates_without_a_shared_canonical_window_are_not_ranked() {
+    let five_hour_only = chatgpt_account("five-hour-only", None);
+    let weekly_only = chatgpt_account("weekly-only", None);
+    let five_hour_only_info = single_window_usage_info(
+        "five-hour-only",
+        20.0,
+        UsageWindowKind::FiveHour,
+        1_000,
+        UsageWindowSlot::Primary,
+    );
+    let weekly_only_info = single_window_usage_info(
+        "weekly-only",
+        20.0,
+        UsageWindowKind::Weekly,
+        1_000,
+        UsageWindowSlot::Primary,
+    );
+    let candidates = [
+        candidate(&five_hour_only, &five_hour_only_info),
+        candidate(&weekly_only, &weekly_only_info),
+    ];
+
+    for policy in ALL_SELECTION_POLICY_KINDS {
+        assert!(
+            select_account(
+                &candidates,
+                SelectionConfig {
+                    policy,
+                    ..SelectionConfig::default()
+                },
+            )
+            .is_none(),
+            "policy: {policy:?}"
+        );
+    }
+}
+
+#[test]
+fn candidates_without_usage_data_do_not_shrink_the_active_window_set() {
+    let no_data = chatgpt_account("no-data", None);
+    let weekly_only = chatgpt_account("weekly-only", None);
+    let no_data_info = UsageInfo::error("no-data".to_string(), "ignored".to_string());
+    let mut no_data_info = UsageInfo {
+        error: None,
+        ..no_data_info
+    };
+    no_data_info.plan_type = Some("pro".to_string());
+    let weekly_only_info = single_window_usage_info(
+        "weekly-only",
+        20.0,
+        UsageWindowKind::Weekly,
+        1_000,
+        UsageWindowSlot::Primary,
+    );
+
+    let selection = select_account(
+        &[
+            candidate(&no_data, &no_data_info),
+            candidate(&weekly_only, &weekly_only_info),
+        ],
+        SelectionConfig::default(),
+    )
+    .expect("the valid weekly-only candidate should remain rankable");
+
+    assert_eq!(selection.account.id, "weekly-only");
+    assert!(
+        select_account(
+            &[candidate(&no_data, &no_data_info)],
+            SelectionConfig::default(),
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn hard_limited_candidate_is_removed_before_active_windows_are_derived() {
+    let hard_limited = chatgpt_account("hard-limited", None);
+    let weekly_only = chatgpt_account("weekly-only", None);
+    let hard_limited_info = single_window_usage_info(
+        "hard-limited",
+        100.0,
+        UsageWindowKind::FiveHour,
+        10,
+        UsageWindowSlot::Primary,
+    );
+    let weekly_only_info = single_window_usage_info(
+        "weekly-only",
+        20.0,
+        UsageWindowKind::Weekly,
+        1_000,
+        UsageWindowSlot::Primary,
+    );
+
+    let selection = select_account(
+        &[
+            candidate(&hard_limited, &hard_limited_info),
+            candidate(&weekly_only, &weekly_only_info),
+        ],
+        SelectionConfig::default(),
+    )
+    .expect("the hard-limited candidate should not erase the weekly cohort");
+
+    assert_eq!(selection.account.id, "weekly-only");
+}
+
+#[test]
+fn single_canonical_window_is_independent_of_transport_slot() {
+    let account = chatgpt_account("account", None);
+    for kind in [UsageWindowKind::FiveHour, UsageWindowKind::Weekly] {
+        let primary =
+            single_window_usage_info("account", 25.0, kind, 1_000, UsageWindowSlot::Primary);
+        let secondary =
+            single_window_usage_info("account", 25.0, kind, 1_000, UsageWindowSlot::Secondary);
+
+        let primary_metrics =
+            select_account(&[candidate(&account, &primary)], SelectionConfig::default())
+                .expect("primary slot should be selectable")
+                .metrics;
+        let secondary_metrics = select_account(
+            &[candidate(&account, &secondary)],
+            SelectionConfig::default(),
+        )
+        .expect("secondary slot should be selectable")
+        .metrics;
+
+        assert_eq!(primary_metrics, secondary_metrics, "window: {kind:?}");
+    }
+}
+
+#[test]
+fn deadline_aware_weekly_only_selection_bypasses_cold_activation() {
+    let current = chatgpt_account("current", None);
+    let preferred = chatgpt_account("preferred", None);
+    let current_info = single_window_usage_info(
+        "current",
+        20.0,
+        UsageWindowKind::Weekly,
+        1_000,
+        UsageWindowSlot::Primary,
+    );
+    let preferred_info = single_window_usage_info(
+        "preferred",
+        0.0,
+        UsageWindowKind::Weekly,
+        10,
+        UsageWindowSlot::Primary,
+    );
+
+    let selection = select_account_with_context(
+        &[
+            candidate(&current, &current_info),
+            candidate(&preferred, &preferred_info),
+        ],
+        SelectionConfig::default(),
+        SelectionContext::at(100).with_current_account_id(Some("current")),
+    )
+    .expect("weekly-only candidates should be selectable");
+
+    assert_eq!(selection.account.id, "preferred");
+}
+
+#[test]
+fn deadline_aware_five_hour_only_selection_keeps_a_cold_current_account() {
+    let current = chatgpt_account("current", None);
+    let earlier_reset = chatgpt_account("earlier-reset", None);
+    let current_info = single_window_usage_info(
+        "current",
+        0.0,
+        UsageWindowKind::FiveHour,
+        1_000,
+        UsageWindowSlot::Primary,
+    );
+    let earlier_reset_info = single_window_usage_info(
+        "earlier-reset",
+        20.0,
+        UsageWindowKind::FiveHour,
+        10,
+        UsageWindowSlot::Primary,
+    );
+
+    let selection = select_account_with_context(
+        &[
+            candidate(&current, &current_info),
+            candidate(&earlier_reset, &earlier_reset_info),
+        ],
+        SelectionConfig::default(),
+        SelectionContext::at(100).with_current_account_id(Some("current")),
+    )
+    .expect("5-hour-only candidates should be selectable");
+
+    assert_eq!(selection.account.id, "current");
 }
 
 #[test]
@@ -3656,4 +3971,40 @@ fn usage_info_with_windows(
         additional_limits: Vec::new(),
         error: None,
     }
+}
+
+fn single_window_usage_info(
+    account_id: &str,
+    used_percent: f64,
+    kind: UsageWindowKind,
+    resets_at: i64,
+    slot: UsageWindowSlot,
+) -> UsageInfo {
+    let window_minutes = match kind {
+        UsageWindowKind::FiveHour => 300,
+        UsageWindowKind::Weekly => 10_080,
+        _ => panic!("test helper only supports canonical selector windows"),
+    };
+    let mut info = usage_info(account_id, 0.0, 0.0, resets_at, resets_at);
+    info.primary_used_percent = None;
+    info.primary_window_minutes = None;
+    info.primary_resets_at = None;
+    info.secondary_used_percent = None;
+    info.secondary_window_minutes = None;
+    info.secondary_resets_at = None;
+
+    match slot {
+        UsageWindowSlot::Primary => {
+            info.primary_used_percent = Some(used_percent);
+            info.primary_window_minutes = Some(window_minutes);
+            info.primary_resets_at = Some(resets_at);
+        }
+        UsageWindowSlot::Secondary => {
+            info.secondary_used_percent = Some(used_percent);
+            info.secondary_window_minutes = Some(window_minutes);
+            info.secondary_resets_at = Some(resets_at);
+        }
+    }
+
+    info
 }

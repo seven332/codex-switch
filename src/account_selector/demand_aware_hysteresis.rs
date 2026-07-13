@@ -162,8 +162,7 @@ fn demand_aware_reset_factor(
 }
 
 fn bottleneck_window_minutes(candidate: &EvaluatedCandidate<'_>) -> Option<i64> {
-    match candidate.metrics.bottleneck {
-        UsageWindow::FiveHour => candidate.five_hour.window_minutes,
-        UsageWindow::Weekly => candidate.weekly.window_minutes,
-    }
+    candidate
+        .window(candidate.metrics.bottleneck)
+        .and_then(|window| window.data.window_minutes)
 }

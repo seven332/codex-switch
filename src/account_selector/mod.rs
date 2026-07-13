@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 use chrono::{DateTime, Utc};
 
-use crate::types::{AuthData, StoredAccount, UsageInfo, UsageWindowData};
+use crate::types::{AuthData, StoredAccount, UsageInfo, UsageWindowData, UsageWindowKind};
 
 mod deadline_aware;
 mod demand_aware_hysteresis;
@@ -57,10 +57,10 @@ pub struct AccountSelection<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct UsageSelectionMetrics {
-    pub five_hour_headroom: f64,
-    pub weekly_headroom: f64,
-    pub five_hour_headroom_units: f64,
-    pub weekly_headroom_units: f64,
+    pub five_hour_headroom: Option<f64>,
+    pub weekly_headroom: Option<f64>,
+    pub five_hour_headroom_units: Option<f64>,
+    pub weekly_headroom_units: Option<f64>,
     pub bottleneck: UsageWindow,
     pub bottleneck_headroom: f64,
     pub bottleneck_resets_at: Option<i64>,
@@ -107,16 +107,80 @@ impl<'a> SelectionContext<'a> {
 
 struct EvaluatedCandidate<'a> {
     account: &'a StoredAccount,
-    five_hour: UsageWindowData,
-    weekly: UsageWindowData,
+    five_hour: Option<EvaluatedWindow>,
+    weekly: Option<EvaluatedWindow>,
+    active_windows: ActiveUsageWindows,
     metrics: UsageSelectionMetrics,
     order: usize,
 }
 
+impl EvaluatedCandidate<'_> {
+    fn window(&self, window: UsageWindow) -> Option<EvaluatedWindow> {
+        match window {
+            UsageWindow::FiveHour => self.five_hour,
+            UsageWindow::Weekly => self.weekly,
+        }
+    }
+}
+
 struct EvaluatedUsage {
-    five_hour: UsageWindowData,
-    weekly: UsageWindowData,
+    five_hour: Option<EvaluatedWindow>,
+    weekly: Option<EvaluatedWindow>,
+    active_windows: ActiveUsageWindows,
     metrics: UsageSelectionMetrics,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveUsageWindows {
+    FiveHour,
+    Weekly,
+    Both,
+}
+
+impl ActiveUsageWindows {
+    fn from_presence(has_five_hour: bool, has_weekly: bool) -> Option<Self> {
+        match (has_five_hour, has_weekly) {
+            (true, false) => Some(Self::FiveHour),
+            (false, true) => Some(Self::Weekly),
+            (true, true) => Some(Self::Both),
+            (false, false) => None,
+        }
+    }
+
+    fn intersection(self, other: Self) -> Option<Self> {
+        Self::from_presence(
+            self.has_five_hour() && other.has_five_hour(),
+            self.has_weekly() && other.has_weekly(),
+        )
+    }
+
+    fn has_five_hour(self) -> bool {
+        matches!(self, Self::FiveHour | Self::Both)
+    }
+
+    fn has_weekly(self) -> bool {
+        matches!(self, Self::Weekly | Self::Both)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ValidatedWindow {
+    data: UsageWindowData,
+    used_percent: f64,
+}
+
+struct ValidatedUsage {
+    five_hour: Option<ValidatedWindow>,
+    weekly: Option<ValidatedWindow>,
+    available_windows: ActiveUsageWindows,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EvaluatedWindow {
+    data: UsageWindowData,
+    used_percent: f64,
+    headroom: f64,
+    headroom_units: f64,
 }
 
 pub trait AccountSelectionPolicy {
@@ -161,8 +225,11 @@ pub fn usage_selection_metrics(
     usage: &UsageInfo,
     config: SelectionConfig,
 ) -> Option<UsageSelectionMetrics> {
+    let validated = validate_usage(usage)?;
+    let active_windows = validated.available_windows;
     evaluate_usage(
-        usage,
+        validated,
+        active_windows,
         normalized_min_safe_headroom(config.min_safe_headroom),
         normalized_weekly_to_five_hour_ratio(config.weekly_to_five_hour_ratio),
     )
@@ -177,20 +244,42 @@ fn evaluated_candidates<'a>(
     let weekly_to_five_hour_ratio =
         normalized_weekly_to_five_hour_ratio(config.weekly_to_five_hour_ratio);
 
-    candidates
+    let validated = candidates
         .iter()
         .enumerate()
         .filter_map(|(order, candidate)| {
-            evaluate_candidate(
-                candidate.account,
-                candidate.usage,
+            validate_candidate(candidate.account, candidate.usage)
+                .map(|usage| (order, candidate.account, usage))
+        })
+        .collect::<Vec<_>>();
+
+    let mut available_windows = validated
+        .iter()
+        .map(|(_, _, usage)| usage.available_windows);
+    let Some(mut active_windows) = available_windows.next() else {
+        return Vec::new();
+    };
+    for available in available_windows {
+        let Some(intersection) = active_windows.intersection(available) else {
+            return Vec::new();
+        };
+        active_windows = intersection;
+    }
+
+    validated
+        .into_iter()
+        .filter_map(|(order, account, usage)| {
+            evaluate_usage(
+                usage,
+                active_windows,
                 min_safe_headroom,
                 weekly_to_five_hour_ratio,
             )
             .map(|evaluated| EvaluatedCandidate {
-                account: candidate.account,
+                account,
                 five_hour: evaluated.five_hour,
                 weekly: evaluated.weekly,
+                active_windows: evaluated.active_windows,
                 metrics: evaluated.metrics,
                 order,
             })
@@ -198,70 +287,106 @@ fn evaluated_candidates<'a>(
         .collect()
 }
 
-fn evaluate_candidate(
-    account: &StoredAccount,
-    usage: &UsageInfo,
-    min_safe_headroom: f64,
-    weekly_to_five_hour_ratio: f64,
-) -> Option<EvaluatedUsage> {
+fn validate_candidate(account: &StoredAccount, usage: &UsageInfo) -> Option<ValidatedUsage> {
     if !account.auto_switch_enabled() {
         return None;
     }
     if !matches!(account.auth_data, AuthData::ChatGPT { .. }) {
         return None;
     }
-    evaluate_usage(usage, min_safe_headroom, weekly_to_five_hour_ratio)
+    validate_usage(usage)
 }
 
-fn evaluate_usage(
-    usage: &UsageInfo,
-    min_safe_headroom: f64,
-    weekly_to_five_hour_ratio: f64,
-) -> Option<EvaluatedUsage> {
+fn validate_usage(usage: &UsageInfo) -> Option<ValidatedUsage> {
     if usage.error.is_some() || usage.rate_limit_reached_type.is_some() {
         return None;
     }
 
-    let five_hour = usage.five_hour_window()?;
-    let weekly = usage.weekly_window()?;
-    let five_hour_used = five_hour.used_percent?;
-    let weekly_used = weekly.used_percent?;
-    if !five_hour_used.is_finite() || !weekly_used.is_finite() {
-        return None;
-    }
-    if five_hour_used >= 100.0 || weekly_used >= 100.0 {
-        return None;
+    let mut five_hour = None;
+    let mut weekly = None;
+    for window in usage.windows() {
+        let used_percent = window.used_percent?;
+        if !used_percent.is_finite() || used_percent >= 100.0 {
+            return None;
+        }
+
+        let validated = ValidatedWindow {
+            data: window,
+            used_percent,
+        };
+        let target = match window.kind() {
+            UsageWindowKind::FiveHour => &mut five_hour,
+            UsageWindowKind::Weekly => &mut weekly,
+            _ => return None,
+        };
+        if target.replace(validated).is_some() {
+            return None;
+        }
     }
 
-    let five_hour_headroom = headroom_from_used_percent(five_hour_used);
-    let weekly_headroom = headroom_from_used_percent(weekly_used);
-    let five_hour_headroom_units = five_hour_headroom;
-    let weekly_headroom_units = weekly_headroom * weekly_to_five_hour_ratio;
-    let (bottleneck, bottleneck_headroom, bottleneck_resets_at) =
-        if five_hour_headroom_units <= weekly_headroom_units {
-            (
-                UsageWindow::FiveHour,
-                five_hour_headroom_units,
-                five_hour.resets_at,
-            )
-        } else {
-            (UsageWindow::Weekly, weekly_headroom_units, weekly.resets_at)
-        };
+    Some(ValidatedUsage {
+        available_windows: ActiveUsageWindows::from_presence(
+            five_hour.is_some(),
+            weekly.is_some(),
+        )?,
+        five_hour,
+        weekly,
+    })
+}
+
+fn evaluate_usage(
+    usage: ValidatedUsage,
+    active_windows: ActiveUsageWindows,
+    min_safe_headroom: f64,
+    weekly_to_five_hour_ratio: f64,
+) -> Option<EvaluatedUsage> {
+    let five_hour = if active_windows.has_five_hour() {
+        Some(evaluate_window(usage.five_hour?, 1.0))
+    } else {
+        None
+    };
+    let weekly = if active_windows.has_weekly() {
+        Some(evaluate_window(usage.weekly?, weekly_to_five_hour_ratio))
+    } else {
+        None
+    };
+
+    let (bottleneck, bottleneck_window) = match (five_hour, weekly) {
+        (Some(five_hour), None) => (UsageWindow::FiveHour, five_hour),
+        (None, Some(weekly)) => (UsageWindow::Weekly, weekly),
+        (Some(five_hour), Some(weekly)) if five_hour.headroom_units <= weekly.headroom_units => {
+            (UsageWindow::FiveHour, five_hour)
+        }
+        (Some(_), Some(weekly)) => (UsageWindow::Weekly, weekly),
+        (None, None) => return None,
+    };
+    let bottleneck_headroom = bottleneck_window.headroom_units;
 
     Some(EvaluatedUsage {
         five_hour,
         weekly,
+        active_windows,
         metrics: UsageSelectionMetrics {
-            five_hour_headroom,
-            weekly_headroom,
-            five_hour_headroom_units,
-            weekly_headroom_units,
+            five_hour_headroom: five_hour.map(|window| window.headroom),
+            weekly_headroom: weekly.map(|window| window.headroom),
+            five_hour_headroom_units: five_hour.map(|window| window.headroom_units),
+            weekly_headroom_units: weekly.map(|window| window.headroom_units),
             bottleneck,
             bottleneck_headroom,
-            bottleneck_resets_at,
+            bottleneck_resets_at: bottleneck_window.data.resets_at,
             safe_for_reset_priority: bottleneck_headroom >= min_safe_headroom,
         },
     })
+}
+
+fn evaluate_window(window: ValidatedWindow, capacity_weight: f64) -> EvaluatedWindow {
+    let headroom = headroom_from_used_percent(window.used_percent);
+    EvaluatedWindow {
+        data: window.data,
+        used_percent: window.used_percent,
+        headroom,
+        headroom_units: headroom * capacity_weight,
+    }
 }
 
 fn normalized_min_safe_headroom(value: f64) -> f64 {

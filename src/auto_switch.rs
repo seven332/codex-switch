@@ -783,6 +783,49 @@ mod tests {
     }
 
     #[test]
+    fn policy_selection_returns_none_for_incomparable_usable_windows() {
+        let five_hour_only = chatgpt_account("five-hour-only");
+        let weekly_only = chatgpt_account("weekly-only");
+        let evaluations = vec![
+            AccountUsageEvaluation {
+                account: five_hour_only,
+                usage: usage_info_with_single_limit("five-hour-only", 20.0, 300, 500),
+                decision: UsageDecision::Usable("usage is available".to_string()),
+            },
+            AccountUsageEvaluation {
+                account: weekly_only,
+                usage: usage_info_with_single_limit("weekly-only", 20.0, 10_080, 1_000),
+                decision: UsageDecision::Usable("usage is available".to_string()),
+            },
+        ];
+
+        assert!(select_usable_account_by_policy(&evaluations, Some("five-hour-only")).is_none());
+    }
+
+    #[test]
+    fn policy_selection_uses_single_window_replacement_for_unavailable_current() {
+        let current = chatgpt_account("current");
+        let replacement = chatgpt_account("replacement");
+        let evaluations = vec![
+            AccountUsageEvaluation {
+                account: current,
+                usage: usage_info_with_single_limit("current", 100.0, 300, 10),
+                decision: UsageDecision::Unavailable("5-hour usage is 100.0%".to_string()),
+            },
+            AccountUsageEvaluation {
+                account: replacement,
+                usage: usage_info_with_single_limit("replacement", 20.0, 10_080, 1_000),
+                decision: UsageDecision::Usable("usage is available".to_string()),
+            },
+        ];
+
+        let selected = select_usable_account_by_policy(&evaluations, Some("current"))
+            .expect("the valid single-window replacement should be selected");
+
+        assert_eq!(selected.account.id, "replacement");
+    }
+
+    #[test]
     fn policy_selection_ignores_disabled_replacements() {
         let active = chatgpt_account("active");
         let mut disabled = chatgpt_account("disabled");
@@ -1032,6 +1075,21 @@ mod tests {
             secondary_window_minutes: Some(10_080),
             primary_resets_at: Some(five_hour_resets_at),
             secondary_resets_at: Some(weekly_resets_at),
+            ..usage_info()
+        }
+    }
+
+    fn usage_info_with_single_limit(
+        account_id: &str,
+        used_percent: f64,
+        window_minutes: i64,
+        resets_at: i64,
+    ) -> UsageInfo {
+        UsageInfo {
+            account_id: account_id.to_string(),
+            primary_used_percent: Some(used_percent),
+            primary_window_minutes: Some(window_minutes),
+            primary_resets_at: Some(resets_at),
             ..usage_info()
         }
     }

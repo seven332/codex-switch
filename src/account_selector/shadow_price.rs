@@ -103,31 +103,32 @@ fn shadow_price_score(
 ) -> f64 {
     let weekly_to_five_hour_ratio =
         normalized_weekly_to_five_hour_ratio(config.weekly_to_five_hour_ratio);
-    shadow_window_price(
-        candidate.five_hour.used_percent,
-        candidate.five_hour.window_minutes,
-        candidate.five_hour.resets_at,
-        1.0,
-        context,
-    ) + shadow_window_price(
-        candidate.weekly.used_percent,
-        candidate.weekly.window_minutes,
-        candidate.weekly.resets_at,
-        weekly_to_five_hour_ratio,
-        context,
-    )
+    candidate.five_hour.map_or(0.0, |window| {
+        shadow_window_price(
+            window.used_percent,
+            window.data.window_minutes,
+            window.data.resets_at,
+            1.0,
+            context,
+        )
+    }) + candidate.weekly.map_or(0.0, |window| {
+        shadow_window_price(
+            window.used_percent,
+            window.data.window_minutes,
+            window.data.resets_at,
+            weekly_to_five_hour_ratio,
+            context,
+        )
+    })
 }
 
 fn shadow_window_price(
-    used_percent: Option<f64>,
+    used_percent: f64,
     window_minutes: Option<i64>,
     resets_at: Option<i64>,
     capacity_weight: f64,
     context: SelectionContext<'_>,
 ) -> f64 {
-    let Some(used_percent) = used_percent.filter(|value| value.is_finite()) else {
-        return f64::INFINITY;
-    };
     let capacity_weight = if capacity_weight.is_finite() && capacity_weight > 0.0 {
         capacity_weight
     } else {
