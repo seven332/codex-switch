@@ -693,6 +693,34 @@ mod tests {
         assert!(info.weekly_window().is_none());
     }
 
+    #[test]
+    fn usage_payload_classifies_a_single_primary_window() {
+        let payload: RateLimitStatusPayload = serde_json::from_value(serde_json::json!({
+            "plan_type": "plus",
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary_window": {
+                    "used_percent": 20,
+                    "limit_window_seconds": 604800,
+                    "reset_after_seconds": 300,
+                    "reset_at": 1_800_500_000
+                },
+                "secondary_window": null
+            }
+        }))
+        .expect("payload should parse");
+
+        let info = convert_payload_to_usage_info("account-id", payload);
+
+        assert_eq!(info.windows().count(), 1);
+        assert_eq!(
+            info.weekly_window().expect("weekly window").slot,
+            UsageWindowSlot::Primary
+        );
+        assert!(info.five_hour_window().is_none());
+    }
+
     #[tokio::test]
     async fn indexed_usage_collection_preserves_original_order() {
         let indexed_accounts = vec![(0, test_account("slow")), (1, test_account("fast"))];
