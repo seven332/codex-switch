@@ -72,6 +72,10 @@ fn select_with_cold_activation<'slice, 'data>(
     deadline_aware: &'slice EvaluatedCandidate<'data>,
     context: SelectionContext<'_>,
 ) -> &'slice EvaluatedCandidate<'data> {
+    if !deadline_aware.active_windows.has_five_hour() {
+        return deadline_aware;
+    }
+
     if let Some(current_cold) = context.current_account_id.and_then(|account_id| {
         evaluated
             .iter()
@@ -139,7 +143,7 @@ fn cold_activation_interval_seconds(evaluated: &[EvaluatedCandidate<'_>]) -> Opt
 
     let window_minutes = evaluated
         .iter()
-        .filter_map(|candidate| candidate.five_hour.window_minutes)
+        .filter_map(|candidate| candidate.five_hour?.data.window_minutes)
         .filter(|window_minutes| *window_minutes > 0)
         .min()?;
     let window_seconds = window_minutes.checked_mul(60)?;
@@ -172,31 +176,21 @@ fn candidate_activity_timestamp(candidate: &EvaluatedCandidate<'_>) -> Option<i6
 }
 
 fn inferred_usage_timestamps(candidate: &EvaluatedCandidate<'_>) -> impl Iterator<Item = i64> {
-    [
-        (
-            candidate.five_hour.used_percent,
-            candidate.five_hour.window_minutes,
-            candidate.five_hour.resets_at,
-        ),
-        (
-            candidate.weekly.used_percent,
-            candidate.weekly.window_minutes,
-            candidate.weekly.resets_at,
-        ),
-    ]
-    .into_iter()
-    .filter_map(|(used_percent, window_minutes, resets_at)| {
-        if !has_nonzero_usage(used_percent) {
-            return None;
-        }
+    [candidate.five_hour, candidate.weekly]
+        .into_iter()
+        .flatten()
+        .filter_map(|window| {
+            if !has_nonzero_usage(window.used_percent) {
+                return None;
+            }
 
-        let window_seconds = window_minutes?.checked_mul(60)?;
-        if window_seconds <= 0 {
-            return None;
-        }
+            let window_seconds = window.data.window_minutes?.checked_mul(60)?;
+            if window_seconds <= 0 {
+                return None;
+            }
 
-        Some(resets_at?.saturating_sub(window_seconds))
-    })
+            Some(window.data.resets_at?.saturating_sub(window_seconds))
+        })
 }
 
 fn compare_cold_activation_candidates(
@@ -208,13 +202,20 @@ fn compare_cold_activation_candidates(
 }
 
 fn is_cold_candidate(candidate: &EvaluatedCandidate<'_>) -> bool {
-    is_zero_usage(candidate.five_hour.used_percent) && is_zero_usage(candidate.weekly.used_percent)
+    candidate.active_windows.has_five_hour()
+        && candidate
+            .five_hour
+            .is_some_and(|window| is_zero_usage(window.used_percent))
+        && (!candidate.active_windows.has_weekly()
+            || candidate
+                .weekly
+                .is_some_and(|window| is_zero_usage(window.used_percent)))
 }
 
-fn is_zero_usage(used_percent: Option<f64>) -> bool {
-    used_percent.is_some_and(|value| value.is_finite() && value.abs() <= COLD_USAGE_EPSILON)
+fn is_zero_usage(used_percent: f64) -> bool {
+    used_percent.abs() <= COLD_USAGE_EPSILON
 }
 
-fn has_nonzero_usage(used_percent: Option<f64>) -> bool {
-    used_percent.is_some_and(|value| value.is_finite() && value > COLD_USAGE_EPSILON)
+fn has_nonzero_usage(used_percent: f64) -> bool {
+    used_percent > COLD_USAGE_EPSILON
 }
