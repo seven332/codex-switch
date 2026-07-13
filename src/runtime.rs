@@ -2746,15 +2746,39 @@ fn complete_pending_internal_request(pending: PendingInternalRequest, result: Ru
 }
 
 async fn handle_client_proxy_message(
-    message: Message,
+    mut message: Message,
     app_server_write: &mut SplitSink<WsStream, Message>,
 ) -> Result<bool> {
+    if let Message::Text(text) = &message
+        && let Ok(mut value) = serde_json::from_str::<Value>(text.as_str())
+        && enable_experimental_api_capability(&mut value)
+    {
+        message = Message::Text(value.to_string().into());
+    }
     let should_continue = !matches!(message, Message::Close(_));
     app_server_write
         .send(message)
         .await
         .context("Failed to forward Codex client message to app-server")?;
     Ok(should_continue)
+}
+
+fn enable_experimental_api_capability(value: &mut Value) -> bool {
+    if value.get("method").and_then(Value::as_str) != Some("initialize") {
+        return false;
+    }
+    let Some(params) = value.get_mut("params").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    let capabilities = params.entry("capabilities").or_insert_with(|| json!({}));
+    if capabilities.is_null() {
+        *capabilities = json!({});
+    }
+    let Some(capabilities) = capabilities.as_object_mut() else {
+        return false;
+    };
+    capabilities.insert("experimentalApi".to_string(), Value::Bool(true));
+    true
 }
 
 async fn handle_app_server_proxy_message(
@@ -3024,6 +3048,9 @@ fn initialize_app_server_request(request_id: Value) -> Value {
                 "name": codex_http::CODEX_APP_SERVER_DAEMON_CLIENT_NAME,
                 "title": "Codex App Server Daemon",
                 "version": codex_http::codex_version()
+            },
+            "capabilities": {
+                "experimentalApi": true
             }
         }
     })
@@ -3363,12 +3390,12 @@ mod tests {
         classify_rate_limit_notification, classify_runtime_login_error,
         codex_args_with_default_cwd, current_account_auth_marker,
         current_account_has_newer_access_token, current_account_snapshot_for_account,
-        duration_until_utc, external_auth_payload_from_fresh_account,
-        finish_background_auto_switch, format_auto_switch_result_for_log,
-        format_codex_args_summary_for_log, has_cwd_arg, initial_auto_switch_nonfatal_reason,
-        initialize_app_server_request, prewarm_snapshot_for_matching_auth,
-        queue_background_auto_switch, queue_hard_auto_switch, random_duration_between,
-        redact_runtime_log_message, runtime_auth_json_switch_notification,
+        duration_until_utc, enable_experimental_api_capability,
+        external_auth_payload_from_fresh_account, finish_background_auto_switch,
+        format_auto_switch_result_for_log, format_codex_args_summary_for_log, has_cwd_arg,
+        initial_auto_switch_nonfatal_reason, initialize_app_server_request,
+        prewarm_snapshot_for_matching_auth, queue_background_auto_switch, queue_hard_auto_switch,
+        random_duration_between, redact_runtime_log_message, runtime_auth_json_switch_notification,
         runtime_auto_switch_success_notification, runtime_chatgpt_account_matches,
         runtime_client_notification_value, runtime_login_success_client_notification,
         runtime_websocket_config, sanitize_startup_log_message, select_current_kept_login_account,
@@ -3379,7 +3406,7 @@ mod tests {
     use crate::types::{AuthData, NewChatGptAccount, StoredAccount};
 
     #[test]
-    fn app_server_probe_uses_codex_daemon_identity() {
+    fn app_server_probe_uses_codex_daemon_identity_and_experimental_api() {
         let request = initialize_app_server_request(json!(1));
 
         assert_eq!(request.get("id"), Some(&json!(1)));
@@ -3405,7 +3432,73 @@ mod tests {
                 .and_then(|value| value.as_str())
                 .is_some_and(|value| !value.is_empty())
         );
-        assert!(request.pointer("/params/capabilities").is_none());
+        assert_eq!(
+            request
+                .pointer("/params/capabilities/experimentalApi")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn proxy_initialize_enables_experimental_api_and_preserves_capabilities() {
+        let mut request = json!({
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": "codex-tui",
+                    "version": "1.0.0"
+                },
+                "capabilities": {
+                    "experimentalApi": false,
+                    "requestAttestation": true
+                }
+            }
+        });
+
+        assert!(enable_experimental_api_capability(&mut request));
+        assert_eq!(
+            request.pointer("/params/capabilities/experimentalApi"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            request.pointer("/params/capabilities/requestAttestation"),
+            Some(&json!(true))
+        );
+    }
+
+    #[test]
+    fn proxy_initialize_adds_missing_capabilities() {
+        let mut request = json!({
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": "codex-tui",
+                    "version": "1.0.0"
+                }
+            }
+        });
+
+        assert!(enable_experimental_api_capability(&mut request));
+        assert_eq!(
+            request.pointer("/params/capabilities/experimentalApi"),
+            Some(&json!(true))
+        );
+    }
+
+    #[test]
+    fn proxy_non_initialize_message_is_unchanged() {
+        let mut request = json!({
+            "id": 1,
+            "method": "thread/start",
+            "params": {}
+        });
+        let original = request.clone();
+
+        assert!(!enable_experimental_api_capability(&mut request));
+        assert_eq!(request, original);
     }
 
     #[test]
