@@ -700,6 +700,39 @@ fn mixed_complete_and_weekly_only_candidates_compare_on_weekly_usage() {
 }
 
 #[test]
+fn mixed_complete_and_five_hour_only_candidates_compare_on_five_hour_usage() {
+    let complete = chatgpt_account("complete", None);
+    let five_hour_only = chatgpt_account("five-hour-only", None);
+    let complete_info = usage_info("complete", 80.0, 0.0, 1_000, 1_000);
+    let five_hour_only_info = single_window_usage_info(
+        "five-hour-only",
+        20.0,
+        UsageWindowKind::FiveHour,
+        1_000,
+        UsageWindowSlot::Secondary,
+    );
+    let candidates = [
+        candidate(&complete, &complete_info),
+        candidate(&five_hour_only, &five_hour_only_info),
+    ];
+
+    for policy in ALL_SELECTION_POLICY_KINDS {
+        let selection = select_account(
+            &candidates,
+            SelectionConfig {
+                policy,
+                ..SelectionConfig::default()
+            },
+        )
+        .unwrap_or_else(|| panic!("{policy:?} should rank the shared 5-hour window"));
+
+        assert_eq!(selection.account.id, "five-hour-only", "policy: {policy:?}");
+        assert_eq!(selection.metrics.five_hour_headroom, Some(80.0));
+        assert_eq!(selection.metrics.weekly_headroom, None);
+    }
+}
+
+#[test]
 fn candidates_without_a_shared_canonical_window_are_not_ranked() {
     let five_hour_only = chatgpt_account("five-hour-only", None);
     let weekly_only = chatgpt_account("weekly-only", None);
@@ -741,12 +774,7 @@ fn candidates_without_a_shared_canonical_window_are_not_ranked() {
 fn candidates_without_usage_data_do_not_shrink_the_active_window_set() {
     let no_data = chatgpt_account("no-data", None);
     let weekly_only = chatgpt_account("weekly-only", None);
-    let no_data_info = UsageInfo::error("no-data".to_string(), "ignored".to_string());
-    let mut no_data_info = UsageInfo {
-        error: None,
-        ..no_data_info
-    };
-    no_data_info.plan_type = Some("pro".to_string());
+    let no_data_info = usage_info_without_windows("no-data");
     let weekly_only_info = single_window_usage_info(
         "weekly-only",
         20.0,
@@ -772,6 +800,47 @@ fn candidates_without_usage_data_do_not_shrink_the_active_window_set() {
         )
         .is_none()
     );
+}
+
+#[test]
+fn malformed_or_non_finite_present_windows_fail_closed() {
+    let missing_percent = chatgpt_account("missing-percent", None);
+    let non_finite = chatgpt_account("non-finite", None);
+    let valid = chatgpt_account("valid", None);
+    let mut missing_percent_info = single_window_usage_info(
+        "missing-percent",
+        0.0,
+        UsageWindowKind::Weekly,
+        10,
+        UsageWindowSlot::Primary,
+    );
+    missing_percent_info.primary_used_percent = None;
+    let non_finite_info = single_window_usage_info(
+        "non-finite",
+        f64::NAN,
+        UsageWindowKind::Weekly,
+        10,
+        UsageWindowSlot::Secondary,
+    );
+    let valid_info = single_window_usage_info(
+        "valid",
+        20.0,
+        UsageWindowKind::Weekly,
+        1_000,
+        UsageWindowSlot::Primary,
+    );
+
+    let selection = select_account(
+        &[
+            candidate(&missing_percent, &missing_percent_info),
+            candidate(&non_finite, &non_finite_info),
+            candidate(&valid, &valid_info),
+        ],
+        SelectionConfig::default(),
+    )
+    .expect("malformed candidates should not erase the valid weekly cohort");
+
+    assert_eq!(selection.account.id, "valid");
 }
 
 #[test]
@@ -3985,13 +4054,7 @@ fn single_window_usage_info(
         UsageWindowKind::Weekly => 10_080,
         _ => panic!("test helper only supports canonical selector windows"),
     };
-    let mut info = usage_info(account_id, 0.0, 0.0, resets_at, resets_at);
-    info.primary_used_percent = None;
-    info.primary_window_minutes = None;
-    info.primary_resets_at = None;
-    info.secondary_used_percent = None;
-    info.secondary_window_minutes = None;
-    info.secondary_resets_at = None;
+    let mut info = usage_info_without_windows(account_id);
 
     match slot {
         UsageWindowSlot::Primary => {
@@ -4005,6 +4068,18 @@ fn single_window_usage_info(
             info.secondary_resets_at = Some(resets_at);
         }
     }
+
+    info
+}
+
+fn usage_info_without_windows(account_id: &str) -> UsageInfo {
+    let mut info = usage_info(account_id, 0.0, 0.0, 0, 0);
+    info.primary_used_percent = None;
+    info.primary_window_minutes = None;
+    info.primary_resets_at = None;
+    info.secondary_used_percent = None;
+    info.secondary_window_minutes = None;
+    info.secondary_resets_at = None;
 
     info
 }
