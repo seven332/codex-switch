@@ -48,6 +48,12 @@ pub enum ForecastUnavailableReason {
 }
 
 impl ForecastUnavailableReason {
+    pub const ALL: [Self; 3] = [
+        Self::IncompleteUsageData,
+        Self::InsufficientRateSamples,
+        Self::NoComparableUsageWindows,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::IncompleteUsageData => "incomplete usage data",
