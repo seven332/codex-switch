@@ -84,6 +84,9 @@ impl FrameCompositor {
     }
 
     fn set_columns(&mut self, columns: u16) {
+        if self.columns != columns && self.synchronized_update {
+            self.synchronized_update_coherent = false;
+        }
         self.columns = columns;
     }
 
@@ -151,16 +154,27 @@ impl FrameCompositor {
     ) -> io::Result<()> {
         match marker {
             Marker::EnterAlternateScreen => {
+                if self.synchronized_update {
+                    self.synchronized_update_coherent = false;
+                }
                 self.alternate_screen = true;
                 self.badge_placement = None;
             }
             Marker::LeaveAlternateScreen => {
+                if self.synchronized_update {
+                    self.synchronized_update_coherent = false;
+                }
                 self.alternate_screen = false;
                 self.badge_placement = None;
             }
             Marker::BeginSynchronizedUpdate => {
                 self.synchronized_update_coherent = !self.synchronized_update;
                 self.synchronized_update = true;
+                output.extend_from_slice(marker_bytes);
+                if self.alternate_screen && self.synchronized_update_coherent {
+                    self.append_stale_badge_clear(output)?;
+                }
+                return Ok(());
             }
             Marker::EndSynchronizedUpdate => {
                 if self.alternate_screen
@@ -177,30 +191,41 @@ impl FrameCompositor {
         Ok(())
     }
 
-    fn append_badge(&mut self, output: &mut Vec<u8>) -> io::Result<()> {
-        let next_placement = (self.columns >= self.label_width).then(|| BadgePlacement {
+    fn next_badge_placement(&self) -> Option<BadgePlacement> {
+        (self.columns >= self.label_width).then(|| BadgePlacement {
             column: self.columns - self.label_width,
             width: self.label_width,
-        });
+        })
+    }
 
-        if self.badge_placement.is_none() && next_placement.is_none() {
+    fn append_stale_badge_clear(&mut self, output: &mut Vec<u8>) -> io::Result<()> {
+        if self.badge_placement == self.next_badge_placement() {
             return Ok(());
         }
 
-        output.queue(SavePosition)?;
-        if self.badge_placement != next_placement
-            && let Some(previous) = self.badge_placement
+        if let Some(previous) = self.badge_placement
             && previous.column < self.columns
         {
+            output.queue(SavePosition)?;
             let visible_width = previous.width.min(self.columns - previous.column);
             output.queue(MoveTo(previous.column, 0))?;
             output.queue(Print(" ".repeat(usize::from(visible_width))))?;
+            output.queue(RestorePosition)?;
         }
+        self.badge_placement = None;
+        Ok(())
+    }
+
+    fn append_badge(&mut self, output: &mut Vec<u8>) -> io::Result<()> {
+        let next_placement = self.next_badge_placement();
+        debug_assert!(self.badge_placement.is_none() || self.badge_placement == next_placement);
+
         if let Some(placement) = next_placement {
+            output.queue(SavePosition)?;
             output.queue(MoveTo(placement.column, 0))?;
             output.queue(Print(self.label.as_str()))?;
+            output.queue(RestorePosition)?;
         }
-        output.queue(RestorePosition)?;
         self.badge_placement = next_placement;
         Ok(())
     }
@@ -1092,6 +1117,12 @@ mod tests {
                 END_SYNCHRONIZED_UPDATE,
             ]
             .concat(),
+            [
+                BEGIN_SYNCHRONIZED_UPDATE,
+                ENTER_ALTERNATE_SCREEN,
+                END_SYNCHRONIZED_UPDATE,
+            ]
+            .concat(),
         ];
         for input in inputs {
             assert_eq!(render_in_chunks(&input, &[], 80), input);
@@ -1160,7 +1191,7 @@ mod tests {
         let old_column = 80 - LABEL.len() as u16;
         let new_column = 100 - LABEL.len() as u16;
         let expected_overlay = format!(
-            "\x1b7\x1b[1;{}H{}\x1b[1;{}H{LABEL}\x1b8",
+            "\x1b7\x1b[1;{}H{}\x1b8\x1b7\x1b[1;{}H{LABEL}\x1b8",
             old_column + 1,
             " ".repeat(LABEL.len()),
             new_column + 1,
@@ -1172,6 +1203,92 @@ mod tests {
                 .any(|bytes| bytes == expected_overlay.as_bytes())
         );
         assert!(output.ends_with(END_SYNCHRONIZED_UPDATE));
+    }
+
+    #[test]
+    fn resize_clears_stale_badge_before_child_frame_content() {
+        let mut compositor = FrameCompositor::new(VERSION, 80);
+        let mut output = Vec::new();
+        compositor
+            .process(ENTER_ALTERNATE_SCREEN, &mut output)
+            .unwrap();
+        compositor
+            .process(
+                &[BEGIN_SYNCHRONIZED_UPDATE, END_SYNCHRONIZED_UPDATE].concat(),
+                &mut output,
+            )
+            .unwrap();
+        output.clear();
+
+        compositor.set_columns(100);
+        compositor
+            .process(
+                &[
+                    BEGIN_SYNCHRONIZED_UPDATE,
+                    b"child-frame",
+                    END_SYNCHRONIZED_UPDATE,
+                ]
+                .concat(),
+                &mut output,
+            )
+            .unwrap();
+
+        let stale_clear = " ".repeat(LABEL.len());
+        let clear_offset = output
+            .windows(stale_clear.len())
+            .position(|bytes| bytes == stale_clear.as_bytes())
+            .unwrap();
+        let child_offset = output
+            .windows(b"child-frame".len())
+            .position(|bytes| bytes == b"child-frame")
+            .unwrap();
+        let badge_offset = output
+            .windows(LABEL.len())
+            .position(|bytes| bytes == LABEL.as_bytes())
+            .unwrap();
+        assert!(clear_offset < child_offset);
+        assert!(child_offset < badge_offset);
+    }
+
+    #[test]
+    fn resize_during_frame_waits_for_next_coherent_frame() {
+        let mut compositor = FrameCompositor::new(VERSION, 80);
+        let mut output = Vec::new();
+        compositor
+            .process(ENTER_ALTERNATE_SCREEN, &mut output)
+            .unwrap();
+        compositor
+            .process(
+                &[BEGIN_SYNCHRONIZED_UPDATE, END_SYNCHRONIZED_UPDATE].concat(),
+                &mut output,
+            )
+            .unwrap();
+        output.clear();
+
+        compositor
+            .process(BEGIN_SYNCHRONIZED_UPDATE, &mut output)
+            .unwrap();
+        compositor.set_columns(100);
+        compositor
+            .process(END_SYNCHRONIZED_UPDATE, &mut output)
+            .unwrap();
+        assert_eq!(
+            output,
+            [BEGIN_SYNCHRONIZED_UPDATE, END_SYNCHRONIZED_UPDATE].concat()
+        );
+
+        output.clear();
+        compositor
+            .process(
+                &[BEGIN_SYNCHRONIZED_UPDATE, END_SYNCHRONIZED_UPDATE].concat(),
+                &mut output,
+            )
+            .unwrap();
+        assert!(
+            output
+                .windows(LABEL.len())
+                .any(|bytes| bytes == LABEL.as_bytes())
+        );
     }
 
     #[test]
