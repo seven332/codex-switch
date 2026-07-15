@@ -15,6 +15,8 @@ mod store;
 mod store_lock;
 mod switcher;
 mod token;
+#[cfg(unix)]
+mod tui_overlay;
 mod types;
 mod update;
 mod usage;

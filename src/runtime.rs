@@ -191,6 +191,38 @@ enum BackgroundRuntimeRequest {
     },
 }
 
+enum RemoteCodexSession {
+    Direct(Child),
+    #[cfg(unix)]
+    Overlay(Box<crate::tui_overlay::TuiOverlaySession>),
+}
+
+impl RemoteCodexSession {
+    fn pid_for_log(&self) -> String {
+        match self {
+            Self::Direct(child) => child_pid_for_log(child),
+            #[cfg(unix)]
+            Self::Overlay(session) => session.id().to_string(),
+        }
+    }
+
+    async fn wait(&mut self) -> Result<ExitStatus> {
+        match self {
+            Self::Direct(child) => Ok(child.wait().await?),
+            #[cfg(unix)]
+            Self::Overlay(session) => session.wait().await,
+        }
+    }
+
+    async fn shutdown(&mut self) {
+        match self {
+            Self::Direct(child) => shutdown_child(child).await,
+            #[cfg(unix)]
+            Self::Overlay(session) => session.shutdown().await,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeAutoSwitchPriority {
     Soft,
@@ -366,7 +398,7 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
         Ok(child) => {
             startup_log(format_args!(
                 "codex tui: spawned pid={} in {}; handing terminal to codex",
-                child_pid_for_log(&child),
+                child.pid_for_log(),
                 format_elapsed(stage_start.elapsed())
             ));
             child
@@ -401,11 +433,11 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
             match proxy_result {
                 Ok(Ok(())) => codex_child.wait().await.context("Failed to wait for codex"),
                 Ok(Err(err)) => {
-                    shutdown_child(&mut codex_child).await;
+                    codex_child.shutdown().await;
                     Err(err).context("Codex websocket proxy failed")
                 }
                 Err(err) => {
-                    shutdown_child(&mut codex_child).await;
+                    codex_child.shutdown().await;
                     Err(anyhow::anyhow!("Codex websocket proxy task failed: {err}"))
                 }
             }
@@ -681,7 +713,24 @@ fn spawn_remote_codex(
     codex_args: &[OsString],
     websocket_url: &str,
     token: &str,
-) -> Result<Child> {
+) -> Result<RemoteCodexSession> {
+    #[cfg(unix)]
+    match crate::tui_overlay::try_spawn(
+        codex_bin,
+        codex_args,
+        websocket_url,
+        REMOTE_TOKEN_ENV,
+        token,
+    )? {
+        crate::tui_overlay::OverlaySpawn::Spawned(session) => {
+            runtime_log("codex tui terminal mode: PTY overlay");
+            return Ok(RemoteCodexSession::Overlay(session));
+        }
+        crate::tui_overlay::OverlaySpawn::Direct { reason } => {
+            runtime_log(format_args!("codex tui terminal mode: direct ({reason})"));
+        }
+    }
+
     let mut command = Command::new(codex_bin);
     command
         .args(codex_args)
@@ -690,7 +739,7 @@ fn spawn_remote_codex(
         .arg("--remote-auth-token-env")
         .arg(REMOTE_TOKEN_ENV)
         .env(REMOTE_TOKEN_ENV, token);
-    Ok(command.spawn()?)
+    Ok(RemoteCodexSession::Direct(command.spawn()?))
 }
 
 async fn shutdown_child(child: &mut Child) {
