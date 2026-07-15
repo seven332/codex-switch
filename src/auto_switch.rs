@@ -2,7 +2,9 @@ use std::fmt;
 
 use anyhow::{Context, Result};
 
-use crate::account_selector::{self, AccountUsageCandidate, SelectionConfig, SelectionContext};
+use crate::account_selector::{
+    self, AccountSelectionDecision, AccountUsageCandidate, SelectionConfig, SelectionContext,
+};
 use crate::auth_json;
 use crate::process;
 use crate::store;
@@ -176,41 +178,48 @@ async fn plan_auto_switch(write_current_auth_on_refresh: bool) -> Result<AutoSwi
     let evaluations = ordered_evaluations(evaluations);
 
     if let Some(selection) = select_usable_account_by_policy(&evaluations, current_id) {
-        let selected_account = selection.account;
-        if Some(selected_account.id.as_str()) == current_id {
-            let reason = match current_decision {
-                Some(UsageDecision::Usable(reason)) => reason,
-                _ => "usage policy kept current account".to_string(),
-            };
-            return Ok(AutoSwitchPlan::CurrentKept {
-                account: Box::new(selected_account.clone()),
-                reason,
-            });
+        match selection {
+            AccountSelectionDecision::Selected(selection) => {
+                let selected_account = selection.account;
+                if Some(selected_account.id.as_str()) == current_id {
+                    let reason = match current_decision {
+                        Some(UsageDecision::Usable(reason)) => reason,
+                        _ => "usage policy kept current account".to_string(),
+                    };
+                    return Ok(AutoSwitchPlan::CurrentKept {
+                        account: Box::new(selected_account.clone()),
+                        reason,
+                    });
+                }
+
+                let switch_reason = match current_decision {
+                    Some(UsageDecision::Unavailable(reason)) => reason,
+                    Some(UsageDecision::Usable(_)) => format!(
+                        "usage policy selected an account with better quota headroom ({:.1} bottleneck score)",
+                        selection.metrics.bottleneck_headroom
+                    ),
+                    None => "no current account".to_string(),
+                    Some(UsageDecision::Unsupported(reason) | UsageDecision::Error(reason)) => {
+                        reason
+                    }
+                };
+                return Ok(AutoSwitchPlan::Switch {
+                    from: current.map(Box::new),
+                    to: Box::new(selected_account.clone()),
+                    reason: switch_reason,
+                });
+            }
+            AccountSelectionDecision::KeepCurrent(account) => {
+                let reason = match current_decision {
+                    Some(UsageDecision::Usable(reason)) => reason,
+                    _ => "usage policy kept current account".to_string(),
+                };
+                return Ok(AutoSwitchPlan::CurrentKept {
+                    account: Box::new(account.clone()),
+                    reason,
+                });
+            }
         }
-
-        let switch_reason = match current_decision {
-            Some(UsageDecision::Unavailable(reason)) => reason,
-            Some(UsageDecision::Usable(_)) => format!(
-                "usage policy selected an account with better quota headroom ({:.1} bottleneck score)",
-                selection.metrics.bottleneck_headroom
-            ),
-            None => "no current account".to_string(),
-            Some(UsageDecision::Unsupported(reason) | UsageDecision::Error(reason)) => reason,
-        };
-        return Ok(AutoSwitchPlan::Switch {
-            from: current.map(Box::new),
-            to: Box::new(selected_account.clone()),
-            reason: switch_reason,
-        });
-    }
-
-    if let (Some(account), Some(UsageDecision::Usable(reason))) =
-        (&current, current_decision.clone())
-    {
-        return Ok(AutoSwitchPlan::CurrentKept {
-            account: Box::new(account.clone()),
-            reason,
-        });
     }
 
     Err(no_selectable_account_error(current_decision, &skipped))
@@ -356,7 +365,7 @@ fn apply_replacement_usage_results(
 fn select_usable_account_by_policy<'a>(
     evaluations: &'a [AccountUsageEvaluation],
     current_id: Option<&str>,
-) -> Option<account_selector::AccountSelection<'a>> {
+) -> Option<AccountSelectionDecision<'a>> {
     let candidates = evaluations
         .iter()
         .filter_map(|evaluation| {
@@ -371,14 +380,11 @@ fn select_usable_account_by_policy<'a>(
         })
         .collect::<Vec<_>>();
 
-    match current_id {
-        Some(_) => account_selector::select_account_with_context(
-            &candidates,
-            SelectionConfig::default(),
-            SelectionContext::now().with_current_account_id(current_id),
-        ),
-        None => account_selector::select_account(&candidates, SelectionConfig::default()),
-    }
+    account_selector::select_account_or_keep_current(
+        &candidates,
+        SelectionConfig::default(),
+        SelectionContext::now().with_current_account_id(current_id),
+    )
 }
 
 struct AccountUsageEvaluation {
@@ -501,6 +507,7 @@ mod tests {
         current_disabled_usable_plan, disabled_replacement_skips, empty_evaluation_slots,
         no_selectable_account_error, ordered_evaluations, select_usable_account_by_policy,
     };
+    use crate::account_selector::AccountSelectionDecision;
     use crate::types::{AuthData, AuthMode, StoredAccount, UsageInfo};
     use crate::usage::AccountUsageFetch;
 
@@ -653,7 +660,7 @@ mod tests {
         let selected = select_usable_account_by_policy(&evaluations, Some("active"))
             .expect("policy should select a usable account");
 
-        assert_eq!(selected.account.id, "soon-reset");
+        assert_eq!(selected.account().id, "soon-reset");
     }
 
     #[test]
@@ -693,7 +700,7 @@ mod tests {
         let selected = select_usable_account_by_policy(&evaluations, Some("active"))
             .expect("policy should select a usable account");
 
-        assert_eq!(selected.account.id, "active");
+        assert_eq!(selected.account().id, "active");
     }
 
     #[test]
@@ -733,7 +740,7 @@ mod tests {
         let selected = select_usable_account_by_policy(&evaluations, Some("active"))
             .expect("policy should select a usable account");
 
-        assert_eq!(selected.account.id, "cold");
+        assert_eq!(selected.account().id, "cold");
     }
 
     #[test]
@@ -756,7 +763,7 @@ mod tests {
         let selected = select_usable_account_by_policy(&evaluations, Some("missing"))
             .expect("policy should select a usable account");
 
-        assert_eq!(selected.account.id, "first");
+        assert_eq!(selected.account().id, "first");
     }
 
     #[test]
@@ -779,11 +786,11 @@ mod tests {
         let selected = select_usable_account_by_policy(&evaluations, Some("active"))
             .expect("policy should select the remaining usable account");
 
-        assert_eq!(selected.account.id, "active");
+        assert_eq!(selected.account().id, "active");
     }
 
     #[test]
-    fn policy_selection_returns_none_for_incomparable_usable_windows() {
+    fn policy_selection_keeps_usable_current_for_incomparable_windows() {
         let five_hour_only = chatgpt_account("five-hour-only");
         let weekly_only = chatgpt_account("weekly-only");
         let evaluations = vec![
@@ -799,7 +806,13 @@ mod tests {
             },
         ];
 
-        assert!(select_usable_account_by_policy(&evaluations, Some("five-hour-only")).is_none());
+        let selected = select_usable_account_by_policy(&evaluations, Some("five-hour-only"))
+            .expect("usable current account should be kept");
+
+        assert!(matches!(
+            selected,
+            AccountSelectionDecision::KeepCurrent(account) if account.id == "five-hour-only"
+        ));
     }
 
     #[test]
@@ -822,7 +835,7 @@ mod tests {
         let selected = select_usable_account_by_policy(&evaluations, Some("current"))
             .expect("the valid single-window replacement should be selected");
 
-        assert_eq!(selected.account.id, "replacement");
+        assert_eq!(selected.account().id, "replacement");
     }
 
     #[test]
@@ -846,7 +859,7 @@ mod tests {
         let selected = select_usable_account_by_policy(&evaluations, Some("active"))
             .expect("policy should select the enabled account");
 
-        assert_eq!(selected.account.id, "active");
+        assert_eq!(selected.account().id, "active");
     }
 
     #[test]
@@ -870,7 +883,7 @@ mod tests {
         let selected = select_usable_account_by_policy(&evaluations, Some("current"))
             .expect("policy should select an enabled replacement");
 
-        assert_eq!(selected.account.id, "replacement");
+        assert_eq!(selected.account().id, "replacement");
     }
 
     #[test]
@@ -1035,7 +1048,7 @@ mod tests {
             .expect("policy should select the successful replacement");
 
         assert_eq!(skipped, vec!["failed: network failed"]);
-        assert_eq!(selected.account.id, "usable");
+        assert_eq!(selected.account().id, "usable");
     }
 
     fn usage_info() -> UsageInfo {

@@ -223,7 +223,6 @@ async fn run() -> Result<()> {
                         show_additional,
                         now,
                         None,
-                        None,
                     ))?;
                 } else {
                     print_usage(&account, &info, is_current, now, show_additional);
@@ -522,7 +521,6 @@ async fn print_all_usage(show_additional: bool, json: bool) -> Result<()> {
                 show_additional,
                 Utc::now().timestamp(),
                 None,
-                None,
             ))?;
         } else {
             println!("No accounts stored.");
@@ -539,21 +537,14 @@ async fn print_all_usage(show_additional: bool, json: bool) -> Result<()> {
     let now = Utc::now().timestamp();
 
     let has_forecastable_usage = has_forecastable_usage_account(&store);
-    let forecast = if has_forecastable_usage {
+    let forecast = has_forecastable_usage.then(|| {
         usage_forecast::forecast_all_usage(
             &store.accounts,
             &by_id,
             current_account_id.as_deref(),
             now,
         )
-    } else {
-        None
-    };
-    let forecast_unavailable_reason = if has_forecastable_usage && forecast.is_none() {
-        Some("not enough complete usage data")
-    } else {
-        None
-    };
+    });
 
     if json {
         let entries = store
@@ -572,7 +563,6 @@ async fn print_all_usage(show_additional: bool, json: bool) -> Result<()> {
             show_additional,
             now,
             forecast.as_ref(),
-            forecast_unavailable_reason,
         ))?;
         return Ok(());
     }
@@ -586,14 +576,9 @@ async fn print_all_usage(show_additional: bool, json: bool) -> Result<()> {
             print_usage(account, info, is_current, now, show_additional);
         }
     }
-    if has_forecastable_usage {
-        if let Some(forecast) = forecast {
-            println!();
-            print_usage_forecast(&forecast, now);
-        } else {
-            println!();
-            print_usage_output("overall estimate:\n  unavailable: not enough complete usage data");
-        }
+    if let Some(forecast) = forecast {
+        println!();
+        print_usage_forecast(&forecast, now);
     }
 
     Ok(())
@@ -700,19 +685,31 @@ fn format_usage_forecast(forecast: &usage_forecast::UsageForecast, now: i64) -> 
                 }
             }
         }
+        usage_forecast::UsageForecastOutcome::NotEnoughData { reason } => {
+            lines.push(format!("  unavailable: {}", reason.as_str()));
+        }
     }
-    if let Some(rates) = forecast.rates {
-        lines.push(format_estimated_rate(rates));
+    if let Some(rates) = forecast.rates
+        && let Some(rate) = format_estimated_rate(rates)
+    {
+        lines.push(rate);
     }
 
     lines.join("\n")
 }
 
-fn format_estimated_rate(rates: usage_forecast::UsageForecastRates) -> String {
-    format!(
-        "  estimated rate: 5-hour {:.1}%/h, weekly {:.1}%/h",
-        rates.five_hour_percent_per_hour, rates.weekly_percent_per_hour
-    )
+fn format_estimated_rate(rates: usage_forecast::UsageForecastRates) -> Option<String> {
+    match (
+        rates.five_hour_percent_per_hour,
+        rates.weekly_percent_per_hour,
+    ) {
+        (Some(five_hour), Some(weekly)) => Some(format!(
+            "  estimated rate: 5-hour {five_hour:.1}%/h, weekly {weekly:.1}%/h"
+        )),
+        (Some(five_hour), None) => Some(format!("  estimated rate: 5-hour {five_hour:.1}%/h")),
+        (None, Some(weekly)) => Some(format!("  estimated rate: weekly {weekly:.1}%/h")),
+        (None, None) => None,
+    }
 }
 
 fn format_usage(
@@ -1097,7 +1094,8 @@ mod tests {
         AccountsStore, NewChatGptAccount, RedactedString, StoredAccount, UsageInfo, UsageLimitInfo,
     };
     use crate::usage_forecast::{
-        ForecastLimit, UsageForecast, UsageForecastOutcome, UsageForecastRates,
+        ForecastLimit, ForecastUnavailableReason, UsageForecast, UsageForecastOutcome,
+        UsageForecastRates,
     };
     use chrono::{TimeZone, Utc};
 
@@ -1569,8 +1567,8 @@ mod tests {
         let now = 1_800_000_000;
         let forecast = UsageForecast {
             rates: Some(UsageForecastRates {
-                five_hour_percent_per_hour: 18.0,
-                weekly_percent_per_hour: 0.7,
+                five_hour_percent_per_hour: Some(18.0),
+                weekly_percent_per_hour: Some(0.7),
             }),
             outcome: UsageForecastOutcome::Unavailable {
                 at: now + 3 * 60 * 60,
@@ -1593,8 +1591,8 @@ mod tests {
     fn usage_forecast_output_shows_sustainable_estimate() {
         let forecast = UsageForecast {
             rates: Some(UsageForecastRates {
-                five_hour_percent_per_hour: 4.0,
-                weekly_percent_per_hour: 0.2,
+                five_hour_percent_per_hour: Some(4.0),
+                weekly_percent_per_hour: Some(0.2),
             }),
             outcome: UsageForecastOutcome::NotExpected {
                 horizon_seconds: 14 * 24 * 60 * 60,
@@ -1605,6 +1603,50 @@ mod tests {
 
         assert!(output.contains("unavailable: not expected within 14d at current pace"));
         assert!(output.contains("estimated rate: 5-hour 4.0%/h, weekly 0.2%/h"));
+    }
+
+    #[test]
+    fn usage_forecast_output_shows_only_the_available_rate() {
+        let weekly_forecast = UsageForecast {
+            rates: Some(UsageForecastRates {
+                five_hour_percent_per_hour: None,
+                weekly_percent_per_hour: Some(0.7),
+            }),
+            outcome: UsageForecastOutcome::NotExpected {
+                horizon_seconds: 14 * 24 * 60 * 60,
+            },
+        };
+        let five_hour_forecast = UsageForecast {
+            rates: Some(UsageForecastRates {
+                five_hour_percent_per_hour: Some(18.0),
+                weekly_percent_per_hour: None,
+            }),
+            outcome: UsageForecastOutcome::NotExpected {
+                horizon_seconds: 14 * 24 * 60 * 60,
+            },
+        };
+
+        let weekly_output = format_usage_forecast(&weekly_forecast, 1_800_000_000);
+        let five_hour_output = format_usage_forecast(&five_hour_forecast, 1_800_000_000);
+
+        assert!(weekly_output.contains("estimated rate: weekly 0.7%/h"));
+        assert!(!weekly_output.contains("5-hour"));
+        assert!(five_hour_output.contains("estimated rate: 5-hour 18.0%/h"));
+        assert!(!five_hour_output.contains("weekly"));
+    }
+
+    #[test]
+    fn usage_forecast_output_explains_not_enough_data() {
+        let forecast = UsageForecast {
+            rates: None,
+            outcome: UsageForecastOutcome::NotEnoughData {
+                reason: ForecastUnavailableReason::NoComparableUsageWindows,
+            },
+        };
+
+        let output = format_usage_forecast(&forecast, 1_800_000_000);
+
+        assert!(output.contains("unavailable: no comparable usage windows"));
     }
 
     #[test]

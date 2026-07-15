@@ -1,5 +1,7 @@
 use std::io::IsTerminal;
 
+use crate::usage_forecast::ForecastUnavailableReason;
+
 const ANSI_RESET: &str = "\x1b[0m";
 const ANSI_BOLD: &str = "\x1b[1m";
 const ANSI_DIM: &str = "\x1b[2m";
@@ -79,7 +81,11 @@ impl UsageOutputStyle {
         if line.starts_with("  unavailable: not expected") {
             return Some(self.wrap(line, ANSI_GREEN));
         }
-        if line.starts_with("  unavailable: not enough complete usage data") {
+        if line.strip_prefix("  unavailable: ").is_some_and(|reason| {
+            ForecastUnavailableReason::ALL
+                .into_iter()
+                .any(|candidate| candidate.as_str() == reason)
+        }) {
             return None;
         }
         if line.starts_with("  unavailable:") {
@@ -227,7 +233,7 @@ fn is_usage_account_header_line(line: &str) -> bool {
 mod tests {
     use super::{
         ANSI_BOLD, ANSI_BOLD_GREEN, ANSI_BOLD_RED, ANSI_DIM, ANSI_GREEN, ANSI_RED, ANSI_RESET,
-        ANSI_YELLOW, UsageOutputStyle, usage_output_style,
+        ANSI_YELLOW, ForecastUnavailableReason, UsageOutputStyle, usage_output_style,
     };
 
     #[test]
@@ -252,14 +258,14 @@ mod tests {
 
     #[test]
     fn plain_usage_output_style_preserves_text() {
-        let text = "work (12345678)\nplan: pro\n5-hour ┬ quota [████] 80.0% left\n       └ reset [────] 20% remaining\noverall estimate:\n  unavailable: not enough complete usage data";
+        let text = "work (12345678)\nplan: pro\n5-hour ┬ quota [████] 80.0% left\n       └ reset [────] 20% remaining\noverall estimate:\n  unavailable: incomplete usage data";
 
         assert_eq!(UsageOutputStyle::plain().style_text(text), text);
     }
 
     #[test]
     fn colored_usage_output_style_applies_usage_hierarchy() {
-        let text = "* work (12345678) [UNAVAILABLE]\nplan: pro\nstatus: weekly usage is 100.0%\n5-hour ┬ quota [████░░░░] 80.0% left\n       └ reset [────] 20% remaining\noverall estimate:\n  unavailable: not enough complete usage data";
+        let text = "* work (12345678) [UNAVAILABLE]\nplan: pro\nstatus: weekly usage is 100.0%\n5-hour ┬ quota [████░░░░] 80.0% left\n       └ reset [────] 20% remaining\noverall estimate:\n  unavailable: incomplete usage data";
 
         let styled = UsageOutputStyle::colored().style_text(text);
 
@@ -276,7 +282,7 @@ mod tests {
         assert!(styled.contains("\n       └ reset [────] 20% remaining\n"));
         assert!(styled.contains(&format!("{ANSI_BOLD}overall estimate:{ANSI_RESET}")));
         assert!(styled.contains(&format!(
-            "{ANSI_DIM}  unavailable: not enough complete usage data{ANSI_RESET}"
+            "{ANSI_DIM}  unavailable: incomplete usage data{ANSI_RESET}"
         )));
     }
 
@@ -299,6 +305,14 @@ mod tests {
             "{ANSI_YELLOW}  unavailable: in 4d 19h (Tue 12:54){ANSI_RESET}"
         )));
         assert!(unavailable.contains(&format!("{ANSI_DIM}  limited by: weekly{ANSI_RESET}")));
+
+        for reason in ForecastUnavailableReason::ALL {
+            let unavailable = style.style_text(&format!("  unavailable: {}", reason.as_str()));
+            assert_eq!(
+                unavailable,
+                format!("{ANSI_DIM}  unavailable: {}{ANSI_RESET}", reason.as_str())
+            );
+        }
     }
 
     #[test]
