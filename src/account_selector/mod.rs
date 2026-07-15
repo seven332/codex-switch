@@ -61,7 +61,6 @@ pub enum AccountSelectionDecision<'a> {
     KeepCurrent(&'a StoredAccount),
 }
 
-#[cfg(test)]
 impl<'a> AccountSelectionDecision<'a> {
     pub fn account(&self) -> &'a StoredAccount {
         match self {
@@ -239,7 +238,7 @@ pub fn select_account_with_context<'a>(
 }
 
 /// Selects from candidates that the caller has already determined are usable.
-/// If their usage windows cannot be compared, a usable current candidate is
+/// If the policy cannot select among them, a usable current candidate is
 /// retained instead of forcing a switch or reporting that no account exists.
 pub fn select_account_or_keep_current<'a>(
     candidates: &[AccountUsageCandidate<'a>],

@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 
-use crate::account_selector::{
-    self, AccountSelectionDecision, AccountUsageCandidate, SelectionConfig, SelectionContext,
-};
+use crate::account_selector::{self, AccountUsageCandidate, SelectionConfig, SelectionContext};
 use crate::runtime::{AUTO_SWITCH_MAINTENANCE_MAX_INTERVAL, AUTO_SWITCH_MAINTENANCE_MIN_INTERVAL};
 use crate::types::{AuthData, StoredAccount, UsageInfo, UsageWindowKind};
 
@@ -570,10 +568,7 @@ fn select_account_index(
         SelectionConfig::default(),
         SelectionContext::at(now).with_current_account_id(current_account_id),
     )?;
-    let account = match decision {
-        AccountSelectionDecision::Selected(selection) => selection.account,
-        AccountSelectionDecision::KeepCurrent(account) => account,
-    };
+    let account = decision.account();
     accounts
         .iter()
         .position(|candidate| candidate.account.id == account.id)
