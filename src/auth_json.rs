@@ -97,7 +97,6 @@ fn import_from_auth_json_contents(content: &str, account_name: String) -> Result
         openai_api_key,
         tokens,
         last_refresh,
-        agent_identity: _,
         ..
     } = auth;
     let resolved_auth_mode = auth_mode.unwrap_or_else(|| {
