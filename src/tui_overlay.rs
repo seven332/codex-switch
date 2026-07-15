@@ -1496,6 +1496,41 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_from_alternate_screen_removes_saved_normal_badge() {
+        let mut compositor = FrameCompositor::new(VERSION, 80);
+        let mut output = Vec::new();
+        compositor
+            .process(&inline_frame(b"conversation"), &mut output)
+            .unwrap();
+        compositor
+            .process(ENTER_ALTERNATE_SCREEN, &mut output)
+            .unwrap();
+        compositor
+            .process(&inline_frame(b"picker"), &mut output)
+            .unwrap();
+        output.clear();
+
+        compositor.append_terminal_cleanup(&mut output).unwrap();
+
+        let column = 80 - LABEL.len() as u16;
+        assert_eq!(
+            output,
+            [
+                LEAVE_ALTERNATE_SCREEN,
+                format!(
+                    "\x1b7\x1b[1;{}H{}\x1b8",
+                    column + 1,
+                    " ".repeat(LABEL.len())
+                )
+                .as_bytes(),
+                b"\x1b[0m\x1b[?25h",
+            ]
+            .concat()
+        );
+        assert!(!compositor.terminal_context_active());
+    }
+
+    #[test]
     fn eligibility_requires_unredirected_normal_terminal() {
         let eligible = TerminalFacts {
             stdin_is_terminal: true,
