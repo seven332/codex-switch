@@ -1101,7 +1101,7 @@ mod tests {
 
     #[test]
     fn preserves_unrelated_and_incomplete_escape_sequences() {
-        let input = b"plain\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\\x1b[31mred\x1b[?202";
+        let input = b"plain \xf0\x9f\xa6\x80\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\\x1bP1;2|dcs payload\x1b\\\x1b[31mred\x1b[?202";
         assert_eq!(render_in_chunks(input, &vec![1; input.len()], 80), input);
     }
 
@@ -1127,6 +1127,28 @@ mod tests {
         for input in inputs {
             assert_eq!(render_in_chunks(&input, &[], 80), input);
         }
+    }
+
+    #[test]
+    fn stops_rendering_after_alternate_screen_exit() {
+        let input = [
+            ENTER_ALTERNATE_SCREEN,
+            BEGIN_SYNCHRONIZED_UPDATE,
+            END_SYNCHRONIZED_UPDATE,
+            LEAVE_ALTERNATE_SCREEN,
+            BEGIN_SYNCHRONIZED_UPDATE,
+            END_SYNCHRONIZED_UPDATE,
+        ]
+        .concat();
+        let output = render_in_chunks(&input, &[], 80);
+
+        assert_eq!(
+            output
+                .windows(LABEL.len())
+                .filter(|bytes| *bytes == LABEL.as_bytes())
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1349,6 +1371,10 @@ mod tests {
         compositor.append_terminal_cleanup(&mut output);
         assert!(output.ends_with(b"\x1b[?20\x1b[?2026l\x1b[?1049l\x1b[0m\x1b[?25h"));
         assert!(!compositor.alternate_screen_active());
+
+        let cleaned_length = output.len();
+        compositor.append_terminal_cleanup(&mut output);
+        assert_eq!(output.len(), cleaned_length);
     }
 
     #[test]
@@ -1435,12 +1461,12 @@ mod tests {
         let pty = unsafe { pty_process::Pty::from_fd(fd) }.unwrap();
         let (mut reader, mut writer) = pty.into_split();
 
+        writer.resize(Size::new(40, 100)).unwrap();
         let mut child = pty_process::blocking::Command::new("/bin/sh")
             .arg("-c")
-            .arg("IFS= read -r value; printf '<%s>' \"$value\"")
+            .arg("stty size; IFS= read -r value; printf '<%s>' \"$value\"")
             .spawn(pts)
             .unwrap();
-        writer.resize(Size::new(40, 100)).unwrap();
         writer.write_all(b"round-trip\n").await.unwrap();
 
         let output = timeout(Duration::from_secs(2), async {
@@ -1461,6 +1487,11 @@ mod tests {
         .await
         .unwrap();
         assert!(child.wait().unwrap().success());
+        assert!(
+            output
+                .windows(b"40 100".len())
+                .any(|bytes| bytes == b"40 100")
+        );
         assert!(
             output
                 .windows(b"<round-trip>".len())
@@ -1506,6 +1537,37 @@ mod tests {
         assert!(status.success());
         monitor.join().unwrap();
         drop(pty);
+    }
+
+    #[tokio::test]
+    async fn child_monitor_preserves_signal_exit_status() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let (_pty, pts) = pty_process::blocking::open().unwrap();
+        let child = pty_process::blocking::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("kill -TERM $$")
+            .spawn(pts)
+            .unwrap();
+        let (child_tx, child_rx) = std_mpsc::sync_channel(0);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let monitor = std::thread::spawn(move || run_child_monitor(child_rx, event_tx));
+        child_tx.send(child).unwrap();
+
+        let status = timeout(Duration::from_secs(2), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(ChildEvent::Exited(status)) => break status,
+                    Some(ChildEvent::Stopped | ChildEvent::Continued) => {}
+                    Some(ChildEvent::Error(message)) => panic!("child monitor failed: {message}"),
+                    None => panic!("child monitor channel closed before exit"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(status.signal(), Some(UnixSignal::SIGTERM as i32));
+        monitor.join().unwrap();
     }
 
     #[tokio::test]
