@@ -55,6 +55,22 @@ pub struct AccountSelection<'a> {
     pub metrics: UsageSelectionMetrics,
 }
 
+#[derive(Debug)]
+pub enum AccountSelectionDecision<'a> {
+    Selected(AccountSelection<'a>),
+    KeepCurrent(&'a StoredAccount),
+}
+
+#[cfg(test)]
+impl<'a> AccountSelectionDecision<'a> {
+    pub fn account(&self) -> &'a StoredAccount {
+        match self {
+            Self::Selected(selection) => selection.account,
+            Self::KeepCurrent(account) => account,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct UsageSelectionMetrics {
     pub five_hour_headroom: Option<f64>,
@@ -191,6 +207,7 @@ pub trait AccountSelectionPolicy {
     ) -> Option<AccountSelection<'a>>;
 }
 
+#[cfg(test)]
 pub fn select_account<'a>(
     candidates: &[AccountUsageCandidate<'a>],
     config: SelectionConfig,
@@ -219,6 +236,25 @@ pub fn select_account_with_context<'a>(
             DeadlineAwarePolicy::new(config).select_account_at(candidates, context)
         }
     }
+}
+
+/// Selects from candidates that the caller has already determined are usable.
+/// If their usage windows cannot be compared, a usable current candidate is
+/// retained instead of forcing a switch or reporting that no account exists.
+pub fn select_account_or_keep_current<'a>(
+    candidates: &[AccountUsageCandidate<'a>],
+    config: SelectionConfig,
+    context: SelectionContext<'_>,
+) -> Option<AccountSelectionDecision<'a>> {
+    if let Some(selection) = select_account_with_context(candidates, config, context) {
+        return Some(AccountSelectionDecision::Selected(selection));
+    }
+
+    let current_account_id = context.current_account_id?;
+    candidates
+        .iter()
+        .find(|candidate| candidate.account.id == current_account_id)
+        .map(|candidate| AccountSelectionDecision::KeepCurrent(candidate.account))
 }
 
 pub fn usage_selection_metrics(

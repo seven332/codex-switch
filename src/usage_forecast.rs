@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use crate::account_selector::{self, AccountUsageCandidate, SelectionConfig, SelectionContext};
+use crate::account_selector::{
+    self, AccountSelectionDecision, AccountUsageCandidate, SelectionConfig, SelectionContext,
+};
 use crate::runtime::{AUTO_SWITCH_MAINTENANCE_MAX_INTERVAL, AUTO_SWITCH_MAINTENANCE_MIN_INTERVAL};
 use crate::types::{AuthData, StoredAccount, UsageInfo, UsageWindowKind};
 
@@ -21,8 +23,8 @@ pub struct UsageForecast {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct UsageForecastRates {
-    pub five_hour_percent_per_hour: f64,
-    pub weekly_percent_per_hour: f64,
+    pub five_hour_percent_per_hour: Option<f64>,
+    pub weekly_percent_per_hour: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -35,6 +37,26 @@ pub enum UsageForecastOutcome {
         limited_by: ForecastLimit,
         recovery_at: Option<i64>,
     },
+    NotEnoughData {
+        reason: ForecastUnavailableReason,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForecastUnavailableReason {
+    IncompleteUsageData,
+    InsufficientRateSamples,
+    NoComparableUsageWindows,
+}
+
+impl ForecastUnavailableReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::IncompleteUsageData => "incomplete usage data",
+            Self::InsufficientRateSamples => "insufficient rate samples",
+            Self::NoComparableUsageWindows => "no comparable usage windows",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,27 +77,34 @@ pub fn forecast_all_usage(
     usage_by_id: &HashMap<String, UsageInfo>,
     current_account_id: Option<&str>,
     now: i64,
-) -> Option<UsageForecast> {
-    let mut forecast = build_forecast(accounts, usage_by_id, now)?;
-    let outcome = simulate_forecast(&mut forecast, current_account_id, now)?;
+) -> UsageForecast {
+    let Some(mut forecast) = build_forecast(accounts, usage_by_id, now) else {
+        return UsageForecast {
+            rates: None,
+            outcome: UsageForecastOutcome::NotEnoughData {
+                reason: ForecastUnavailableReason::IncompleteUsageData,
+            },
+        };
+    };
+    let outcome = simulate_forecast(&mut forecast, current_account_id, now);
+    let rates = (!matches!(outcome, UsageForecastOutcome::NotEnoughData { .. }))
+        .then_some(forecast.rates)
+        .filter(UsageForecastRates::has_any);
 
-    Some(UsageForecast {
-        rates: forecast.rates,
-        outcome,
-    })
+    UsageForecast { rates, outcome }
 }
 
 struct ForecastInput<'a> {
     accounts: Vec<SimAccount<'a>>,
-    rates: Option<UsageForecastRates>,
+    rates: UsageForecastRates,
     fallback_unavailable_limit: Option<ForecastLimit>,
 }
 
 #[derive(Clone)]
 struct SimAccount<'a> {
     account: &'a StoredAccount,
-    five_hour: SimWindow,
-    weekly: SimWindow,
+    five_hour: Option<SimWindow>,
+    weekly: Option<SimWindow>,
     blocked_until: Option<i64>,
 }
 
@@ -142,35 +171,7 @@ fn build_forecast<'a>(
         }
         let additional_block = additional_hard_limit_block(usage, now);
 
-        let Some(five_hour_window) = usage.five_hour_window() else {
-            if let Some(limit) = known_limit {
-                record_fallback_limit(&mut fallback_unavailable_limit, limit);
-            }
-            continue;
-        };
-        let Some(mut five_hour) = make_window(
-            five_hour_window.used_percent,
-            five_hour_window.window_minutes,
-            five_hour_window.resets_at,
-            now,
-        ) else {
-            if let Some(limit) = known_limit {
-                record_fallback_limit(&mut fallback_unavailable_limit, limit);
-            }
-            continue;
-        };
-        let Some(weekly_window) = usage.weekly_window() else {
-            if let Some(limit) = known_limit {
-                record_fallback_limit(&mut fallback_unavailable_limit, limit);
-            }
-            continue;
-        };
-        let Some(mut weekly) = make_window(
-            weekly_window.used_percent,
-            weekly_window.window_minutes,
-            weekly_window.resets_at,
-            now,
-        ) else {
+        let Some((mut five_hour, mut weekly)) = make_account_windows(usage, now) else {
             if let Some(limit) = known_limit {
                 record_fallback_limit(&mut fallback_unavailable_limit, limit);
             }
@@ -189,10 +190,14 @@ fn build_forecast<'a>(
             None
         };
 
-        if let Some(sample) = rate_sample(&five_hour, now, MIN_FIVE_HOUR_RATE_SAMPLE_MINUTES) {
+        if let Some(window) = five_hour.as_ref()
+            && let Some(sample) = rate_sample(window, now, MIN_FIVE_HOUR_RATE_SAMPLE_MINUTES)
+        {
             samples.five_hour.push(sample);
         }
-        if let Some(sample) = rate_sample(&weekly, now, MIN_WEEKLY_RATE_SAMPLE_MINUTES) {
+        if let Some(window) = weekly.as_ref()
+            && let Some(sample) = rate_sample(window, now, MIN_WEEKLY_RATE_SAMPLE_MINUTES)
+        {
             samples.weekly.push(sample);
         }
 
@@ -216,11 +221,67 @@ fn build_forecast<'a>(
     })
 }
 
-fn estimate_rates(samples: &RateSamples) -> Option<UsageForecastRates> {
-    Some(UsageForecastRates {
-        five_hour_percent_per_hour: estimate_rate_percent_per_hour(&samples.five_hour)?,
-        weekly_percent_per_hour: estimate_rate_percent_per_hour(&samples.weekly)?,
-    })
+fn estimate_rates(samples: &RateSamples) -> UsageForecastRates {
+    UsageForecastRates {
+        five_hour_percent_per_hour: estimate_rate_percent_per_hour(&samples.five_hour),
+        weekly_percent_per_hour: estimate_rate_percent_per_hour(&samples.weekly),
+    }
+}
+
+impl UsageForecastRates {
+    fn has_any(&self) -> bool {
+        self.five_hour_percent_per_hour.is_some() || self.weekly_percent_per_hour.is_some()
+    }
+
+    fn all_present_rates_non_positive(self) -> bool {
+        [
+            self.five_hour_percent_per_hour,
+            self.weekly_percent_per_hour,
+        ]
+        .into_iter()
+        .flatten()
+        .all(|rate| rate <= 0.0)
+    }
+}
+
+impl ForecastInput<'_> {
+    fn has_required_rates(&self) -> bool {
+        let needs_five_hour = self
+            .accounts
+            .iter()
+            .any(|account| account.five_hour.is_some());
+        let needs_weekly = self.accounts.iter().any(|account| account.weekly.is_some());
+
+        (!needs_five_hour || self.rates.five_hour_percent_per_hour.is_some())
+            && (!needs_weekly || self.rates.weekly_percent_per_hour.is_some())
+    }
+}
+
+fn make_account_windows(
+    usage: &UsageInfo,
+    now: i64,
+) -> Option<(Option<SimWindow>, Option<SimWindow>)> {
+    let mut five_hour = None;
+    let mut weekly = None;
+
+    for window in usage.windows() {
+        let target = match window.kind() {
+            UsageWindowKind::FiveHour => &mut five_hour,
+            UsageWindowKind::Weekly => &mut weekly,
+            _ => return None,
+        };
+        let simulated = make_window(
+            window.used_percent,
+            window.window_minutes,
+            window.resets_at,
+            now,
+        )?;
+        if target.replace(simulated).is_some() {
+            return None;
+        }
+    }
+
+    (five_hour.is_some() || weekly.is_some()).then_some((five_hour, weekly))
 }
 
 fn make_window(
@@ -324,8 +385,8 @@ fn estimate_rate_percent_per_hour(samples: &[RateSample]) -> Option<f64> {
 
 fn apply_rate_limit_reached_type(
     usage: &UsageInfo,
-    five_hour: &mut SimWindow,
-    weekly: &mut SimWindow,
+    five_hour: &mut Option<SimWindow>,
+    weekly: &mut Option<SimWindow>,
 ) {
     let Some(kind) = usage.rate_limit_reached_type.as_deref() else {
         return;
@@ -336,17 +397,22 @@ fn apply_rate_limit_reached_type(
     ) {
         return;
     }
-    if five_hour.used_percent >= LIMIT_PERCENT || weekly.used_percent >= LIMIT_PERCENT {
-        return;
-    }
-
-    if five_hour.used_percent > weekly.used_percent {
-        five_hour.used_percent = LIMIT_PERCENT;
-    } else if weekly.used_percent > five_hour.used_percent {
-        weekly.used_percent = LIMIT_PERCENT;
-    } else {
-        five_hour.used_percent = LIMIT_PERCENT;
-        weekly.used_percent = LIMIT_PERCENT;
+    match (five_hour.as_mut(), weekly.as_mut()) {
+        (Some(five_hour), None) => five_hour.used_percent = LIMIT_PERCENT,
+        (None, Some(weekly)) => weekly.used_percent = LIMIT_PERCENT,
+        (Some(five_hour), Some(weekly))
+            if five_hour.used_percent < LIMIT_PERCENT && weekly.used_percent < LIMIT_PERCENT =>
+        {
+            if five_hour.used_percent > weekly.used_percent {
+                five_hour.used_percent = LIMIT_PERCENT;
+            } else if weekly.used_percent > five_hour.used_percent {
+                weekly.used_percent = LIMIT_PERCENT;
+            } else {
+                five_hour.used_percent = LIMIT_PERCENT;
+                weekly.used_percent = LIMIT_PERCENT;
+            }
+        }
+        (Some(_), Some(_)) | (None, None) => {}
     }
 }
 
@@ -354,7 +420,7 @@ fn simulate_forecast(
     forecast: &mut ForecastInput<'_>,
     current_account_id: Option<&str>,
     now: i64,
-) -> Option<UsageForecastOutcome> {
+) -> UsageForecastOutcome {
     let horizon_at = now.saturating_add(FORECAST_HORIZON_SECONDS);
     let mut time = now;
     let mut next_policy_reevaluation = time.saturating_add(POLICY_REEVALUATION_SECONDS);
@@ -362,18 +428,33 @@ fn simulate_forecast(
     let mut current_index = initial_account_index(&forecast.accounts, current_account_id, time);
 
     if current_index.is_none() {
-        return Some(UsageForecastOutcome::Unavailable {
-            at: time,
-            limited_by: forecast_limited_by(forecast, time),
-            recovery_at: recovery_time(&forecast.accounts, time),
-        });
+        return if forecast
+            .accounts
+            .iter()
+            .any(|account| account.is_usable_at(time))
+        {
+            UsageForecastOutcome::NotEnoughData {
+                reason: ForecastUnavailableReason::NoComparableUsageWindows,
+            }
+        } else {
+            UsageForecastOutcome::Unavailable {
+                at: time,
+                limited_by: forecast_limited_by(forecast, time),
+                recovery_at: recovery_time(&forecast.accounts, time),
+            }
+        };
     }
 
-    let rates = forecast.rates?;
-    if rates.five_hour_percent_per_hour <= 0.0 && rates.weekly_percent_per_hour <= 0.0 {
-        return Some(UsageForecastOutcome::NotExpected {
+    if !forecast.has_required_rates() {
+        return UsageForecastOutcome::NotEnoughData {
+            reason: ForecastUnavailableReason::InsufficientRateSamples,
+        };
+    }
+    let rates = forecast.rates;
+    if rates.all_present_rates_non_positive() {
+        return UsageForecastOutcome::NotExpected {
             horizon_seconds: FORECAST_HORIZON_SECONDS,
-        });
+        };
     }
 
     for _ in 0..MAX_SIMULATION_STEPS {
@@ -397,17 +478,27 @@ fn simulate_forecast(
         }
 
         let Some(selected_index) = current_index else {
-            return Some(UsageForecastOutcome::Unavailable {
-                at: time,
-                limited_by: forecast_limited_by(forecast, time),
-                recovery_at: recovery_time(&forecast.accounts, time),
-            });
+            return if forecast
+                .accounts
+                .iter()
+                .any(|account| account.is_usable_at(time))
+            {
+                UsageForecastOutcome::NotEnoughData {
+                    reason: ForecastUnavailableReason::NoComparableUsageWindows,
+                }
+            } else {
+                UsageForecastOutcome::Unavailable {
+                    at: time,
+                    limited_by: forecast_limited_by(forecast, time),
+                    recovery_at: recovery_time(&forecast.accounts, time),
+                }
+            };
         };
 
         if time >= horizon_at {
-            return Some(UsageForecastOutcome::NotExpected {
+            return UsageForecastOutcome::NotExpected {
                 horizon_seconds: FORECAST_HORIZON_SECONDS,
-            });
+            };
         }
 
         let Some(next_time) = next_event_time(
@@ -417,15 +508,15 @@ fn simulate_forecast(
             time,
             next_policy_reevaluation,
         ) else {
-            return Some(UsageForecastOutcome::NotExpected {
+            return UsageForecastOutcome::NotExpected {
                 horizon_seconds: FORECAST_HORIZON_SECONDS,
-            });
+            };
         };
         let next_time = next_time.min(horizon_at);
         if next_time <= time {
-            return Some(UsageForecastOutcome::NotExpected {
+            return UsageForecastOutcome::NotExpected {
                 horizon_seconds: FORECAST_HORIZON_SECONDS,
-            });
+            };
         }
 
         charge_account(
@@ -436,9 +527,9 @@ fn simulate_forecast(
         time = next_time;
     }
 
-    Some(UsageForecastOutcome::NotExpected {
+    UsageForecastOutcome::NotExpected {
         horizon_seconds: FORECAST_HORIZON_SECONDS,
-    })
+    }
 }
 
 fn initial_account_index(
@@ -463,7 +554,7 @@ fn select_account_index(
     let indexed_usages = accounts
         .iter()
         .enumerate()
-        .filter(|(_, account)| !account.is_blocked_at(now))
+        .filter(|(_, account)| account.is_usable_at(now))
         .map(|(index, account)| (index, account.usage_info()))
         .collect::<Vec<_>>();
     let candidates = indexed_usages
@@ -474,16 +565,18 @@ fn select_account_index(
         })
         .collect::<Vec<_>>();
 
-    account_selector::select_account_with_context(
+    let decision = account_selector::select_account_or_keep_current(
         &candidates,
         SelectionConfig::default(),
         SelectionContext::at(now).with_current_account_id(current_account_id),
-    )
-    .and_then(|selection| {
-        accounts
-            .iter()
-            .position(|account| account.account.id == selection.account.id)
-    })
+    )?;
+    let account = match decision {
+        AccountSelectionDecision::Selected(selection) => selection.account,
+        AccountSelectionDecision::KeepCurrent(account) => account,
+    };
+    accounts
+        .iter()
+        .position(|candidate| candidate.account.id == account.id)
 }
 
 fn apply_due_resets(accounts: &mut [SimAccount<'_>], now: i64) {
@@ -501,14 +594,24 @@ fn next_event_time(
 ) -> Option<i64> {
     let selected = accounts.get(selected_index)?;
     [
+        selected.five_hour.and_then(|window| {
+            rates
+                .five_hour_percent_per_hour
+                .and_then(|rate| window.exhaustion_time(rate, now))
+        }),
+        selected.weekly.and_then(|window| {
+            rates
+                .weekly_percent_per_hour
+                .and_then(|rate| window.exhaustion_time(rate, now))
+        }),
         selected
             .five_hour
-            .exhaustion_time(rates.five_hour_percent_per_hour, now),
+            .filter(|window| window.resets_at > now)
+            .map(|window| window.resets_at),
         selected
             .weekly
-            .exhaustion_time(rates.weekly_percent_per_hour, now),
-        (selected.five_hour.resets_at > now).then_some(selected.five_hour.resets_at),
-        (selected.weekly.resets_at > now).then_some(selected.weekly.resets_at),
+            .filter(|window| window.resets_at > now)
+            .map(|window| window.resets_at),
         (next_policy_reevaluation > now).then_some(next_policy_reevaluation),
     ]
     .into_iter()
@@ -518,21 +621,27 @@ fn next_event_time(
 
 fn charge_account(account: &mut SimAccount<'_>, rates: &UsageForecastRates, seconds: i64) {
     let hours = seconds as f64 / 3600.0;
-    account.five_hour.used_percent = (account.five_hour.used_percent
-        + rates.five_hour_percent_per_hour * hours)
-        .clamp(0.0, LIMIT_PERCENT);
-    account.weekly.used_percent = (account.weekly.used_percent
-        + rates.weekly_percent_per_hour * hours)
-        .clamp(0.0, LIMIT_PERCENT);
+    if let (Some(window), Some(rate)) =
+        (account.five_hour.as_mut(), rates.five_hour_percent_per_hour)
+    {
+        window.used_percent = (window.used_percent + rate * hours).clamp(0.0, LIMIT_PERCENT);
+    }
+    if let (Some(window), Some(rate)) = (account.weekly.as_mut(), rates.weekly_percent_per_hour) {
+        window.used_percent = (window.used_percent + rate * hours).clamp(0.0, LIMIT_PERCENT);
+    }
 }
 
 fn limited_by(accounts: &[SimAccount<'_>], now: i64) -> ForecastLimit {
-    let five_hour = accounts
-        .iter()
-        .any(|account| account.five_hour.used_percent >= LIMIT_PERCENT);
-    let weekly = accounts
-        .iter()
-        .any(|account| account.weekly.used_percent >= LIMIT_PERCENT);
+    let five_hour = accounts.iter().any(|account| {
+        account
+            .five_hour
+            .is_some_and(|window| window.used_percent >= LIMIT_PERCENT)
+    });
+    let weekly = accounts.iter().any(|account| {
+        account
+            .weekly
+            .is_some_and(|window| window.used_percent >= LIMIT_PERCENT)
+    });
     let additional = accounts.iter().any(|account| account.is_blocked_at(now));
     match (five_hour, weekly, additional) {
         (false, false, false) => ForecastLimit::Unknown,
@@ -694,22 +803,31 @@ impl SimAccount<'_> {
 
     fn is_usable_at(&self, now: i64) -> bool {
         !self.is_blocked_at(now)
-            && self.five_hour.used_percent < LIMIT_PERCENT
-            && self.weekly.used_percent < LIMIT_PERCENT
+            && (self.five_hour.is_some() || self.weekly.is_some())
+            && [self.five_hour, self.weekly]
+                .into_iter()
+                .flatten()
+                .all(|window| window.used_percent < LIMIT_PERCENT)
     }
 
     fn usage_info(&self) -> UsageInfo {
+        let (primary, secondary) = match (self.five_hour, self.weekly) {
+            (Some(five_hour), Some(weekly)) => (Some(five_hour), Some(weekly)),
+            (Some(five_hour), None) => (Some(five_hour), None),
+            (None, Some(weekly)) => (Some(weekly), None),
+            (None, None) => (None, None),
+        };
         UsageInfo {
             account_id: self.account.id.clone(),
             limit_id: Some("codex".to_string()),
             limit_name: None,
             plan_type: self.account.plan_type.clone(),
-            primary_used_percent: Some(self.five_hour.used_percent),
-            primary_window_minutes: Some(self.five_hour.window_seconds / 60),
-            primary_resets_at: Some(self.five_hour.resets_at),
-            secondary_used_percent: Some(self.weekly.used_percent),
-            secondary_window_minutes: Some(self.weekly.window_seconds / 60),
-            secondary_resets_at: Some(self.weekly.resets_at),
+            primary_used_percent: primary.map(|window| window.used_percent),
+            primary_window_minutes: primary.map(|window| window.window_seconds / 60),
+            primary_resets_at: primary.map(|window| window.resets_at),
+            secondary_used_percent: secondary.map(|window| window.used_percent),
+            secondary_window_minutes: secondary.map(|window| window.window_seconds / 60),
+            secondary_resets_at: secondary.map(|window| window.resets_at),
             has_credits: None,
             unlimited_credits: None,
             credits_balance: None,
@@ -724,26 +842,23 @@ impl SimAccount<'_> {
         let blocked_ready = self
             .blocked_until
             .filter(|blocked_until| *blocked_until > now);
-        let five_hour_ready = if self.five_hour.used_percent >= LIMIT_PERCENT {
-            self.five_hour.resets_at
-        } else {
-            now
-        };
-        let weekly_ready = if self.weekly.used_percent >= LIMIT_PERCENT {
-            self.weekly.resets_at
-        } else {
-            now
-        };
-        Some(
-            five_hour_ready
-                .max(weekly_ready)
-                .max(blocked_ready.unwrap_or(now)),
-        )
+        let usage_ready = [self.five_hour, self.weekly]
+            .into_iter()
+            .flatten()
+            .filter(|window| window.used_percent >= LIMIT_PERCENT)
+            .map(|window| window.resets_at)
+            .max()
+            .unwrap_or(now);
+        Some(usage_ready.max(blocked_ready.unwrap_or(now)))
     }
 
     fn apply_due_resets(&mut self, now: i64) {
-        self.five_hour.apply_due_reset(now);
-        self.weekly.apply_due_reset(now);
+        if let Some(window) = self.five_hour.as_mut() {
+            window.apply_due_reset(now);
+        }
+        if let Some(window) = self.weekly.as_mut() {
+            window.apply_due_reset(now);
+        }
         if self
             .blocked_until
             .is_some_and(|blocked_until| blocked_until <= now)
@@ -796,9 +911,9 @@ impl ForecastLimit {
 #[cfg(test)]
 mod tests {
     use super::{
-        ForecastLimit, POLICY_REEVALUATION_SECONDS, UsageForecastOutcome, UsageForecastRates,
-        build_forecast, charge_account, forecast_all_usage, initial_account_index, next_event_time,
-        select_account_index,
+        ForecastLimit, ForecastUnavailableReason, POLICY_REEVALUATION_SECONDS,
+        UsageForecastOutcome, UsageForecastRates, build_forecast, charge_account,
+        forecast_all_usage, initial_account_index, next_event_time, select_account_index,
     };
     use crate::types::{AuthData, RedactedString, StoredAccount, UsageInfo, UsageLimitInfo};
     use chrono::Utc;
@@ -821,10 +936,10 @@ mod tests {
         ]);
 
         let forecast = build_forecast(&accounts, &usage_by_id, NOW).expect("forecast input");
-        let rates = forecast.rates.expect("forecast rates");
+        let rates = forecast.rates;
 
-        assert_eq!(rates.five_hour_percent_per_hour, 30.0);
-        assert!((rates.weekly_percent_per_hour - 0.5).abs() < f64::EPSILON);
+        assert_eq!(rates.five_hour_percent_per_hour, Some(30.0));
+        assert!((rates.weekly_percent_per_hour.expect("weekly rate") - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -836,8 +951,7 @@ mod tests {
             &HashMap::from([(accounts[0].id.clone(), canonical.clone())]),
             Some(accounts[0].id.as_str()),
             NOW,
-        )
-        .expect("canonical forecast");
+        );
         let mut swapped = canonical;
         std::mem::swap(
             &mut swapped.primary_used_percent,
@@ -857,22 +971,147 @@ mod tests {
             &HashMap::from([(accounts[0].id.clone(), swapped)]),
             Some(accounts[0].id.as_str()),
             NOW,
-        )
-        .expect("swapped forecast");
+        );
 
         assert_eq!(swapped_forecast, canonical_forecast);
     }
 
     #[test]
-    fn noncanonical_window_returns_no_forecast() {
+    fn weekly_only_pool_produces_a_weekly_forecast() {
+        let accounts = vec![chatgpt_account("a"), chatgpt_account("b")];
+        let mut secondary_weekly = single_window_usage_info(&accounts[1].id, 30.0, 10_080, 8_640);
+        secondary_weekly.secondary_used_percent = secondary_weekly.primary_used_percent.take();
+        secondary_weekly.secondary_window_minutes = secondary_weekly.primary_window_minutes.take();
+        secondary_weekly.secondary_resets_at = secondary_weekly.primary_resets_at.take();
+        let usage_by_id = HashMap::from([
+            (
+                accounts[0].id.clone(),
+                single_window_usage_info(&accounts[0].id, 20.0, 10_080, 9_000),
+            ),
+            (accounts[1].id.clone(), secondary_weekly),
+        ]);
+
+        let forecast = forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW);
+        let rates = forecast.rates.expect("weekly forecast rates");
+
+        assert_eq!(rates.five_hour_percent_per_hour, None);
+        assert!(rates.weekly_percent_per_hour.is_some());
+        assert!(!matches!(
+            forecast.outcome,
+            UsageForecastOutcome::NotEnoughData { .. }
+        ));
+    }
+
+    #[test]
+    fn five_hour_only_pool_produces_a_five_hour_forecast() {
+        let accounts = vec![chatgpt_account("a"), chatgpt_account("b")];
+        let usage_by_id = HashMap::from([
+            (
+                accounts[0].id.clone(),
+                single_window_usage_info(&accounts[0].id, 20.0, 300, 240),
+            ),
+            (
+                accounts[1].id.clone(),
+                single_window_usage_info(&accounts[1].id, 30.0, 300, 180),
+            ),
+        ]);
+
+        let forecast = forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW);
+        let rates = forecast.rates.expect("5-hour forecast rates");
+
+        assert!(rates.five_hour_percent_per_hour.is_some());
+        assert_eq!(rates.weekly_percent_per_hour, None);
+        assert!(!matches!(
+            forecast.outcome,
+            UsageForecastOutcome::NotEnoughData { .. }
+        ));
+    }
+
+    #[test]
+    fn mixed_single_window_pool_keeps_usable_current_account() {
+        let accounts = vec![
+            chatgpt_account("five-hour-current"),
+            chatgpt_account("weekly-replacement"),
+        ];
+        let usage_by_id = HashMap::from([
+            (
+                accounts[0].id.clone(),
+                single_window_usage_info(&accounts[0].id, 50.0, 300, 240),
+            ),
+            (
+                accounts[1].id.clone(),
+                single_window_usage_info(&accounts[1].id, 20.0, 10_080, 9_000),
+            ),
+        ]);
+
+        let forecast = forecast_all_usage(&accounts, &usage_by_id, Some("five-hour-current"), NOW);
+
+        assert!(!matches!(
+            forecast.outcome,
+            UsageForecastOutcome::NotEnoughData {
+                reason: ForecastUnavailableReason::NoComparableUsageWindows,
+            }
+        ));
+    }
+
+    #[test]
+    fn mixed_single_window_pool_without_current_reports_no_comparable_windows() {
+        let accounts = vec![chatgpt_account("five-hour"), chatgpt_account("weekly")];
+        let usage_by_id = HashMap::from([
+            (
+                accounts[0].id.clone(),
+                single_window_usage_info(&accounts[0].id, 20.0, 300, 240),
+            ),
+            (
+                accounts[1].id.clone(),
+                single_window_usage_info(&accounts[1].id, 20.0, 10_080, 9_000),
+            ),
+        ]);
+
+        let forecast = forecast_all_usage(&accounts, &usage_by_id, None, NOW);
+
+        assert_eq!(
+            forecast.outcome,
+            UsageForecastOutcome::NotEnoughData {
+                reason: ForecastUnavailableReason::NoComparableUsageWindows,
+            }
+        );
+    }
+
+    #[test]
+    fn single_window_pool_reports_insufficient_rate_samples_separately() {
+        let accounts = vec![chatgpt_account("weekly")];
+        let usage_by_id = HashMap::from([(
+            accounts[0].id.clone(),
+            single_window_usage_info(&accounts[0].id, 20.0, 10_080, 9_900),
+        )]);
+
+        let forecast = forecast_all_usage(&accounts, &usage_by_id, Some("weekly"), NOW);
+
+        assert_eq!(forecast.rates, None);
+        assert_eq!(
+            forecast.outcome,
+            UsageForecastOutcome::NotEnoughData {
+                reason: ForecastUnavailableReason::InsufficientRateSamples,
+            }
+        );
+    }
+
+    #[test]
+    fn noncanonical_window_reports_not_enough_data() {
         let accounts = vec![chatgpt_account("a")];
         let mut info = usage_info(&accounts[0].id, 30.0, 40.0, 180, 4_320);
         info.primary_window_minutes = Some(120);
         let usage_by_id = HashMap::from([(accounts[0].id.clone(), info)]);
 
-        assert!(
-            forecast_all_usage(&accounts, &usage_by_id, Some(accounts[0].id.as_str()), NOW,)
-                .is_none()
+        let forecast =
+            forecast_all_usage(&accounts, &usage_by_id, Some(accounts[0].id.as_str()), NOW);
+
+        assert_eq!(
+            forecast.outcome,
+            UsageForecastOutcome::NotEnoughData {
+                reason: ForecastUnavailableReason::IncompleteUsageData,
+            }
         );
     }
 
@@ -884,8 +1123,7 @@ mod tests {
         let usage_by_id = HashMap::from([(accounts[0].id.clone(), info)]);
 
         let forecast =
-            forecast_all_usage(&accounts, &usage_by_id, Some(accounts[0].id.as_str()), NOW)
-                .expect("hard limit should produce a forecast");
+            forecast_all_usage(&accounts, &usage_by_id, Some(accounts[0].id.as_str()), NOW);
 
         assert_eq!(
             forecast.outcome,
@@ -915,12 +1153,15 @@ mod tests {
         ]);
 
         let forecast = build_forecast(&accounts, &usage_by_id, NOW).expect("forecast input");
-        let rates = forecast.rates.expect("forecast rates");
+        let rates = forecast.rates;
 
         assert_eq!(forecast.accounts.len(), 1);
         assert_eq!(forecast.accounts[0].account.id, "enabled");
-        assert_eq!(rates.five_hour_percent_per_hour, 50.0);
-        assert!((rates.weekly_percent_per_hour - 1.111_111_111_111_111_2).abs() < 1e-12);
+        assert_eq!(rates.five_hour_percent_per_hour, Some(50.0));
+        assert!(
+            (rates.weekly_percent_per_hour.expect("weekly rate") - 1.111_111_111_111_111_2).abs()
+                < 1e-12
+        );
     }
 
     #[test]
@@ -938,10 +1179,13 @@ mod tests {
         ]);
 
         let forecast = build_forecast(&accounts, &usage_by_id, NOW).expect("forecast input");
-        let rates = forecast.rates.expect("forecast rates");
+        let rates = forecast.rates;
 
-        assert_eq!(rates.five_hour_percent_per_hour, 50.0);
-        assert!((rates.weekly_percent_per_hour - 1.111_111_111_111_111_2).abs() < 1e-12);
+        assert_eq!(rates.five_hour_percent_per_hour, Some(50.0));
+        assert!(
+            (rates.weekly_percent_per_hour.expect("weekly rate") - 1.111_111_111_111_111_2).abs()
+                < 1e-12
+        );
     }
 
     #[test]
@@ -979,8 +1223,7 @@ mod tests {
             ),
         ]);
 
-        let forecast =
-            forecast_all_usage(&accounts, &usage_by_id, Some("b"), NOW).expect("forecast");
+        let forecast = forecast_all_usage(&accounts, &usage_by_id, Some("b"), NOW);
 
         assert!(matches!(
             forecast.outcome,
@@ -1000,8 +1243,7 @@ mod tests {
             usage_info(&accounts[0].id, 0.0, 0.0, 240, 9_000),
         )]);
 
-        let forecast =
-            forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW).expect("forecast");
+        let forecast = forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW);
 
         assert!(matches!(
             forecast.outcome,
@@ -1010,13 +1252,20 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_usage_returns_no_forecast() {
+    fn incomplete_usage_reports_not_enough_data() {
         let accounts = vec![chatgpt_account("a")];
         let mut info = usage_info(&accounts[0].id, 10.0, 10.0, 240, 9_000);
         info.primary_resets_at = None;
         let usage_by_id = HashMap::from([(accounts[0].id.clone(), info)]);
 
-        assert!(forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW).is_none());
+        let forecast = forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW);
+
+        assert_eq!(
+            forecast.outcome,
+            UsageForecastOutcome::NotEnoughData {
+                reason: ForecastUnavailableReason::IncompleteUsageData,
+            }
+        );
     }
 
     #[test]
@@ -1026,8 +1275,7 @@ mod tests {
         info.secondary_resets_at = None;
         let usage_by_id = HashMap::from([(accounts[0].id.clone(), info)]);
 
-        let forecast =
-            forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW).expect("forecast");
+        let forecast = forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW);
 
         assert!(forecast.rates.is_none());
         assert!(matches!(
@@ -1041,14 +1289,21 @@ mod tests {
     }
 
     #[test]
-    fn expired_hard_limit_with_incomplete_usage_returns_no_forecast() {
+    fn expired_hard_limit_with_incomplete_usage_reports_not_enough_data() {
         let accounts = vec![chatgpt_account("a")];
         let mut info = usage_info(&accounts[0].id, 100.0, 20.0, 120, 9_000);
         info.primary_resets_at = Some(NOW - 60);
         info.secondary_resets_at = None;
         let usage_by_id = HashMap::from([(accounts[0].id.clone(), info)]);
 
-        assert!(forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW).is_none());
+        let forecast = forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW);
+
+        assert_eq!(
+            forecast.outcome,
+            UsageForecastOutcome::NotEnoughData {
+                reason: ForecastUnavailableReason::IncompleteUsageData,
+            }
+        );
     }
 
     #[test]
@@ -1083,8 +1338,7 @@ mod tests {
         info.additional_limits.push(additional_limit(100.0, 10.0));
         let usage_by_id = HashMap::from([(accounts[0].id.clone(), info)]);
 
-        let forecast =
-            forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW).expect("forecast");
+        let forecast = forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW);
 
         assert!(forecast.rates.is_some());
         assert!(matches!(
@@ -1137,8 +1391,7 @@ mod tests {
         info.additional_limits.push(additional);
         let usage_by_id = HashMap::from([(accounts[0].id.clone(), info)]);
 
-        let forecast =
-            forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW).expect("forecast");
+        let forecast = forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW);
 
         assert!(matches!(
             forecast.outcome,
@@ -1159,8 +1412,7 @@ mod tests {
         info.additional_limits.push(additional);
         let usage_by_id = HashMap::from([(accounts[0].id.clone(), info)]);
 
-        let forecast =
-            forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW).expect("forecast");
+        let forecast = forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW);
 
         assert!(matches!(
             forecast.outcome,
@@ -1198,8 +1450,7 @@ mod tests {
         info.rate_limit_reached_type = Some("workspace_member_credits_depleted".to_string());
         let usage_by_id = HashMap::from([(accounts[0].id.clone(), info)]);
 
-        let forecast =
-            forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW).expect("forecast");
+        let forecast = forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW);
 
         assert!(forecast.rates.is_none());
         assert!(matches!(
@@ -1221,8 +1472,7 @@ mod tests {
         info.credits_balance = Some("0".to_string());
         let usage_by_id = HashMap::from([(accounts[0].id.clone(), info)]);
 
-        let forecast =
-            forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW).expect("forecast");
+        let forecast = forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW);
 
         assert!(matches!(
             forecast.outcome,
@@ -1241,8 +1491,7 @@ mod tests {
         info.rate_limit_reached_type = Some("rate_limit_reached".to_string());
         let usage_by_id = HashMap::from([(accounts[0].id.clone(), info)]);
 
-        let forecast =
-            forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW).expect("forecast");
+        let forecast = forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW);
 
         assert!(matches!(
             forecast.outcome,
@@ -1261,8 +1510,7 @@ mod tests {
         info.rate_limit_reached_type = Some("rate_limit_reached".to_string());
         let usage_by_id = HashMap::from([(accounts[0].id.clone(), info)]);
 
-        let forecast =
-            forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW).expect("forecast");
+        let forecast = forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW);
 
         assert!(matches!(
             forecast.outcome,
@@ -1282,8 +1530,7 @@ mod tests {
         info.primary_resets_at = None;
         let usage_by_id = HashMap::from([(accounts[0].id.clone(), info)]);
 
-        let forecast =
-            forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW).expect("forecast");
+        let forecast = forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW);
 
         assert!(forecast.rates.is_none());
         assert!(matches!(
@@ -1304,8 +1551,7 @@ mod tests {
         info.secondary_resets_at = None;
         let usage_by_id = HashMap::from([(accounts[0].id.clone(), info)]);
 
-        let forecast =
-            forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW).expect("forecast");
+        let forecast = forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW);
 
         assert!(forecast.rates.is_none());
         assert!(matches!(
@@ -1332,8 +1578,7 @@ mod tests {
             (accounts[1].id.clone(), credits_depleted),
         ]);
 
-        let forecast =
-            forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW).expect("forecast");
+        let forecast = forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW);
 
         assert!(matches!(
             forecast.outcome,
@@ -1357,8 +1602,7 @@ mod tests {
             (accounts[1].id.clone(), credits_depleted),
         ]);
 
-        let forecast =
-            forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW).expect("forecast");
+        let forecast = forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW);
 
         assert!(matches!(
             forecast.outcome,
@@ -1377,8 +1621,7 @@ mod tests {
         info.rate_limit_reached_type = Some("rate_limit_reached".to_string());
         let usage_by_id = HashMap::from([(accounts[0].id.clone(), info)]);
 
-        let forecast =
-            forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW).expect("forecast");
+        let forecast = forecast_all_usage(&accounts, &usage_by_id, Some("a"), NOW);
 
         assert!(forecast.rates.is_none());
         assert!(matches!(
@@ -1406,10 +1649,10 @@ mod tests {
         ]);
 
         let forecast = build_forecast(&accounts, &usage_by_id, NOW).expect("forecast input");
-        let rates = forecast.rates.expect("forecast rates");
+        let rates = forecast.rates;
 
         assert_eq!(forecast.accounts.len(), 2);
-        assert_eq!(rates.five_hour_percent_per_hour, 10.0);
+        assert_eq!(rates.five_hour_percent_per_hour, Some(10.0));
     }
 
     #[test]
@@ -1427,11 +1670,14 @@ mod tests {
         ]);
 
         let forecast = build_forecast(&accounts, &usage_by_id, NOW).expect("forecast input");
-        let rates = forecast.rates.expect("forecast rates");
+        let rates = forecast.rates;
 
         assert_eq!(forecast.accounts.len(), 2);
-        assert_eq!(rates.five_hour_percent_per_hour, 10.0);
-        assert!((rates.weekly_percent_per_hour - 0.555_555_555_555_555_6).abs() < 1e-12);
+        assert_eq!(rates.five_hour_percent_per_hour, Some(10.0));
+        assert!(
+            (rates.weekly_percent_per_hour.expect("weekly rate") - 0.555_555_555_555_555_6).abs()
+                < 1e-12
+        );
     }
 
     #[test]
@@ -1448,11 +1694,17 @@ mod tests {
         ]);
 
         let forecast = build_forecast(&accounts, &usage_by_id, NOW).expect("forecast input");
-        let rates = forecast.rates.expect("forecast rates");
+        let rates = forecast.rates;
 
         assert_eq!(forecast.accounts.len(), 2);
-        assert_eq!(forecast.accounts[0].five_hour.used_percent, 0.0);
-        assert_eq!(rates.five_hour_percent_per_hour, 10.0);
+        assert_eq!(
+            forecast.accounts[0]
+                .five_hour
+                .expect("5-hour window")
+                .used_percent,
+            0.0
+        );
+        assert_eq!(rates.five_hour_percent_per_hour, Some(10.0));
     }
 
     #[test]
@@ -1470,14 +1722,8 @@ mod tests {
         ]);
         let forecast = build_forecast(&accounts, &usage_by_id, NOW).expect("forecast input");
 
-        let next = next_event_time(
-            &forecast.accounts,
-            0,
-            forecast.rates.expect("forecast rates"),
-            NOW,
-            NOW + 120 * 60,
-        )
-        .expect("next event");
+        let next = next_event_time(&forecast.accounts, 0, forecast.rates, NOW, NOW + 120 * 60)
+            .expect("next event");
 
         assert_eq!(next, NOW + 120 * 60);
     }
@@ -1502,8 +1748,8 @@ mod tests {
             &forecast.accounts,
             0,
             UsageForecastRates {
-                five_hour_percent_per_hour: 1.0,
-                weekly_percent_per_hour: 1.0,
+                five_hour_percent_per_hour: Some(1.0),
+                weekly_percent_per_hour: Some(1.0),
             },
             NOW,
             next_policy_reevaluation,
@@ -1527,7 +1773,7 @@ mod tests {
             ),
         ]);
         let mut forecast = build_forecast(&accounts, &usage_by_id, NOW).expect("forecast input");
-        let rates = forecast.rates.expect("forecast rates");
+        let rates = forecast.rates;
         let selected = initial_account_index(&forecast.accounts, Some("current"), NOW)
             .expect("initial account");
         assert_eq!(forecast.accounts[selected].account.id, "current");
@@ -1540,12 +1786,24 @@ mod tests {
             NOW + POLICY_REEVALUATION_SECONDS,
         )
         .expect("next event");
-        let weekly_before = forecast.accounts[selected].weekly.used_percent;
+        let weekly_before = forecast.accounts[selected]
+            .weekly
+            .expect("weekly window")
+            .used_percent;
 
         charge_account(&mut forecast.accounts[selected], &rates, next - NOW);
-        let weekly_after_exhaustion = forecast.accounts[selected].weekly.used_percent;
+        let weekly_after_exhaustion = forecast.accounts[selected]
+            .weekly
+            .expect("weekly window")
+            .used_percent;
 
-        assert_eq!(forecast.accounts[selected].five_hour.used_percent, 100.0);
+        assert_eq!(
+            forecast.accounts[selected]
+                .five_hour
+                .expect("5-hour window")
+                .used_percent,
+            100.0
+        );
         assert!(weekly_after_exhaustion > weekly_before);
         assert!(!forecast.accounts[selected].is_usable_at(next));
         let replacement = select_account_index(
@@ -1555,7 +1813,10 @@ mod tests {
         )
         .expect("replacement account");
         assert_eq!(forecast.accounts[replacement].account.id, "replacement");
-        let replacement_weekly_before = forecast.accounts[replacement].weekly.used_percent;
+        let replacement_weekly_before = forecast.accounts[replacement]
+            .weekly
+            .expect("weekly window")
+            .used_percent;
 
         let replacement_next = next_event_time(
             &forecast.accounts,
@@ -1570,9 +1831,18 @@ mod tests {
             &rates,
             replacement_next - next,
         );
-        assert!(forecast.accounts[replacement].weekly.used_percent > replacement_weekly_before);
+        assert!(
+            forecast.accounts[replacement]
+                .weekly
+                .expect("weekly window")
+                .used_percent
+                > replacement_weekly_before
+        );
         assert_eq!(
-            forecast.accounts[selected].weekly.used_percent,
+            forecast.accounts[selected]
+                .weekly
+                .expect("weekly window")
+                .used_percent,
             weekly_after_exhaustion
         );
     }
@@ -1618,6 +1888,33 @@ mod tests {
             secondary_used_percent: Some(weekly_used),
             secondary_window_minutes: Some(10_080),
             secondary_resets_at: Some(NOW + weekly_remaining_minutes * 60),
+            has_credits: None,
+            unlimited_credits: None,
+            credits_balance: None,
+            rate_limit_reset_credits_available: None,
+            rate_limit_reached_type: None,
+            additional_limits: Vec::new(),
+            error: None,
+        }
+    }
+
+    fn single_window_usage_info(
+        account_id: &str,
+        used_percent: f64,
+        window_minutes: i64,
+        remaining_minutes: i64,
+    ) -> UsageInfo {
+        UsageInfo {
+            account_id: account_id.to_string(),
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            plan_type: Some("pro".to_string()),
+            primary_used_percent: Some(used_percent),
+            primary_window_minutes: Some(window_minutes),
+            primary_resets_at: Some(NOW + remaining_minutes * 60),
+            secondary_used_percent: None,
+            secondary_window_minutes: None,
+            secondary_resets_at: None,
             has_credits: None,
             unlimited_credits: None,
             credits_balance: None,

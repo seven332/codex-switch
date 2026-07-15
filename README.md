@@ -215,7 +215,7 @@ codex-switch reset-usage my-account --yes
 
 When no account is passed, `reset-usage` uses the current Codex auth account. The command requires ChatGPT OAuth and asks for confirmation unless `--yes` is passed. It does not run automatically from `run` or `auto-switch`.
 
-`usage --all` also prints an overall estimate for the ChatGPT OAuth account pool based on the current 5-hour and weekly usage snapshot. The estimate starts from the current account when it has usable usage data, periodically reapplies the account selection policy, and reports the estimated 5-hour and weekly usage rates when enough samples are available.
+`usage --all` also prints an overall estimate for the ChatGPT OAuth account pool based on whichever canonical 5-hour and weekly windows ChatGPT currently returns. Pools with only one window type are forecast from that window alone. The estimate starts from the current account when it has usable usage data, periodically reapplies the same account selection and keep-current policy as auto-switch, and reports only the usage rates that can be estimated from the available windows.
 
 Additional usage limits are hidden by default. Pass `--show-additional` to include them.
 

@@ -170,7 +170,6 @@ pub(crate) fn usage_report(
     show_additional: bool,
     generated_at: i64,
     forecast: Option<&UsageForecast>,
-    forecast_unavailable_reason: Option<&'static str>,
 ) -> UsageJson {
     UsageJson {
         schema_version: SCHEMA_VERSION,
@@ -186,9 +185,7 @@ pub(crate) fn usage_report(
                 usage: usage_info_json(entry.usage, show_additional),
             })
             .collect(),
-        forecast: forecast
-            .map(forecast_json)
-            .or_else(|| forecast_unavailable_reason.map(forecast_unavailable_json)),
+        forecast: forecast.map(forecast_json),
     }
 }
 
@@ -342,6 +339,9 @@ fn forecast_json(forecast: &UsageForecast) -> ForecastJson {
             recovery_at,
             rates: forecast.rates.map(forecast_rates_json),
         },
+        UsageForecastOutcome::NotEnoughData { reason } => {
+            forecast_unavailable_json(reason.as_str())
+        }
     }
 }
 
@@ -359,8 +359,8 @@ fn forecast_unavailable_json(reason: &'static str) -> ForecastJson {
 
 fn forecast_rates_json(rates: UsageForecastRates) -> ForecastRatesJson {
     ForecastRatesJson {
-        five_hour_percent_per_hour: finite_percent(Some(rates.five_hour_percent_per_hour)),
-        weekly_percent_per_hour: finite_percent(Some(rates.weekly_percent_per_hour)),
+        five_hour_percent_per_hour: finite_percent(rates.five_hour_percent_per_hour),
+        weekly_percent_per_hour: finite_percent(rates.weekly_percent_per_hour),
     }
 }
 
@@ -372,7 +372,7 @@ mod tests {
     use super::*;
     use crate::doctor::{DoctorCheck, DoctorReport};
     use crate::types::{NewChatGptAccount, RedactedString};
-    use crate::usage_forecast::{ForecastLimit, UsageForecastOutcome};
+    use crate::usage_forecast::{ForecastLimit, ForecastUnavailableReason, UsageForecastOutcome};
 
     #[test]
     fn list_json_omits_secret_fields_and_values() {
@@ -450,7 +450,6 @@ mod tests {
             false,
             now,
             None,
-            None,
         );
         let value = serde_json::to_value(report).expect("usage JSON should serialize");
 
@@ -512,7 +511,7 @@ mod tests {
 
     #[test]
     fn usage_json_handles_empty_account_set() {
-        let report = usage_report(&[], None, true, false, 1_800_000_000, None, None);
+        let report = usage_report(&[], None, true, false, 1_800_000_000, None);
         let value = serde_json::to_value(report).expect("empty usage JSON should serialize");
 
         assert_eq!(value["schema_version"], json!(1));
@@ -530,6 +529,12 @@ mod tests {
         let mut account = StoredAccount::new_api_key("work".to_string(), "sk-test".to_string());
         account.id = "account-id".to_string();
         let info = usage_info_with_additional_limit("account-id", now);
+        let forecast = UsageForecast {
+            rates: None,
+            outcome: UsageForecastOutcome::NotEnoughData {
+                reason: ForecastUnavailableReason::IncompleteUsageData,
+            },
+        };
 
         let report = usage_report(
             &[UsageJsonEntry {
@@ -540,8 +545,7 @@ mod tests {
             true,
             true,
             now,
-            None,
-            Some("not enough complete usage data"),
+            Some(&forecast),
         );
         let value = serde_json::to_value(report).expect("usage JSON should serialize");
 
@@ -550,10 +554,7 @@ mod tests {
             json!("GPT-5.3-Codex-Spark")
         );
         assert_eq!(value["forecast"]["status"], json!("not_enough_data"));
-        assert_eq!(
-            value["forecast"]["reason"],
-            json!("not enough complete usage data")
-        );
+        assert_eq!(value["forecast"]["reason"], json!("incomplete usage data"));
     }
 
     #[test]
@@ -570,8 +571,8 @@ mod tests {
     fn usage_json_reports_forecast_outcome() {
         let forecast = UsageForecast {
             rates: Some(UsageForecastRates {
-                five_hour_percent_per_hour: 12.5,
-                weekly_percent_per_hour: 0.8,
+                five_hour_percent_per_hour: Some(12.5),
+                weekly_percent_per_hour: Some(0.8),
             }),
             outcome: UsageForecastOutcome::Unavailable {
                 at: 1_800_000_000,
@@ -587,6 +588,25 @@ mod tests {
         assert_eq!(value["limited_by"], json!("weekly"));
         assert_eq!(value["recovery_at"], json!(1_800_003_600));
         assert_eq!(value["rates"]["five_hour_percent_per_hour"], json!(12.5));
+    }
+
+    #[test]
+    fn usage_json_preserves_rate_keys_for_a_single_active_window() {
+        let forecast = UsageForecast {
+            rates: Some(UsageForecastRates {
+                five_hour_percent_per_hour: None,
+                weekly_percent_per_hour: Some(0.8),
+            }),
+            outcome: UsageForecastOutcome::NotExpected {
+                horizon_seconds: 14 * 24 * 60 * 60,
+            },
+        };
+
+        let value =
+            serde_json::to_value(forecast_json(&forecast)).expect("forecast JSON should serialize");
+
+        assert!(value["rates"]["five_hour_percent_per_hour"].is_null());
+        assert_eq!(value["rates"]["weekly_percent_per_hour"], json!(0.8));
     }
 
     #[test]
