@@ -36,9 +36,9 @@ again with its existing name:
 codex-switch login personal --replace
 ```
 
-Replacement happens only after OAuth succeeds. It preserves the stored account ID and timestamps
-and rejects an auth identity that belongs to another stored account. API key accounts cannot be
-replaced with `login --replace`.
+Replacement happens only after OAuth succeeds. It preserves the stored account ID, name, creation
+time, last-used time, and automatic-selection state, and rejects an auth identity that belongs to
+another stored account. API key accounts cannot be replaced with `login --replace`.
 
 Login saves the account but does not change the current Codex `auth.json`. Use `switch` when you
 want Codex to use it.
@@ -92,9 +92,11 @@ codex-switch disable work
 codex-switch enable work
 ```
 
-A disabled account remains stored but is skipped by standalone `auto-switch`, managed `run`
-switching, and `usage --all` forecast capacity. It still works with explicit `switch`, `usage`,
-`export`, `rename`, and `delete` commands.
+A disabled account remains stored but is excluded as an automatic replacement candidate and from
+`usage --all` forecast capacity. If it is already current and still usable, standalone
+`auto-switch` and managed `run` checks keep it; once it becomes unavailable, an enabled replacement
+may be selected. A disabled account still works with explicit `switch`, `usage`, `export`,
+`rename`, and `delete` commands.
 
 ## Rename or delete an account
 

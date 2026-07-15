@@ -10,11 +10,14 @@ authoritative option list.
 codex-switch auto-switch
 ```
 
-The command checks stored ChatGPT OAuth accounts and switches when the current Codex auth account
-is out of usage. It refuses to switch while an unmanaged Codex process is active.
+The command checks the current and stored ChatGPT OAuth accounts, applies the quota-aware selection
+policy, and switches when that policy selects a different eligible account. This includes recovery
+when the current account is out of usage. It refuses to switch while an unmanaged Codex process is
+active.
 
 Accounts that are out of credits, rate-limited, usage-limited, at 100% usage, or disabled are not
-replacement candidates. API key accounts are not usage-checkable and are skipped.
+replacement candidates. A disabled current account is kept while it remains usable. API key
+accounts are not usage-checkable and are skipped.
 
 ## Run a managed Codex session
 
