@@ -610,6 +610,36 @@ mod tests {
     }
 
     #[test]
+    fn usage_json_reports_each_not_enough_data_reason() {
+        for (reason, expected) in [
+            (
+                ForecastUnavailableReason::IncompleteUsageData,
+                "incomplete usage data",
+            ),
+            (
+                ForecastUnavailableReason::InsufficientRateSamples,
+                "insufficient rate samples",
+            ),
+            (
+                ForecastUnavailableReason::NoComparableUsageWindows,
+                "no comparable usage windows",
+            ),
+        ] {
+            let forecast = UsageForecast {
+                rates: None,
+                outcome: UsageForecastOutcome::NotEnoughData { reason },
+            };
+
+            let value = serde_json::to_value(forecast_json(&forecast))
+                .expect("forecast JSON should serialize");
+
+            assert_eq!(value["status"], json!("not_enough_data"));
+            assert_eq!(value["reason"], json!(expected));
+            assert!(value["rates"].is_null());
+        }
+    }
+
+    #[test]
     fn doctor_json_preserves_check_status_without_human_formatting() {
         let mut report = DoctorReport::default();
         report.push(DoctorCheck::ok("install", "ok"));

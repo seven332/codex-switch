@@ -1028,6 +1028,80 @@ mod tests {
     }
 
     #[test]
+    fn weekly_only_account_reports_exhaustion_and_recovery() {
+        let accounts = vec![chatgpt_account("weekly")];
+        let usage_by_id = HashMap::from([(
+            accounts[0].id.clone(),
+            single_window_usage_info(&accounts[0].id, 50.0, 10_080, 9_000),
+        )]);
+
+        let forecast = forecast_all_usage(&accounts, &usage_by_id, Some("weekly"), NOW);
+
+        assert!(matches!(
+            forecast.outcome,
+            UsageForecastOutcome::Unavailable {
+                at,
+                limited_by: ForecastLimit::Weekly,
+                recovery_at: Some(recovery_at),
+            } if at > NOW && at < recovery_at && recovery_at == NOW + 9_000 * 60
+        ));
+    }
+
+    #[test]
+    fn five_hour_only_account_reports_exhaustion_and_recovery() {
+        let accounts = vec![chatgpt_account("five-hour")];
+        let usage_by_id = HashMap::from([(
+            accounts[0].id.clone(),
+            single_window_usage_info(&accounts[0].id, 50.0, 300, 240),
+        )]);
+
+        let forecast = forecast_all_usage(&accounts, &usage_by_id, Some("five-hour"), NOW);
+
+        assert!(matches!(
+            forecast.outcome,
+            UsageForecastOutcome::Unavailable {
+                at,
+                limited_by: ForecastLimit::FiveHour,
+                recovery_at: Some(recovery_at),
+            } if at == NOW + 60 * 60 && recovery_at == NOW + 240 * 60
+        ));
+    }
+
+    #[test]
+    fn single_window_rate_limit_marks_the_real_window_unavailable() {
+        let accounts = vec![chatgpt_account("weekly")];
+        let mut usage = single_window_usage_info(&accounts[0].id, 20.0, 10_080, 9_000);
+        usage.rate_limit_reached_type = Some("rate_limit_reached".to_string());
+        let usage_by_id = HashMap::from([(accounts[0].id.clone(), usage)]);
+
+        let forecast = forecast_all_usage(&accounts, &usage_by_id, Some("weekly"), NOW);
+
+        assert!(matches!(
+            forecast.outcome,
+            UsageForecastOutcome::Unavailable {
+                at,
+                limited_by: ForecastLimit::Weekly,
+                recovery_at: Some(recovery_at),
+            } if at == NOW && recovery_at == NOW + 9_000 * 60
+        ));
+    }
+
+    #[test]
+    fn synthetic_selection_usage_does_not_create_a_missing_window() {
+        let accounts = vec![chatgpt_account("weekly")];
+        let usage_by_id = HashMap::from([(
+            accounts[0].id.clone(),
+            single_window_usage_info(&accounts[0].id, 20.0, 10_080, 9_000),
+        )]);
+        let forecast = build_forecast(&accounts, &usage_by_id, NOW).expect("forecast input");
+
+        let selection_usage = forecast.accounts[0].usage_info();
+
+        assert!(selection_usage.five_hour_window().is_none());
+        assert!(selection_usage.weekly_window().is_some());
+    }
+
+    #[test]
     fn mixed_single_window_pool_keeps_usable_current_account() {
         let accounts = vec![
             chatgpt_account("five-hour-current"),
