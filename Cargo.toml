@@ -40,5 +40,5 @@ webbrowser = "1"
 
 [target.'cfg(unix)'.dependencies]
 crossterm = { version = "0.29", default-features = false }
-nix = { version = "0.31", features = ["fs", "poll", "process", "signal"] }
+nix = { version = "0.31", features = ["fs", "poll", "process", "signal", "term"] }
 pty-process = { version = "0.5.3", features = ["async"] }

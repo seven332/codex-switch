@@ -15,6 +15,7 @@ use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::sys::select::{FdSet, select};
 use nix::sys::signal::{Signal as UnixSignal, kill, killpg};
+use nix::sys::termios::{LocalFlags, tcgetattr};
 use nix::sys::time::{TimeVal, TimeValLike};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
@@ -248,6 +249,11 @@ fn overlay_eligibility(args: &[OsString], facts: TerminalFacts<'_>) -> OverlayEl
     OverlayEligibility::Eligible
 }
 
+fn terminal_is_noncanonical(terminal: impl AsFd) -> io::Result<bool> {
+    let attributes = tcgetattr(terminal).map_err(|err| io::Error::from_raw_os_error(err as i32))?;
+    Ok(!attributes.local_flags.contains(LocalFlags::ICANON))
+}
+
 #[derive(Debug)]
 pub(crate) enum OverlaySpawn {
     Spawned(Box<TuiOverlaySession>),
@@ -366,7 +372,8 @@ pub(crate) fn try_spawn(
     token_env: &str,
     token: &str,
 ) -> Result<OverlaySpawn> {
-    let raw_mode_enabled = match crossterm::terminal::is_raw_mode_enabled() {
+    let stdin = io::stdin();
+    let raw_mode_enabled = match terminal_is_noncanonical(&stdin) {
         Ok(enabled) => enabled,
         Err(err) => {
             return Ok(OverlaySpawn::Direct {
@@ -565,7 +572,7 @@ pub(crate) fn try_spawn(
     };
     if let Err(send_error) = child_handle_tx.send(child) {
         let mut child = send_error.0;
-        let _ = child.kill();
+        let _ = killpg(pid, UnixSignal::SIGKILL);
         let _ = child.wait();
         raw_mode.restore();
         drop(input_start_tx);
@@ -736,10 +743,13 @@ impl TuiOverlaySession {
             match self.next_event().await {
                 SessionEvent::Output(result) => self.handle_output(result)?,
                 SessionEvent::Input(Some(InputEvent::Bytes(bytes))) => {
-                    self.pty_writer
-                        .write_all(&bytes)
-                        .await
-                        .context("Failed to relay terminal input to Codex")?;
+                    if let Err(err) = self.pty_writer.write_all(&bytes).await {
+                        if pty_input_closed(&err) {
+                            self.input_open = false;
+                        } else {
+                            return Err(err).context("Failed to relay terminal input to Codex");
+                        }
+                    }
                 }
                 SessionEvent::Input(Some(InputEvent::Eof) | None) => {
                     self.input_open = false;
@@ -889,20 +899,22 @@ impl TuiOverlaySession {
         if self.completed {
             return;
         }
-        let _ = killpg(self.pid, UnixSignal::SIGKILL);
-        let wait_for_exit = async {
-            while let Some(event) = self.child_events.recv().await {
-                match event {
-                    ChildEvent::Exited(_) => {
-                        self.child_reaped = true;
-                        break;
+        if !self.child_reaped {
+            let _ = killpg(self.pid, UnixSignal::SIGKILL);
+            let wait_for_exit = async {
+                while let Some(event) = self.child_events.recv().await {
+                    match event {
+                        ChildEvent::Exited(_) => {
+                            self.child_reaped = true;
+                            break;
+                        }
+                        ChildEvent::Stopped | ChildEvent::Continued => {}
+                        ChildEvent::Error(_) => break,
                     }
-                    ChildEvent::Stopped | ChildEvent::Continued => {}
-                    ChildEvent::Error(_) => break,
                 }
-            }
-        };
-        let _ = timeout(Duration::from_secs(2), wait_for_exit).await;
+            };
+            let _ = timeout(Duration::from_secs(2), wait_for_exit).await;
+        }
         let _ = self
             .drain_output_until_quiet(Duration::from_millis(50))
             .await;
@@ -945,7 +957,9 @@ impl Drop for TuiOverlaySession {
             return;
         }
         self.input_shutdown.store(true, Ordering::Relaxed);
-        let _ = killpg(self.pid, UnixSignal::SIGKILL);
+        if !self.child_reaped {
+            let _ = killpg(self.pid, UnixSignal::SIGKILL);
+        }
         let mut cleanup = Vec::new();
         self.compositor.append_terminal_cleanup(&mut cleanup);
         let _ = write_terminal(&cleanup);
@@ -970,6 +984,10 @@ fn write_terminal(bytes: &[u8]) -> io::Result<()> {
     stdout.flush()
 }
 
+fn pty_input_closed(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::BrokenPipe || err.raw_os_error() == Some(Errno::EIO as i32)
+}
+
 fn signal_process_group(pid: Pid, signal: UnixSignal) -> Result<()> {
     match killpg(pid, signal) {
         Ok(()) | Err(Errno::ESRCH) => Ok(()),
@@ -982,14 +1000,17 @@ mod tests {
     use super::{
         BEGIN_SYNCHRONIZED_UPDATE, ChildEvent, END_SYNCHRONIZED_UPDATE, ENTER_ALTERNATE_SCREEN,
         FrameCompositor, LEAVE_ALTERNATE_SCREEN, OverlayEligibility, OverlaySpawn, TerminalFacts,
-        overlay_eligibility, run_child_monitor, try_spawn,
+        overlay_eligibility, pty_input_closed, run_child_monitor, terminal_is_noncanonical,
+        try_spawn,
     };
     use std::ffi::OsString;
+    use std::io;
     use std::os::fd::OwnedFd;
     use std::sync::mpsc as std_mpsc;
 
     use nix::fcntl::{FcntlArg, OFlag, fcntl};
     use nix::sys::signal::{Signal as UnixSignal, killpg};
+    use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
     use nix::unistd::Pid;
     use pty_process::Size;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1258,6 +1279,32 @@ mod tests {
             overlay_eligibility(&[OsString::from("--no-alt-screen")], eligible),
             OverlayEligibility::Direct(_)
         ));
+    }
+
+    #[test]
+    fn detects_noncanonical_terminal_state_from_termios() {
+        let (_pty, pts) = pty_process::blocking::open().unwrap();
+        assert!(!terminal_is_noncanonical(&pts).unwrap());
+
+        let mut attributes = tcgetattr(&pts).unwrap();
+        attributes.local_flags.remove(LocalFlags::ICANON);
+        tcsetattr(&pts, SetArg::TCSANOW, &attributes).unwrap();
+        assert!(terminal_is_noncanonical(&pts).unwrap());
+    }
+
+    #[test]
+    fn closed_pty_input_errors_are_nonfatal() {
+        assert!(pty_input_closed(&io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "closed"
+        )));
+        assert!(pty_input_closed(&io::Error::from_raw_os_error(
+            nix::errno::Errno::EIO as i32
+        )));
+        assert!(!pty_input_closed(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "denied"
+        )));
     }
 
     #[tokio::test]
