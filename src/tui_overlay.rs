@@ -63,7 +63,10 @@ struct FrameCompositor {
     alternate_screen: bool,
     synchronized_update: bool,
     synchronized_update_coherent: bool,
-    badge_placement: Option<BadgePlacement>,
+    // Alternate-screen entry preserves the normal buffer, so each buffer needs
+    // independent placement state across picker/conversation transitions.
+    normal_badge_placement: Option<BadgePlacement>,
+    alternate_badge_placement: Option<BadgePlacement>,
 }
 
 impl FrameCompositor {
@@ -79,7 +82,8 @@ impl FrameCompositor {
             alternate_screen: false,
             synchronized_update: false,
             synchronized_update_coherent: false,
-            badge_placement: None,
+            normal_badge_placement: None,
+            alternate_badge_placement: None,
         }
     }
 
@@ -95,7 +99,10 @@ impl FrameCompositor {
     }
 
     fn terminal_context_active(&self) -> bool {
-        self.alternate_screen || self.synchronized_update
+        self.alternate_screen
+            || self.synchronized_update
+            || self.normal_badge_placement.is_some()
+            || self.alternate_badge_placement.is_some()
     }
 
     fn process(&mut self, bytes: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
@@ -110,21 +117,26 @@ impl FrameCompositor {
         output.append(&mut self.pending);
     }
 
-    fn append_terminal_cleanup(&mut self, output: &mut Vec<u8>) {
+    fn append_terminal_cleanup(&mut self, output: &mut Vec<u8>) -> io::Result<()> {
         self.finish(output);
+        let had_terminal_context = self.terminal_context_active();
         if self.synchronized_update {
+            self.append_active_badge_clear(output)?;
             output.extend_from_slice(END_SYNCHRONIZED_UPDATE);
         }
         if self.alternate_screen {
             output.extend_from_slice(LEAVE_ALTERNATE_SCREEN);
         }
-        if self.synchronized_update || self.alternate_screen {
+        self.alternate_screen = false;
+        self.alternate_badge_placement = None;
+        self.append_active_badge_clear(output)?;
+        if had_terminal_context {
             output.extend_from_slice(b"\x1b[0m\x1b[?25h");
         }
         self.synchronized_update = false;
         self.synchronized_update_coherent = false;
-        self.alternate_screen = false;
-        self.badge_placement = None;
+        self.normal_badge_placement = None;
+        Ok(())
     }
 
     fn flush_non_marker_prefix(&mut self, output: &mut Vec<u8>) -> io::Result<()> {
@@ -158,29 +170,28 @@ impl FrameCompositor {
                     self.synchronized_update_coherent = false;
                 }
                 self.alternate_screen = true;
-                self.badge_placement = None;
+                self.alternate_badge_placement = None;
             }
             Marker::LeaveAlternateScreen => {
                 if self.synchronized_update {
                     self.synchronized_update_coherent = false;
                 }
                 self.alternate_screen = false;
-                self.badge_placement = None;
+                self.alternate_badge_placement = None;
             }
             Marker::BeginSynchronizedUpdate => {
                 self.synchronized_update_coherent = !self.synchronized_update;
                 self.synchronized_update = true;
                 output.extend_from_slice(marker_bytes);
-                if self.alternate_screen && self.synchronized_update_coherent {
+                // Codex renders its main conversation as synchronized inline
+                // frames; alternate screen is reserved for transient views.
+                if self.synchronized_update_coherent {
                     self.append_stale_badge_clear(output)?;
                 }
                 return Ok(());
             }
             Marker::EndSynchronizedUpdate => {
-                if self.alternate_screen
-                    && self.synchronized_update
-                    && self.synchronized_update_coherent
-                {
+                if self.synchronized_update && self.synchronized_update_coherent {
                     self.append_badge(output)?;
                 }
                 self.synchronized_update = false;
@@ -199,11 +210,48 @@ impl FrameCompositor {
     }
 
     fn append_stale_badge_clear(&mut self, output: &mut Vec<u8>) -> io::Result<()> {
-        if self.badge_placement == self.next_badge_placement() {
+        if self.active_badge_placement() == self.next_badge_placement() {
             return Ok(());
         }
 
-        if let Some(previous) = self.badge_placement
+        self.append_active_badge_clear(output)
+    }
+
+    fn append_badge(&mut self, output: &mut Vec<u8>) -> io::Result<()> {
+        let next_placement = self.next_badge_placement();
+        debug_assert!(
+            self.active_badge_placement().is_none()
+                || self.active_badge_placement() == next_placement
+        );
+
+        if let Some(placement) = next_placement {
+            output.queue(SavePosition)?;
+            output.queue(MoveTo(placement.column, 0))?;
+            output.queue(Print(self.label.as_str()))?;
+            output.queue(RestorePosition)?;
+        }
+        *self.active_badge_placement_mut() = next_placement;
+        Ok(())
+    }
+
+    fn active_badge_placement(&self) -> Option<BadgePlacement> {
+        if self.alternate_screen {
+            self.alternate_badge_placement
+        } else {
+            self.normal_badge_placement
+        }
+    }
+
+    fn active_badge_placement_mut(&mut self) -> &mut Option<BadgePlacement> {
+        if self.alternate_screen {
+            &mut self.alternate_badge_placement
+        } else {
+            &mut self.normal_badge_placement
+        }
+    }
+
+    fn append_active_badge_clear(&mut self, output: &mut Vec<u8>) -> io::Result<()> {
+        if let Some(previous) = self.active_badge_placement()
             && previous.column < self.columns
         {
             output.queue(SavePosition)?;
@@ -212,21 +260,7 @@ impl FrameCompositor {
             output.queue(Print(" ".repeat(usize::from(visible_width))))?;
             output.queue(RestorePosition)?;
         }
-        self.badge_placement = None;
-        Ok(())
-    }
-
-    fn append_badge(&mut self, output: &mut Vec<u8>) -> io::Result<()> {
-        let next_placement = self.next_badge_placement();
-        debug_assert!(self.badge_placement.is_none() || self.badge_placement == next_placement);
-
-        if let Some(placement) = next_placement {
-            output.queue(SavePosition)?;
-            output.queue(MoveTo(placement.column, 0))?;
-            output.queue(Print(self.label.as_str()))?;
-            output.queue(RestorePosition)?;
-        }
-        self.badge_placement = next_placement;
+        *self.active_badge_placement_mut() = None;
         Ok(())
     }
 }
@@ -882,7 +916,7 @@ impl TuiOverlaySession {
         let forced_alternate_restore = self.compositor.alternate_screen_active();
         if self.compositor.terminal_context_active() {
             let mut cleanup = Vec::new();
-            self.compositor.append_terminal_cleanup(&mut cleanup);
+            self.compositor.append_terminal_cleanup(&mut cleanup)?;
             write_terminal(&cleanup)?;
         } else {
             io::stdout()
@@ -955,12 +989,13 @@ impl TuiOverlaySession {
         self.input_events.close();
 
         let mut final_output = Vec::new();
-        if self.compositor.terminal_context_active() {
-            self.compositor.append_terminal_cleanup(&mut final_output);
+        let composition_result = if self.compositor.terminal_context_active() {
+            self.compositor.append_terminal_cleanup(&mut final_output)
         } else {
             self.compositor.finish(&mut final_output);
-        }
-        let terminal_result = write_terminal(&final_output);
+            Ok(())
+        };
+        let terminal_result = composition_result.and_then(|()| write_terminal(&final_output));
         self.raw_mode.restore();
 
         if let Some(thread) = self.input_thread.take() {
@@ -986,7 +1021,7 @@ impl Drop for TuiOverlaySession {
             let _ = killpg(self.pid, UnixSignal::SIGKILL);
         }
         let mut cleanup = Vec::new();
-        self.compositor.append_terminal_cleanup(&mut cleanup);
+        let _ = self.compositor.append_terminal_cleanup(&mut cleanup);
         let _ = write_terminal(&cleanup);
         self.raw_mode.restore();
     }
@@ -1056,6 +1091,10 @@ mod tests {
         .concat()
     }
 
+    fn inline_frame(content: &[u8]) -> Vec<u8> {
+        [BEGIN_SYNCHRONIZED_UPDATE, content, END_SYNCHRONIZED_UPDATE].concat()
+    }
+
     fn badge(column: u16) -> Vec<u8> {
         format!("\x1b7\x1b[1;{}H{LABEL}\x1b8", column + 1).into_bytes()
     }
@@ -1087,6 +1126,16 @@ mod tests {
     }
 
     #[test]
+    fn inserts_badge_in_synchronized_inline_frame() {
+        let input = inline_frame(b"conversation");
+        let output = render_in_chunks(&input, &[], 80);
+        let mut expected = [BEGIN_SYNCHRONIZED_UPDATE, b"conversation"].concat();
+        expected.extend_from_slice(&badge(80 - LABEL.len() as u16));
+        expected.extend_from_slice(END_SYNCHRONIZED_UPDATE);
+        assert_eq!(output, expected);
+    }
+
+    #[test]
     fn recognizes_markers_across_every_read_boundary() {
         let input = frame(b"frame");
         let expected = render_in_chunks(&input, &[], 80);
@@ -1106,9 +1155,8 @@ mod tests {
     }
 
     #[test]
-    fn suppresses_badge_outside_supported_frame_context() {
+    fn suppresses_badge_outside_coherent_synchronized_frame() {
         let inputs = [
-            [BEGIN_SYNCHRONIZED_UPDATE, b"frame", END_SYNCHRONIZED_UPDATE].concat(),
             [ENTER_ALTERNATE_SCREEN, b"frame", LEAVE_ALTERNATE_SCREEN].concat(),
             [
                 ENTER_ALTERNATE_SCREEN,
@@ -1130,7 +1178,7 @@ mod tests {
     }
 
     #[test]
-    fn stops_rendering_after_alternate_screen_exit() {
+    fn keeps_rendering_after_alternate_screen_exits_to_inline_conversation() {
         let input = [
             ENTER_ALTERNATE_SCREEN,
             BEGIN_SYNCHRONIZED_UPDATE,
@@ -1147,7 +1195,53 @@ mod tests {
                 .windows(LABEL.len())
                 .filter(|bytes| *bytes == LABEL.as_bytes())
                 .count(),
-            1
+            2
+        );
+    }
+
+    #[test]
+    fn tracks_normal_and_alternate_badge_placements_separately() {
+        let mut compositor = FrameCompositor::new(VERSION, 80);
+        let mut output = Vec::new();
+        compositor
+            .process(&inline_frame(b"inline-before"), &mut output)
+            .unwrap();
+        output.clear();
+
+        compositor
+            .process(ENTER_ALTERNATE_SCREEN, &mut output)
+            .unwrap();
+        compositor.set_columns(100);
+        compositor
+            .process(&inline_frame(b"alternate"), &mut output)
+            .unwrap();
+        compositor
+            .process(LEAVE_ALTERNATE_SCREEN, &mut output)
+            .unwrap();
+        output.clear();
+
+        compositor
+            .process(&inline_frame(b"inline-after"), &mut output)
+            .unwrap();
+
+        let old_column = 80 - LABEL.len() as u16;
+        let new_column = 100 - LABEL.len() as u16;
+        let expected_overlay = format!(
+            "\x1b7\x1b[1;{}H{}\x1b8",
+            old_column + 1,
+            " ".repeat(LABEL.len())
+        );
+        let expected_badge = badge(new_column);
+        assert!(output.starts_with(BEGIN_SYNCHRONIZED_UPDATE));
+        assert!(
+            output
+                .windows(expected_overlay.len())
+                .any(|bytes| bytes == expected_overlay.as_bytes())
+        );
+        assert!(
+            output
+                .windows(expected_badge.len())
+                .any(|bytes| bytes == expected_badge)
         );
     }
 
@@ -1368,13 +1462,37 @@ mod tests {
                 &mut output,
             )
             .unwrap();
-        compositor.append_terminal_cleanup(&mut output);
+        compositor.append_terminal_cleanup(&mut output).unwrap();
         assert!(output.ends_with(b"\x1b[?20\x1b[?2026l\x1b[?1049l\x1b[0m\x1b[?25h"));
         assert!(!compositor.alternate_screen_active());
 
         let cleaned_length = output.len();
-        compositor.append_terminal_cleanup(&mut output);
+        compositor.append_terminal_cleanup(&mut output).unwrap();
         assert_eq!(output.len(), cleaned_length);
+    }
+
+    #[test]
+    fn cleanup_removes_inline_badge_from_normal_screen() {
+        let mut compositor = FrameCompositor::new(VERSION, 80);
+        let mut output = Vec::new();
+        compositor
+            .process(&inline_frame(b"conversation"), &mut output)
+            .unwrap();
+        output.clear();
+
+        compositor.append_terminal_cleanup(&mut output).unwrap();
+
+        let column = 80 - LABEL.len() as u16;
+        assert_eq!(
+            output,
+            format!(
+                "\x1b7\x1b[1;{}H{}\x1b8\x1b[0m\x1b[?25h",
+                column + 1,
+                " ".repeat(LABEL.len())
+            )
+            .as_bytes()
+        );
+        assert!(!compositor.terminal_context_active());
     }
 
     #[test]
