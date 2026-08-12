@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::fs;
 use std::future::pending;
 use std::net::TcpListener as StdTcpListener;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -13,6 +15,7 @@ use futures_util::{Sink, SinkExt, StreamExt};
 use rand::RngExt as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -41,6 +44,8 @@ use crate::types::{AuthData, StoredAccount};
 const REMOTE_TOKEN_ENV: &str = "CODEX_SWITCH_REMOTE_TOKEN";
 const APP_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const APP_SERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const LEGACY_RUNTIME_TOKEN_PREFIX: &str = "ws-token-";
+const LEGACY_RUNTIME_TOKEN_GRACE_PERIOD: Duration = Duration::from_secs(60);
 pub(crate) const AUTO_SWITCH_MAINTENANCE_MIN_INTERVAL: Duration = Duration::from_secs(15 * 60);
 pub(crate) const AUTO_SWITCH_MAINTENANCE_MAX_INTERVAL: Duration = Duration::from_secs(45 * 60);
 const AUTO_SWITCH_SOFT_COOLDOWN: Duration = Duration::from_secs(15 * 60);
@@ -63,6 +68,12 @@ const TOKEN_PREWARM_RETRY_DELAY: Duration = Duration::from_secs(60);
 const INTERNAL_REQUEST_ID_PREFIX: &str = "codex-switch/";
 const RUNTIME_WEBSOCKET_MAX_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
 const RUNTIME_WEBSOCKET_MAX_FRAME_SIZE: usize = RUNTIME_WEBSOCKET_MAX_MESSAGE_SIZE;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LegacyRuntimeTokenCleanup {
+    removed: usize,
+    failures: usize,
+}
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type ProxyClientStream = WebSocketStream<TcpStream>;
@@ -221,6 +232,7 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
         "codex version: {}",
         codex_http::detected_codex_version().unwrap_or_else(|| "unknown".to_string())
     ));
+    cleanup_legacy_runtime_tokens_at_startup();
 
     let stage_start = Instant::now();
     startup_log("initial auto-switch: start");
@@ -259,12 +271,11 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
     let port = reserve_local_port()?;
     let app_server_url = format!("ws://127.0.0.1:{port}");
     let token = websocket_token();
-    let token_path = runtime_token_path()?;
-    store::write_private_file(&token_path, &token)?;
+    let token_sha256 = websocket_token_sha256(&token);
 
     let stage_start = Instant::now();
     startup_log(format_args!("app-server: spawn start ({app_server_url})"));
-    let mut app_server = match spawn_app_server(&codex_bin, &app_server_url, &token_path) {
+    let mut app_server = match spawn_app_server(&codex_bin, &app_server_url, &token_sha256) {
         Ok(app_server) => {
             startup_log(format_args!(
                 "app-server: spawned pid={} in {}",
@@ -278,7 +289,6 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
                 "app-server: spawn failed in {}: {err:#}",
                 format_elapsed(stage_start.elapsed())
             ));
-            let _ = std::fs::remove_file(&token_path);
             return Err(err);
         }
     };
@@ -290,7 +300,6 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
             format_elapsed(stage_start.elapsed())
         ));
         shutdown_child(&mut app_server).await;
-        let _ = std::fs::remove_file(&token_path);
         return Err(err);
     }
     startup_log(format_args!(
@@ -315,7 +324,6 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
                 format_elapsed(stage_start.elapsed())
             ));
             shutdown_child(&mut app_server).await;
-            let _ = std::fs::remove_file(&token_path);
             return Err(err);
         }
     };
@@ -388,7 +396,6 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
             )
             .await;
             shutdown_child(&mut app_server).await;
-            let _ = std::fs::remove_file(&token_path);
             return Err(err);
         }
     };
@@ -426,7 +433,6 @@ pub async fn run_codex(codex_bin: String, codex_args: Vec<String>) -> Result<Exi
     )
     .await;
     shutdown_child(&mut app_server).await;
-    let _ = std::fs::remove_file(&token_path);
 
     status
 }
@@ -614,26 +620,129 @@ fn websocket_token() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
-fn runtime_token_path() -> Result<PathBuf> {
-    Ok(store::config_dir()?
-        .join("runtime")
-        .join(format!("ws-token-{}", Uuid::new_v4())))
+fn websocket_token_sha256(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    let mut result = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(result, "{byte:02x}");
+    }
+    result
 }
 
-fn spawn_app_server(codex_bin: &str, websocket_url: &str, token_path: &Path) -> Result<Child> {
-    Command::new(codex_bin)
+fn cleanup_legacy_runtime_tokens_at_startup() {
+    let result = store::config_dir()
+        .map(|config_dir| config_dir.join("runtime"))
+        .and_then(|runtime_dir| {
+            cleanup_legacy_runtime_token_files(&runtime_dir, SystemTime::now())
+        });
+
+    match result {
+        Ok(LegacyRuntimeTokenCleanup {
+            removed: 0,
+            failures: 0,
+        }) => {}
+        Ok(cleanup) => startup_log(format_args!(
+            "runtime token cleanup: removed {} stale file(s), skipped {} candidate(s) after filesystem errors",
+            cleanup.removed, cleanup.failures
+        )),
+        Err(_) => startup_log("runtime token cleanup: scan failed; continuing"),
+    }
+}
+
+fn cleanup_legacy_runtime_token_files(
+    runtime_dir: &Path,
+    now: SystemTime,
+) -> Result<LegacyRuntimeTokenCleanup> {
+    let entries = match fs::read_dir(runtime_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LegacyRuntimeTokenCleanup::default());
+        }
+        Err(err) => {
+            return Err(err).context("Failed to inspect legacy runtime token directory");
+        }
+    };
+    let mut cleanup = LegacyRuntimeTokenCleanup::default();
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                cleanup.failures += 1;
+                continue;
+            }
+        };
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if !is_legacy_runtime_token_file_name(file_name) {
+            continue;
+        }
+
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => {
+                cleanup.failures += 1;
+                continue;
+            }
+        };
+        if file_type.is_symlink() || !file_type.is_file() {
+            continue;
+        }
+
+        let modified = match entry.metadata().and_then(|metadata| metadata.modified()) {
+            Ok(modified) => modified,
+            Err(_) => {
+                cleanup.failures += 1;
+                continue;
+            }
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age < LEGACY_RUNTIME_TOKEN_GRACE_PERIOD {
+            continue;
+        }
+
+        match fs::remove_file(entry.path()) {
+            Ok(()) => cleanup.removed += 1,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => cleanup.failures += 1,
+        }
+    }
+
+    Ok(cleanup)
+}
+
+fn is_legacy_runtime_token_file_name(file_name: &str) -> bool {
+    let Some(uuid) = file_name.strip_prefix(LEGACY_RUNTIME_TOKEN_PREFIX) else {
+        return false;
+    };
+    Uuid::parse_str(uuid).is_ok_and(|parsed| parsed.hyphenated().to_string() == uuid)
+}
+
+fn spawn_app_server(codex_bin: &str, websocket_url: &str, token_sha256: &str) -> Result<Child> {
+    app_server_command(codex_bin, websocket_url, token_sha256)
+        .spawn()
+        .with_context(|| format!("Failed to start Codex app-server with {codex_bin}"))
+}
+
+fn app_server_command(codex_bin: &str, websocket_url: &str, token_sha256: &str) -> Command {
+    let mut command = Command::new(codex_bin);
+    command
         .arg("app-server")
         .arg("--listen")
         .arg(websocket_url)
         .arg("--ws-auth")
         .arg("capability-token")
-        .arg("--ws-token-file")
-        .arg(token_path)
+        .arg("--ws-token-sha256")
+        .arg(token_sha256)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .with_context(|| format!("Failed to start Codex app-server with {codex_bin}"))
+        .stderr(std::process::Stdio::null());
+    command
 }
 
 async fn wait_for_app_server_ready(
@@ -3394,45 +3503,201 @@ fn is_jsonrpc_request(value: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
-    use std::path::Path;
-    use std::time::Duration;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
 
     use base64::Engine;
     use chrono::Utc;
     use serde_json::json;
     use tokio::sync::{mpsc, oneshot, watch};
     use tokio::time::Instant;
+    use uuid::Uuid;
 
     use super::{
         ACTIVE_ACCOUNT_MAX_ATTEMPTS, ACTIVE_ACCOUNT_RETRY_DELAYS, ACTIVE_ACCOUNT_WATCH_INTERVAL,
         APP_SERVER_REQUEST_TIMEOUT, ActiveAccountReconcileAction, ActiveAccountReconcileOutcome,
         ActiveAccountReconcileState, AutoSwitchLoginMode, AutoSwitchResult,
         BackgroundAutoSwitchQueueStatus, BackgroundRuntimeRequest, CurrentAccountSnapshot,
-        ExternalAuthPayload, PendingInternalRequest, PendingLoginStatus, PreparedAccountLogin,
-        ProxyState, RUNTIME_WEBSOCKET_MAX_FRAME_SIZE, RUNTIME_WEBSOCKET_MAX_MESSAGE_SIZE,
-        RateLimitAutoSwitchTrigger, RuntimeAuthState, RuntimeAutoSwitchPriority,
-        RuntimeClientNotification, RuntimeCommand, RuntimeCommandSendStatus, RuntimeLoadedAuth,
-        RuntimeLoginCommand, RuntimeLoginResult, RuntimeLoginSuccessNotification,
-        TOKEN_PREWARM_IDLE_AFTER, TokenPrewarmAttemptResult, TokenPrewarmDecision,
-        classify_rate_limit_notification, classify_runtime_login_error,
+        ExternalAuthPayload, LEGACY_RUNTIME_TOKEN_GRACE_PERIOD, LEGACY_RUNTIME_TOKEN_PREFIX,
+        LegacyRuntimeTokenCleanup, PendingInternalRequest, PendingLoginStatus,
+        PreparedAccountLogin, ProxyState, RUNTIME_WEBSOCKET_MAX_FRAME_SIZE,
+        RUNTIME_WEBSOCKET_MAX_MESSAGE_SIZE, RateLimitAutoSwitchTrigger, RuntimeAuthState,
+        RuntimeAutoSwitchPriority, RuntimeClientNotification, RuntimeCommand,
+        RuntimeCommandSendStatus, RuntimeLoadedAuth, RuntimeLoginCommand, RuntimeLoginResult,
+        RuntimeLoginSuccessNotification, TOKEN_PREWARM_IDLE_AFTER, TokenPrewarmAttemptResult,
+        TokenPrewarmDecision, app_server_command, classify_rate_limit_notification,
+        classify_runtime_login_error, cleanup_legacy_runtime_token_files,
         codex_args_with_default_cwd, current_account_auth_marker,
         current_account_has_newer_access_token, current_account_snapshot_for_account,
         duration_until_utc, enable_experimental_api_capability,
         enable_experimental_api_capability_for_message, external_auth_payload_from_fresh_account,
         finish_background_auto_switch, format_auto_switch_result_for_log,
         format_codex_args_summary_for_log, has_cwd_arg, initial_auto_switch_nonfatal_reason,
-        initialize_app_server_request, prewarm_snapshot_for_matching_auth,
-        queue_background_auto_switch, queue_hard_auto_switch, random_duration_between,
-        redact_runtime_log_message, runtime_auth_json_switch_notification,
+        initialize_app_server_request, is_legacy_runtime_token_file_name,
+        prewarm_snapshot_for_matching_auth, queue_background_auto_switch, queue_hard_auto_switch,
+        random_duration_between, redact_runtime_log_message, runtime_auth_json_switch_notification,
         runtime_auto_switch_success_notification, runtime_chatgpt_account_matches,
         runtime_client_notification_value, runtime_login_success_client_notification,
         runtime_websocket_config, sanitize_startup_log_message, select_current_kept_login_account,
         shared_runtime_auto_switch_coordinator, token_prewarm_attempt_result_for_login_result,
         token_prewarm_decision, token_prewarm_is_suppressed, try_send_background_runtime_command,
         usage_limit_error_requires_switch, validate_remote_capable_codex_args,
+        websocket_token_sha256,
     };
     use crate::types::{AuthData, NewChatGptAccount, StoredAccount};
     use tokio_tungstenite::tungstenite::Message;
+
+    fn runtime_token_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "codex-switch-runtime-token-{name}-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir(&dir).expect("runtime token test dir should be created");
+        dir
+    }
+
+    #[test]
+    fn websocket_token_digest_matches_sha256() {
+        assert_eq!(
+            websocket_token_sha256("test"),
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+        );
+    }
+
+    #[test]
+    fn app_server_command_uses_token_digest_without_token_file() {
+        let command = app_server_command("codex", "ws://127.0.0.1:1234", "0123456789abcdef");
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            [
+                "app-server",
+                "--listen",
+                "ws://127.0.0.1:1234",
+                "--ws-auth",
+                "capability-token",
+                "--ws-token-sha256",
+                "0123456789abcdef",
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_runtime_token_cleanup_observes_grace_period() {
+        let dir = runtime_token_test_dir("grace");
+        let token_path = dir.join(format!("{LEGACY_RUNTIME_TOKEN_PREFIX}{}", Uuid::new_v4()));
+        fs::write(&token_path, "legacy token").expect("candidate should be written");
+        let modified = fs::metadata(&token_path)
+            .and_then(|metadata| metadata.modified())
+            .expect("candidate modification time should be available");
+
+        let future_dated = cleanup_legacy_runtime_token_files(&dir, SystemTime::UNIX_EPOCH)
+            .expect("future-dated cleanup should succeed");
+        assert_eq!(future_dated, LegacyRuntimeTokenCleanup::default());
+        assert!(token_path.exists());
+
+        let before_grace = modified
+            .checked_add(LEGACY_RUNTIME_TOKEN_GRACE_PERIOD - Duration::from_millis(1))
+            .expect("test time should be representable");
+        let recent = cleanup_legacy_runtime_token_files(&dir, before_grace)
+            .expect("recent cleanup should succeed");
+        assert_eq!(recent, LegacyRuntimeTokenCleanup::default());
+        assert!(token_path.exists());
+
+        let at_grace = modified
+            .checked_add(LEGACY_RUNTIME_TOKEN_GRACE_PERIOD)
+            .expect("test time should be representable");
+        let stale = cleanup_legacy_runtime_token_files(&dir, at_grace)
+            .expect("stale cleanup should succeed");
+        assert_eq!(
+            stale,
+            LegacyRuntimeTokenCleanup {
+                removed: 1,
+                failures: 0,
+            }
+        );
+        assert!(!token_path.exists());
+
+        fs::remove_dir_all(&dir).expect("runtime token test dir should be removed");
+    }
+
+    #[test]
+    fn legacy_runtime_token_cleanup_strictly_filters_candidates() {
+        let dir = runtime_token_test_dir("filter");
+        let valid_path = dir.join(format!("{LEGACY_RUNTIME_TOKEN_PREFIX}{}", Uuid::new_v4()));
+        let invalid_path = dir.join(format!("{LEGACY_RUNTIME_TOKEN_PREFIX}not-a-uuid"));
+        let noncanonical_path = dir.join(format!(
+            "{LEGACY_RUNTIME_TOKEN_PREFIX}{}",
+            Uuid::new_v4().simple()
+        ));
+        let unrelated_path = dir.join("notes.txt");
+        let directory_path = dir.join(format!("{LEGACY_RUNTIME_TOKEN_PREFIX}{}", Uuid::new_v4()));
+        fs::write(&valid_path, "legacy token").expect("valid candidate should be written");
+        fs::write(&invalid_path, "not a token").expect("invalid candidate should be written");
+        fs::write(&noncanonical_path, "not a legacy name")
+            .expect("noncanonical candidate should be written");
+        fs::write(&unrelated_path, "unrelated").expect("unrelated file should be written");
+        fs::create_dir(&directory_path).expect("matching directory should be created");
+
+        #[cfg(unix)]
+        let symlink_path = {
+            use std::os::unix::fs::symlink;
+
+            let target_path = dir.join("symlink-target");
+            fs::write(&target_path, "unrelated target").expect("symlink target should be written");
+            let symlink_path = dir.join(format!("{LEGACY_RUNTIME_TOKEN_PREFIX}{}", Uuid::new_v4()));
+            symlink(&target_path, &symlink_path).expect("matching symlink should be created");
+            symlink_path
+        };
+
+        let now = SystemTime::now()
+            .checked_add(LEGACY_RUNTIME_TOKEN_GRACE_PERIOD + Duration::from_secs(1))
+            .expect("test time should be representable");
+        let cleanup = cleanup_legacy_runtime_token_files(&dir, now)
+            .expect("strict candidate cleanup should succeed");
+
+        assert_eq!(
+            cleanup,
+            LegacyRuntimeTokenCleanup {
+                removed: 1,
+                failures: 0,
+            }
+        );
+        assert!(!valid_path.exists());
+        assert!(invalid_path.exists());
+        assert!(noncanonical_path.exists());
+        assert!(unrelated_path.exists());
+        assert!(directory_path.is_dir());
+        #[cfg(unix)]
+        assert!(symlink_path.is_symlink());
+        assert!(!is_legacy_runtime_token_file_name(
+            noncanonical_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("test file name should be UTF-8")
+        ));
+
+        fs::remove_dir_all(&dir).expect("runtime token test dir should be removed");
+    }
+
+    #[test]
+    fn legacy_runtime_token_cleanup_accepts_missing_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "codex-switch-runtime-token-missing-{}",
+            Uuid::new_v4()
+        ));
+
+        let cleanup = cleanup_legacy_runtime_token_files(&dir, SystemTime::now())
+            .expect("missing runtime token dir should be accepted");
+
+        assert_eq!(cleanup, LegacyRuntimeTokenCleanup::default());
+    }
 
     #[test]
     fn app_server_probe_uses_codex_daemon_identity_and_experimental_api() {
