@@ -1,6 +1,6 @@
 [package]
 name = "codex-switch"
-version = "0.2.1"
+version = "0.3.1"
 edition = "2024"
 description = "Multi-account runtime switcher for Codex"
 license = "MIT"
