@@ -3093,6 +3093,7 @@ impl AppServerRateLimitSnapshot {
             unlimited_credits: self.credits.as_ref().map(|credits| credits.unlimited),
             credits_balance: self.credits.and_then(|credits| credits.balance),
             rate_limit_reset_credits_available: None,
+            rate_limit_reset_credits_next_expires_at: None,
             rate_limit_reached_type: self.rate_limit_reached_type,
             additional_limits: Vec::new(),
             error: None,

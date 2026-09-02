@@ -2,6 +2,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use futures_util::stream::{self, StreamExt};
 use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -12,13 +13,25 @@ use crate::store;
 use crate::token;
 use crate::types::{
     AdditionalRateLimitDetails, AuthData, ConsumeRateLimitResetCreditResponse, CreditStatusDetails,
-    RateLimitStatusDetails, RateLimitStatusPayload, RateLimitWindowSnapshot, StoredAccount,
-    UsageInfo, UsageLimitInfo,
+    RateLimitResetCreditsDetails, RateLimitStatusDetails, RateLimitStatusPayload,
+    RateLimitWindowSnapshot, StoredAccount, UsageInfo, UsageLimitInfo,
 };
 
 const CHATGPT_BACKEND_API: &str = "https://chatgpt.com/backend-api";
 const USAGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const RATE_LIMIT_RESET_DETAILS_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONCURRENT_USAGE_REQUESTS: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResetCreditDetailsMode {
+    SummaryOnly,
+    IncludeExpiration,
+}
+
+struct ChatGptUsageResponses {
+    usage: reqwest::Response,
+    reset_credit_details: Option<Result<RateLimitResetCreditsDetails>>,
+}
 
 #[derive(Debug, Clone)]
 pub struct AccountUsageFetch {
@@ -37,11 +50,15 @@ impl AccountUsageFetch {
 }
 
 pub async fn get_account_usage(account: &StoredAccount) -> Result<UsageInfo> {
-    get_account_usage_inner(account, true).await
+    get_account_usage_inner(account, true, ResetCreditDetailsMode::SummaryOnly).await
 }
 
 pub async fn get_account_usage_without_auth_write(account: &StoredAccount) -> Result<UsageInfo> {
-    get_account_usage_inner(account, false).await
+    get_account_usage_inner(account, false, ResetCreditDetailsMode::SummaryOnly).await
+}
+
+pub async fn get_account_usage_for_display(account: &StoredAccount) -> Result<UsageInfo> {
+    get_account_usage_inner(account, true, ResetCreditDetailsMode::IncludeExpiration).await
 }
 
 pub async fn consume_rate_limit_reset_credit(
@@ -64,18 +81,25 @@ pub async fn consume_rate_limit_reset_credit(
 async fn get_account_usage_inner(
     account: &StoredAccount,
     write_current_auth_on_refresh: bool,
+    reset_credit_details_mode: ResetCreditDetailsMode,
 ) -> Result<UsageInfo> {
     match &account.auth_data {
         AuthData::ApiKey { .. } => Ok(UsageInfo::unsupported(account.id.clone())),
         AuthData::ChatGPT { .. } => {
             let client = usage_http_client()?;
-            get_usage_with_chatgpt_auth(account, &client, write_current_auth_on_refresh).await
+            get_usage_with_chatgpt_auth(
+                account,
+                &client,
+                write_current_auth_on_refresh,
+                reset_credit_details_mode,
+            )
+            .await
         }
     }
 }
 
-pub async fn get_all_account_usage(accounts: &[StoredAccount]) -> Vec<UsageInfo> {
-    collect_account_usage(accounts)
+pub async fn get_all_account_usage_for_display(accounts: &[StoredAccount]) -> Vec<UsageInfo> {
+    collect_account_usage_for_display(accounts)
         .await
         .into_iter()
         .map(AccountUsageFetch::into_usage_info)
@@ -108,18 +132,29 @@ async fn collect_replacement_account_usage_inner(
         .filter(|(_, account)| account.auto_switch_enabled())
         .collect::<Vec<_>>();
 
-    collect_indexed_account_usage(indexed_accounts, write_current_auth_on_refresh).await
+    collect_indexed_account_usage(
+        indexed_accounts,
+        write_current_auth_on_refresh,
+        ResetCreditDetailsMode::SummaryOnly,
+    )
+    .await
 }
 
-async fn collect_account_usage(accounts: &[StoredAccount]) -> Vec<AccountUsageFetch> {
+async fn collect_account_usage_for_display(accounts: &[StoredAccount]) -> Vec<AccountUsageFetch> {
     let indexed_accounts = accounts.iter().enumerate().collect::<Vec<_>>();
 
-    collect_indexed_account_usage(indexed_accounts, true).await
+    collect_indexed_account_usage(
+        indexed_accounts,
+        true,
+        ResetCreditDetailsMode::IncludeExpiration,
+    )
+    .await
 }
 
 async fn collect_indexed_account_usage(
     indexed_accounts: Vec<(usize, &StoredAccount)>,
     write_current_auth_on_refresh: bool,
+    reset_credit_details_mode: ResetCreditDetailsMode,
 ) -> Vec<AccountUsageFetch> {
     let mut results = Vec::with_capacity(indexed_accounts.len());
     let mut oauth_accounts = Vec::new();
@@ -156,8 +191,13 @@ async fn collect_indexed_account_usage(
         .map(|(index, account)| (index, account.clone()))
         .collect::<Vec<_>>();
     results.extend(
-        collect_oauth_account_usage(owned_oauth_accounts, client, write_current_auth_on_refresh)
-            .await,
+        collect_oauth_account_usage(
+            owned_oauth_accounts,
+            client,
+            write_current_auth_on_refresh,
+            reset_credit_details_mode,
+        )
+        .await,
     );
     results.sort_by_key(|result| result.index);
     results
@@ -167,6 +207,7 @@ async fn collect_oauth_account_usage(
     indexed_accounts: Vec<(usize, StoredAccount)>,
     client: reqwest::Client,
     write_current_auth_on_refresh: bool,
+    reset_credit_details_mode: ResetCreditDetailsMode,
 ) -> Vec<AccountUsageFetch> {
     collect_indexed_account_usage_with(
         indexed_accounts,
@@ -174,9 +215,14 @@ async fn collect_oauth_account_usage(
         move |account| {
             let client = client.clone();
             async move {
-                get_account_usage_with_client(&account, &client, write_current_auth_on_refresh)
-                    .await
-                    .map_err(|err| err.to_string())
+                get_account_usage_with_client(
+                    &account,
+                    &client,
+                    write_current_auth_on_refresh,
+                    reset_credit_details_mode,
+                )
+                .await
+                .map_err(|err| err.to_string())
             }
         },
     )
@@ -217,11 +263,18 @@ async fn get_account_usage_with_client(
     account: &StoredAccount,
     client: &reqwest::Client,
     write_current_auth_on_refresh: bool,
+    reset_credit_details_mode: ResetCreditDetailsMode,
 ) -> Result<UsageInfo> {
     match &account.auth_data {
         AuthData::ApiKey { .. } => Ok(UsageInfo::unsupported(account.id.clone())),
         AuthData::ChatGPT { .. } => {
-            get_usage_with_chatgpt_auth(account, client, write_current_auth_on_refresh).await
+            get_usage_with_chatgpt_auth(
+                account,
+                client,
+                write_current_auth_on_refresh,
+                reset_credit_details_mode,
+            )
+            .await
         }
     }
 }
@@ -237,6 +290,7 @@ async fn get_usage_with_chatgpt_auth(
     account: &StoredAccount,
     client: &reqwest::Client,
     write_current_auth_on_refresh: bool,
+    reset_credit_details_mode: ResetCreditDetailsMode,
 ) -> Result<UsageInfo> {
     let fresh_account = if write_current_auth_on_refresh {
         token::ensure_chatgpt_tokens_fresh(account).await?
@@ -245,9 +299,15 @@ async fn get_usage_with_chatgpt_auth(
     };
     let (access_token, account_id, account_is_fedramp) = extract_chatgpt_auth(&fresh_account)?;
 
-    let response =
-        send_chatgpt_usage_request(client, access_token, account_id, account_is_fedramp).await?;
-    if response.status() == StatusCode::UNAUTHORIZED {
+    let responses = send_chatgpt_usage_requests(
+        client,
+        access_token,
+        account_id,
+        account_is_fedramp,
+        reset_credit_details_mode,
+    )
+    .await?;
+    if responses.usage.status() == StatusCode::UNAUTHORIZED {
         let refreshed_account = if write_current_auth_on_refresh {
             token::refresh_chatgpt_tokens(&fresh_account).await?
         } else {
@@ -255,13 +315,19 @@ async fn get_usage_with_chatgpt_auth(
         };
         let (retry_token, retry_account_id, retry_is_fedramp) =
             extract_chatgpt_auth(&refreshed_account)?;
-        let retry_response =
-            send_chatgpt_usage_request(client, retry_token, retry_account_id, retry_is_fedramp)
-                .await?;
-        return parse_usage_response_and_sync_metadata(&refreshed_account.id, retry_response).await;
+        let retry_responses = send_chatgpt_usage_requests(
+            client,
+            retry_token,
+            retry_account_id,
+            retry_is_fedramp,
+            reset_credit_details_mode,
+        )
+        .await?;
+        return parse_usage_response_and_sync_metadata(&refreshed_account.id, retry_responses)
+            .await;
     }
 
-    parse_usage_response_and_sync_metadata(&fresh_account.id, response).await
+    parse_usage_response_and_sync_metadata(&fresh_account.id, responses).await
 }
 
 fn extract_chatgpt_auth(account: &StoredAccount) -> Result<(&str, Option<&str>, bool)> {
@@ -294,6 +360,86 @@ async fn send_chatgpt_usage_request(
         .send()
         .await
         .context("Failed to send usage request")
+}
+
+async fn send_chatgpt_usage_requests(
+    client: &reqwest::Client,
+    access_token: &str,
+    chatgpt_account_id: Option<&str>,
+    chatgpt_account_is_fedramp: bool,
+    reset_credit_details_mode: ResetCreditDetailsMode,
+) -> Result<ChatGptUsageResponses> {
+    match reset_credit_details_mode {
+        ResetCreditDetailsMode::SummaryOnly => Ok(ChatGptUsageResponses {
+            usage: send_chatgpt_usage_request(
+                client,
+                access_token,
+                chatgpt_account_id,
+                chatgpt_account_is_fedramp,
+            )
+            .await?,
+            reset_credit_details: None,
+        }),
+        ResetCreditDetailsMode::IncludeExpiration => {
+            let (usage, reset_credit_details) = tokio::join!(
+                send_chatgpt_usage_request(
+                    client,
+                    access_token,
+                    chatgpt_account_id,
+                    chatgpt_account_is_fedramp,
+                ),
+                fetch_rate_limit_reset_credit_details(
+                    client,
+                    access_token,
+                    chatgpt_account_id,
+                    chatgpt_account_is_fedramp,
+                ),
+            );
+            Ok(ChatGptUsageResponses {
+                usage: usage?,
+                reset_credit_details: Some(reset_credit_details),
+            })
+        }
+    }
+}
+
+async fn fetch_rate_limit_reset_credit_details(
+    client: &reqwest::Client,
+    access_token: &str,
+    chatgpt_account_id: Option<&str>,
+    chatgpt_account_is_fedramp: bool,
+) -> Result<RateLimitResetCreditsDetails> {
+    tokio::time::timeout(RATE_LIMIT_RESET_DETAILS_REQUEST_TIMEOUT, async {
+        let response = send_chatgpt_rate_limit_reset_credit_details_request(
+            client,
+            access_token,
+            chatgpt_account_id,
+            chatgpt_account_is_fedramp,
+        )
+        .await?;
+        parse_rate_limit_reset_credit_details_response(response).await
+    })
+    .await
+    .context("Rate-limit reset credit details request timed out")?
+}
+
+async fn send_chatgpt_rate_limit_reset_credit_details_request(
+    client: &reqwest::Client,
+    access_token: &str,
+    chatgpt_account_id: Option<&str>,
+    chatgpt_account_is_fedramp: bool,
+) -> Result<reqwest::Response> {
+    let headers =
+        build_chatgpt_headers(access_token, chatgpt_account_id, chatgpt_account_is_fedramp)?;
+
+    client
+        .get(format!(
+            "{CHATGPT_BACKEND_API}/wham/rate-limit-reset-credits"
+        ))
+        .headers(headers)
+        .send()
+        .await
+        .context("Failed to send rate-limit reset credit details request")
 }
 
 #[derive(Debug, Serialize)]
@@ -407,6 +553,26 @@ async fn parse_usage_response(account_id: &str, response: reqwest::Response) -> 
     Ok(convert_payload_to_usage_info(account_id, payload))
 }
 
+async fn parse_rate_limit_reset_credit_details_response(
+    response: reqwest::Response,
+) -> Result<RateLimitResetCreditsDetails> {
+    let status = response.status();
+    if !status.is_success() {
+        let _body = response.text().await.unwrap_or_default();
+        anyhow::bail!("Rate-limit reset credit details API error: {status}");
+    }
+
+    let body = response
+        .text()
+        .await
+        .context("Failed to read rate-limit reset credit details response body")?;
+    parse_rate_limit_reset_credit_details_body(&body)
+}
+
+fn parse_rate_limit_reset_credit_details_body(body: &str) -> Result<RateLimitResetCreditsDetails> {
+    serde_json::from_str(body).context("Failed to parse rate-limit reset credit details response")
+}
+
 async fn parse_rate_limit_reset_consume_response(
     response: reqwest::Response,
 ) -> Result<ConsumeRateLimitResetCreditResponse> {
@@ -440,15 +606,65 @@ fn fetch_result_for_client_build_error(
 
 async fn parse_usage_response_and_sync_metadata(
     account_id: &str,
-    response: reqwest::Response,
+    responses: ChatGptUsageResponses,
 ) -> Result<UsageInfo> {
-    let info = parse_usage_response(account_id, response).await?;
+    let info = parse_usage_response(account_id, responses.usage).await?;
+    let info = apply_rate_limit_reset_credit_details(
+        info,
+        responses.reset_credit_details,
+        Utc::now().timestamp(),
+    );
     Ok(sync_usage_metadata_best_effort_with(
         info,
         |account_id, plan_type| {
             store::update_account_usage_metadata(account_id, plan_type).map(|_| ())
         },
     ))
+}
+
+fn apply_rate_limit_reset_credit_details(
+    mut info: UsageInfo,
+    details: Option<Result<RateLimitResetCreditsDetails>>,
+    now: i64,
+) -> UsageInfo {
+    let Some(details) = details else {
+        return info;
+    };
+    let details = match details {
+        Ok(details) => details,
+        Err(err) => {
+            tracing::warn!(
+                target: "codex_switch",
+                "failed to fetch rate-limit reset credit details; continuing with count-only usage: {err:#}"
+            );
+            return info;
+        }
+    };
+
+    if info.error.is_none()
+        && info
+            .rate_limit_reset_credits_available
+            .is_some_and(|available| available > 0)
+    {
+        info.rate_limit_reset_credits_next_expires_at =
+            next_rate_limit_reset_credit_expiration(&details, now);
+    }
+    info
+}
+
+fn next_rate_limit_reset_credit_expiration(
+    details: &RateLimitResetCreditsDetails,
+    now: i64,
+) -> Option<i64> {
+    details
+        .credits
+        .iter()
+        .filter(|credit| credit.status == "available")
+        .filter_map(|credit| credit.expires_at.as_deref())
+        .filter_map(|expires_at| DateTime::parse_from_rfc3339(expires_at).ok())
+        .map(|expires_at| expires_at.timestamp())
+        .filter(|expires_at| *expires_at > now)
+        .min()
 }
 
 fn sync_usage_metadata_best_effort_with(
@@ -510,6 +726,7 @@ fn convert_payload_to_usage_info(account_id: &str, payload: RateLimitStatusPaylo
         unlimited_credits: credits.as_ref().map(|credits| credits.unlimited),
         credits_balance: credits.and_then(|credits| credits.balance.flatten()),
         rate_limit_reset_credits_available,
+        rate_limit_reset_credits_next_expires_at: None,
         rate_limit_reached_type,
         additional_limits: snapshots,
         error: None,
@@ -588,12 +805,17 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ConsumeRateLimitResetCreditRequest, collect_indexed_account_usage_with,
-        collect_replacement_account_usage, consume_rate_limit_reset_credit,
-        convert_payload_to_usage_info, sync_usage_metadata_best_effort_with,
+        ConsumeRateLimitResetCreditRequest, apply_rate_limit_reset_credit_details,
+        collect_indexed_account_usage_with, collect_replacement_account_usage,
+        consume_rate_limit_reset_credit, convert_payload_to_usage_info,
+        next_rate_limit_reset_credit_expiration, parse_rate_limit_reset_credit_details_body,
+        sync_usage_metadata_best_effort_with,
     };
-    use crate::types::RateLimitStatusPayload;
-    use crate::types::{StoredAccount, UsageInfo, UsageWindowSlot};
+    use crate::types::{
+        RateLimitResetCreditsDetails, RateLimitStatusPayload, StoredAccount, UsageInfo,
+        UsageWindowSlot,
+    };
+    use chrono::{DateTime, Utc};
     use tokio::time::sleep;
 
     #[test]
@@ -647,6 +869,115 @@ mod tests {
         assert_eq!(info.primary_resets_at, Some(1_800_000_000));
         assert_eq!(info.credits_balance.as_deref(), Some("12.5"));
         assert_eq!(info.rate_limit_reset_credits_available, Some(2));
+    }
+
+    #[test]
+    fn rate_limit_reset_credit_details_parse_upstream_fields() {
+        let details = parse_rate_limit_reset_credit_details_body(
+            r#"{
+                "credits": [{
+                    "id": "credit-1",
+                    "reset_type": "codex_rate_limits",
+                    "status": "available",
+                    "granted_at": "2027-01-15T08:00:00Z",
+                    "expires_at": "2027-01-22T08:00:00Z",
+                    "title": "Full reset",
+                    "description": "Reset weekly usage"
+                }, {
+                    "id": "credit-2",
+                    "reset_type": "codex_rate_limits",
+                    "status": "redeemed",
+                    "granted_at": "2027-01-15T08:00:00Z",
+                    "expires_at": null,
+                    "title": null,
+                    "description": null
+                }],
+                "available_count": 1
+            }"#,
+        )
+        .expect("details should parse");
+
+        assert_eq!(details.available_count, 1);
+        assert_eq!(details.credits.len(), 2);
+        assert_eq!(details.credits[0].status, "available");
+        assert_eq!(
+            details.credits[0].expires_at.as_deref(),
+            Some("2027-01-22T08:00:00Z")
+        );
+        assert_eq!(details.credits[1].expires_at, None);
+    }
+
+    #[test]
+    fn reset_credit_expiration_selects_earliest_valid_available_future_timestamp() {
+        let now = 1_800_000_000;
+        let early = now + 60 * 60;
+        let late = now + 2 * 60 * 60;
+        let details = reset_credit_details(serde_json::json!([
+            { "status": "available", "expires_at": rfc3339(now - 1) },
+            { "status": "available", "expires_at": rfc3339(now) },
+            { "status": "redeeming", "expires_at": rfc3339(now + 1) },
+            { "status": "available", "expires_at": null },
+            { "status": "available", "expires_at": "not-a-timestamp" },
+            { "status": "available", "expires_at": rfc3339(late) },
+            { "status": "available", "expires_at": rfc3339(early) }
+        ]));
+
+        assert_eq!(
+            next_rate_limit_reset_credit_expiration(&details, now),
+            Some(early)
+        );
+    }
+
+    #[test]
+    fn reset_credit_details_enrich_positive_count_without_replacing_it() {
+        let now = 1_800_000_000;
+        let expires_at = now + 60 * 60;
+        let mut info = test_usage_info("account-id");
+        info.rate_limit_reset_credits_available = Some(2);
+        let details = reset_credit_details(serde_json::json!([
+            { "status": "available", "expires_at": rfc3339(expires_at) }
+        ]));
+
+        let info = apply_rate_limit_reset_credit_details(info, Some(Ok(details)), now);
+
+        assert_eq!(info.rate_limit_reset_credits_available, Some(2));
+        assert_eq!(
+            info.rate_limit_reset_credits_next_expires_at,
+            Some(expires_at)
+        );
+    }
+
+    #[test]
+    fn reset_credit_details_do_not_enrich_absent_or_non_positive_base_count() {
+        let now = 1_800_000_000;
+        for available_count in [None, Some(0), Some(-1)] {
+            let details = reset_credit_details(serde_json::json!([
+                { "status": "available", "expires_at": rfc3339(now + 60 * 60) }
+            ]));
+            let mut info = test_usage_info("account-id");
+            info.rate_limit_reset_credits_available = available_count;
+
+            let info = apply_rate_limit_reset_credit_details(info, Some(Ok(details)), now);
+
+            assert_eq!(info.rate_limit_reset_credits_available, available_count);
+            assert_eq!(info.rate_limit_reset_credits_next_expires_at, None);
+        }
+    }
+
+    #[test]
+    fn reset_credit_detail_failure_keeps_successful_count_only_usage() {
+        let mut info = test_usage_info("account-id");
+        info.rate_limit_reset_credits_available = Some(3);
+
+        let info = apply_rate_limit_reset_credit_details(
+            info,
+            Some(Err(anyhow::anyhow!("details unavailable"))),
+            1_800_000_000,
+        );
+
+        assert_eq!(info.rate_limit_reset_credits_available, Some(3));
+        assert_eq!(info.rate_limit_reset_credits_next_expires_at, None);
+        assert!(info.error.is_none());
     }
 
     #[test]
@@ -865,6 +1196,20 @@ mod tests {
         account
     }
 
+    fn reset_credit_details(credits: serde_json::Value) -> RateLimitResetCreditsDetails {
+        serde_json::from_value(serde_json::json!({
+            "credits": credits,
+            "available_count": 1
+        }))
+        .expect("reset credit details")
+    }
+
+    fn rfc3339(timestamp: i64) -> String {
+        DateTime::<Utc>::from_timestamp(timestamp, 0)
+            .expect("valid timestamp")
+            .to_rfc3339()
+    }
+
     fn test_usage_info(account_id: &str) -> UsageInfo {
         UsageInfo {
             account_id: account_id.to_string(),
@@ -881,6 +1226,7 @@ mod tests {
             unlimited_credits: None,
             credits_balance: None,
             rate_limit_reset_credits_available: None,
+            rate_limit_reset_credits_next_expires_at: None,
             rate_limit_reached_type: None,
             additional_limits: Vec::new(),
             error: None,
