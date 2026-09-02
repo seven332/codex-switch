@@ -46,6 +46,13 @@ impl UsageOutputStyle {
             return String::new();
         }
 
+        if line.starts_with("rate-limit resets:") {
+            return if line.ends_with(", expiring soon") {
+                self.wrap(line, ANSI_YELLOW)
+            } else {
+                line.to_string()
+            };
+        }
         if is_usage_account_header_line(line) {
             return self.style_account_header_line(line);
         }
@@ -352,5 +359,19 @@ mod tests {
         assert_eq!(style.style_text("credits: none"), "credits: none");
         assert_eq!(style.style_text("credits: 0"), "credits: 0");
         assert_eq!(style.style_text("credits: 0.5"), "credits: 0.5");
+    }
+
+    #[test]
+    fn colored_usage_output_style_highlights_expiring_reset_credits() {
+        let style = UsageOutputStyle::colored();
+        let later = "rate-limit resets: 2 available, next expires in 8d (12:00 on 10 Sep)";
+        let soon =
+            "rate-limit resets: 2 available, next expires in 7d (12:00 on 9 Sep), expiring soon";
+
+        assert_eq!(style.style_text(later), later);
+        assert_eq!(
+            style.style_text(soon),
+            format!("{ANSI_YELLOW}{soon}{ANSI_RESET}")
+        );
     }
 }

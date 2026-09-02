@@ -41,6 +41,7 @@ const QUOTA_BAR_FILLED: &str = "\u{2588}";
 const QUOTA_BAR_EMPTY: &str = "\u{2591}";
 const RESET_BAR_FILLED: &str = "\u{2588}";
 const RESET_BAR_EMPTY: &str = "\u{2500}";
+const RESET_CREDIT_EXPIRING_SOON_SECONDS: i64 = 7 * 24 * 60 * 60;
 
 #[tokio::main]
 async fn main() {
@@ -209,7 +210,7 @@ async fn run() -> Result<()> {
                     current_account_id.as_deref(),
                 )?;
                 let is_current = current_account_id.as_deref() == Some(account.id.as_str());
-                let info = usage::get_account_usage(&account).await?;
+                let info = usage::get_account_usage_for_display(&account).await?;
                 let now = Utc::now().timestamp();
                 if json {
                     let entry = json_output::UsageJsonEntry {
@@ -349,7 +350,7 @@ async fn print_refreshed_usage_after_reset(
     is_current: bool,
 ) -> Result<()> {
     let fresh_account = store::get_account_by_selector(&account.id)?;
-    let info = usage::get_account_usage(&fresh_account).await?;
+    let info = usage::get_account_usage_for_display(&fresh_account).await?;
     println!();
     print_usage(
         &fresh_account,
@@ -529,7 +530,7 @@ async fn print_all_usage(show_additional: bool, json: bool) -> Result<()> {
     }
     let current_account_id = auth_json::current_stored_account_id_best_effort(&store);
 
-    let results = usage::get_all_account_usage(&store.accounts).await;
+    let results = usage::get_all_account_usage_for_display(&store.accounts).await;
     let by_id: HashMap<String, UsageInfo> = results
         .into_iter()
         .map(|info| (info.account_id.clone(), info))
@@ -747,7 +748,7 @@ fn format_usage(
     if let Some(credits) = format_credits(info) {
         lines.push(credits);
     }
-    if let Some(rate_limit_reset_credits) = format_rate_limit_reset_credits(info) {
+    if let Some(rate_limit_reset_credits) = format_rate_limit_reset_credits(info, now) {
         lines.push(rate_limit_reset_credits);
     }
     if show_additional {
@@ -877,9 +878,24 @@ fn format_credits(info: &UsageInfo) -> Option<String> {
     Some(format!("credits: {credits}"))
 }
 
-fn format_rate_limit_reset_credits(info: &UsageInfo) -> Option<String> {
-    info.rate_limit_reset_credits_available
-        .map(|available_count| format!("rate-limit resets: {} available", available_count.max(0)))
+fn format_rate_limit_reset_credits(info: &UsageInfo, now: i64) -> Option<String> {
+    let available_count = info.rate_limit_reset_credits_available?.max(0);
+    let mut output = format!("rate-limit resets: {available_count} available");
+    let Some(expires_at) = info
+        .rate_limit_reset_credits_next_expires_at
+        .filter(|expires_at| available_count > 0 && *expires_at > now)
+    else {
+        return Some(output);
+    };
+
+    output.push_str(&format!(
+        ", next expires {}",
+        format_reset_timestamp(expires_at, now)
+    ));
+    if expires_at.saturating_sub(now) <= RESET_CREDIT_EXPIRING_SOON_SECONDS {
+        output.push_str(", expiring soon");
+    }
+    Some(output)
 }
 
 fn format_additional_limits(info: &UsageInfo, now: i64) -> Vec<String> {
@@ -1525,19 +1541,59 @@ mod tests {
     }
 
     #[test]
+    fn rate_limit_reset_credit_expiring_in_exactly_one_week_is_marked_soon() {
+        let now = 1_800_000_000;
+        let mut info = usage_info_with_additional_limit("account-id", now);
+        info.rate_limit_reset_credits_available = Some(2);
+        info.rate_limit_reset_credits_next_expires_at = Some(now + 7 * 24 * 60 * 60);
+
+        let output = format_rate_limit_reset_credits(&info, now).expect("reset credits");
+
+        assert!(output.contains("rate-limit resets: 2 available, next expires in 7d"));
+        assert!(output.ends_with(", expiring soon"));
+    }
+
+    #[test]
+    fn rate_limit_reset_credit_expiring_after_one_week_is_not_marked_soon() {
+        let now = 1_800_000_000;
+        let mut info = usage_info_with_additional_limit("account-id", now);
+        info.rate_limit_reset_credits_available = Some(2);
+        info.rate_limit_reset_credits_next_expires_at = Some(now + 7 * 24 * 60 * 60 + 1);
+
+        let output = format_rate_limit_reset_credits(&info, now).expect("reset credits");
+
+        assert!(output.contains("rate-limit resets: 2 available, next expires in 7d"));
+        assert!(!output.contains("expiring soon"));
+    }
+
+    #[test]
+    fn stale_reset_credit_expiration_falls_back_to_count_only() {
+        let now = 1_800_000_000;
+        let mut info = usage_info_with_additional_limit("account-id", now);
+        info.rate_limit_reset_credits_available = Some(2);
+        info.rate_limit_reset_credits_next_expires_at = Some(now);
+
+        assert_eq!(
+            format_rate_limit_reset_credits(&info, now).as_deref(),
+            Some("rate-limit resets: 2 available")
+        );
+    }
+
+    #[test]
     fn rate_limit_reset_credits_are_hidden_when_missing() {
         let info = usage_info_with_additional_limit("account-id", 1_800_000_000);
 
-        assert_eq!(format_rate_limit_reset_credits(&info), None);
+        assert_eq!(format_rate_limit_reset_credits(&info, 1_800_000_000), None);
     }
 
     #[test]
     fn rate_limit_reset_credits_clamp_negative_values() {
         let mut info = usage_info_with_additional_limit("account-id", 1_800_000_000);
         info.rate_limit_reset_credits_available = Some(-1);
+        info.rate_limit_reset_credits_next_expires_at = Some(1_800_003_600);
 
         assert_eq!(
-            format_rate_limit_reset_credits(&info).as_deref(),
+            format_rate_limit_reset_credits(&info, 1_800_000_000).as_deref(),
             Some("rate-limit resets: 0 available")
         );
     }
@@ -1760,6 +1816,7 @@ mod tests {
             unlimited_credits: None,
             credits_balance: Some("42".to_string()),
             rate_limit_reset_credits_available: None,
+            rate_limit_reset_credits_next_expires_at: None,
             rate_limit_reached_type: None,
             additional_limits: vec![UsageLimitInfo {
                 limit_id: Some("gpt-5.3-codex-spark".to_string()),

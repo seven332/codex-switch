@@ -84,6 +84,8 @@ struct UsageInfoJson {
     credits: Option<CreditsJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rate_limit_reset_credits_available: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rate_limit_reset_credits_next_expires_at: Option<i64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     additional_limits: Vec<AdditionalLimitJson>,
 }
@@ -238,6 +240,7 @@ fn usage_info_json(info: &UsageInfo, show_additional: bool) -> UsageInfoJson {
         rate_limit_reset_credits_available: info
             .rate_limit_reset_credits_available
             .map(|count| count.max(0)),
+        rate_limit_reset_credits_next_expires_at: info.rate_limit_reset_credits_next_expires_at,
         additional_limits: if show_additional {
             info.additional_limits
                 .iter()
@@ -492,6 +495,29 @@ mod tests {
     }
 
     #[test]
+    fn usage_json_includes_known_reset_credit_expiration_and_omits_unknown() {
+        let now = 1_800_000_000;
+        let mut info = usage_info_with_additional_limit("account-id", now);
+
+        let without_expiration = serde_json::to_value(usage_info_json(&info, false))
+            .expect("usage JSON should serialize");
+        assert!(
+            !without_expiration
+                .as_object()
+                .expect("usage JSON object")
+                .contains_key("rate_limit_reset_credits_next_expires_at")
+        );
+
+        info.rate_limit_reset_credits_next_expires_at = Some(now + 60 * 60);
+        let with_expiration = serde_json::to_value(usage_info_json(&info, false))
+            .expect("usage JSON should serialize");
+        assert_eq!(
+            with_expiration["rate_limit_reset_credits_next_expires_at"],
+            json!(now + 60 * 60)
+        );
+    }
+
+    #[test]
     fn usage_json_keeps_missing_canonical_window_objects_compatible() {
         let now = 1_800_000_000;
         let mut info = usage_info_with_additional_limit("account-id", now);
@@ -681,6 +707,7 @@ mod tests {
             unlimited_credits: Some(false),
             credits_balance: Some("42".to_string()),
             rate_limit_reset_credits_available: Some(2),
+            rate_limit_reset_credits_next_expires_at: None,
             rate_limit_reached_type: None,
             additional_limits: vec![UsageLimitInfo {
                 limit_id: Some("gpt-5.3-codex-spark".to_string()),

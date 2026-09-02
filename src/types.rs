@@ -384,6 +384,8 @@ pub struct UsageInfo {
     pub credits_balance: Option<String>,
     #[serde(default)]
     pub rate_limit_reset_credits_available: Option<i64>,
+    #[serde(default)]
+    pub rate_limit_reset_credits_next_expires_at: Option<i64>,
     pub rate_limit_reached_type: Option<String>,
     #[serde(default)]
     pub additional_limits: Vec<UsageLimitInfo>,
@@ -583,6 +585,7 @@ impl UsageInfo {
             unlimited_credits: None,
             credits_balance: None,
             rate_limit_reset_credits_available: None,
+            rate_limit_reset_credits_next_expires_at: None,
             rate_limit_reached_type: None,
             additional_limits: Vec::new(),
             error: Some(error),
@@ -605,6 +608,7 @@ impl UsageInfo {
             unlimited_credits: None,
             credits_balance: None,
             rate_limit_reset_credits_available: None,
+            rate_limit_reset_credits_next_expires_at: None,
             rate_limit_reached_type: None,
             additional_limits: Vec::new(),
             error: Some("usage unsupported".to_string()),
@@ -655,6 +659,18 @@ pub struct RateLimitStatusPayload {
 pub struct RateLimitResetCreditsSummary {
     #[serde(rename = "available_count")]
     pub available_count: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct RateLimitResetCreditsDetails {
+    pub credits: Vec<RateLimitResetCreditDetails>,
+    pub available_count: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct RateLimitResetCreditDetails {
+    pub status: String,
+    pub expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -1207,6 +1223,7 @@ mod tests {
         .expect("usage info");
 
         assert_eq!(info.rate_limit_reset_credits_available, None);
+        assert_eq!(info.rate_limit_reset_credits_next_expires_at, None);
     }
 
     #[test]
