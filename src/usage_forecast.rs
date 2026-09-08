@@ -1286,6 +1286,27 @@ mod tests {
     }
 
     #[test]
+    fn forecast_policy_reselection_prefers_zero_usage_account() {
+        let accounts = vec![chatgpt_account("used"), chatgpt_account("zero")];
+        let usage_by_id = HashMap::from([
+            (
+                accounts[0].id.clone(),
+                usage_info(&accounts[0].id, 20.0, 20.0, 240, 9_000),
+            ),
+            (
+                accounts[1].id.clone(),
+                usage_info(&accounts[1].id, 0.0, 0.0, 240, 9_000),
+            ),
+        ]);
+        let forecast = build_forecast(&accounts, &usage_by_id, NOW).expect("forecast input");
+
+        let selected = select_account_index(&forecast.accounts, Some("used"), NOW)
+            .expect("forecast account should be selected");
+
+        assert_eq!(forecast.accounts[selected].account.id, "zero");
+    }
+
+    #[test]
     fn simulation_reports_mixed_limits_and_recovery() {
         let accounts = vec![chatgpt_account("a"), chatgpt_account("b")];
         let usage_by_id = HashMap::from([

@@ -15,6 +15,10 @@ policy, and switches when that policy selects a different eligible account. This
 when the current account is out of usage. It refuses to switch while an unmanaged Codex process is
 active.
 
+The default policy prefers an eligible account when every canonical usage window reported for that
+account is at zero. A missing 5-hour or weekly window is ignored rather than treated as zero; when
+both windows are reported, both must be zero for this priority to apply.
+
 Accounts that are out of credits, rate-limited, usage-limited, at 100% usage, or disabled are not
 replacement candidates. A disabled current account is kept while it remains usable. API key
 accounts are not usage-checkable and are skipped.

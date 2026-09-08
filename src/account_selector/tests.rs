@@ -10,8 +10,9 @@ use chrono::{TimeZone, Utc};
 use super::{
     AccountSelection, AccountSelectionPolicy, AccountUsageCandidate, DeadlineAwarePolicy,
     DemandAwareHysteresisPolicy, ResetWeightedMinimaxPolicy, SelectionConfig, SelectionContext,
-    SelectionPolicyKind, ShadowPricePolicy, UsageWindow, compare_headroom_desc, compare_last_used,
-    compare_optional_reset, evaluated_candidates, select_account, select_account_with_context,
+    SelectionPolicyKind, ShadowPricePolicy, UsageWindow, ZERO_USAGE_EPSILON, compare_headroom_desc,
+    compare_last_used, compare_optional_reset, evaluated_candidates, select_account,
+    select_account_with_context,
 };
 use crate::types::{
     AuthData, AuthMode, StoredAccount, UsageInfo, UsageWindowKind, UsageWindowSlot,
@@ -447,6 +448,8 @@ impl ReplacementGate {
 #[test]
 fn excludes_hard_unavailable_accounts() {
     let api_key = api_key_account("api-key");
+    let mut disabled = chatgpt_account("disabled", None);
+    disabled.auto_switch_disabled = true;
     let usage_error = chatgpt_account("usage-error", None);
     let rate_limited = chatgpt_account("rate-limited", None);
     let five_hour_exhausted = chatgpt_account("five-hour-exhausted", None);
@@ -464,8 +467,10 @@ fn excludes_hard_unavailable_accounts() {
     let weekly_exhausted_info = usage_info("weekly-exhausted", 10.0, 100.0, 100, 200);
     let usable_info = usage_info("usable", 30.0, 30.0, 100, 200);
     let api_key_info = usage_info("api-key", 0.0, 0.0, 100, 200);
+    let disabled_info = usage_info("disabled", 0.0, 0.0, 100, 200);
     let candidates = [
         candidate(&api_key, &api_key_info),
+        candidate(&disabled, &disabled_info),
         candidate(&usage_error, &usage_error_info),
         candidate(&rate_limited, &rate_limited_info),
         candidate(&five_hour_exhausted, &five_hour_exhausted_info),
@@ -899,67 +904,61 @@ fn single_canonical_window_is_independent_of_transport_slot() {
 }
 
 #[test]
-fn deadline_aware_weekly_only_selection_bypasses_cold_activation() {
-    let current = chatgpt_account("current", None);
-    let preferred = chatgpt_account("preferred", None);
-    let current_info = single_window_usage_info(
-        "current",
+fn deadline_aware_prioritizes_weekly_only_zero_usage() {
+    let used = chatgpt_account("used", None);
+    let zero = chatgpt_account("zero", None);
+    let used_info = single_window_usage_info(
+        "used",
         20.0,
-        UsageWindowKind::Weekly,
-        1_000,
-        UsageWindowSlot::Primary,
-    );
-    let preferred_info = single_window_usage_info(
-        "preferred",
-        0.0,
         UsageWindowKind::Weekly,
         10,
         UsageWindowSlot::Primary,
     );
+    let zero_info = single_window_usage_info(
+        "zero",
+        0.0,
+        UsageWindowKind::Weekly,
+        1_000,
+        UsageWindowSlot::Primary,
+    );
 
     let selection = select_account_with_context(
-        &[
-            candidate(&current, &current_info),
-            candidate(&preferred, &preferred_info),
-        ],
+        &[candidate(&used, &used_info), candidate(&zero, &zero_info)],
         SelectionConfig::default(),
-        SelectionContext::at(100).with_current_account_id(Some("current")),
+        SelectionContext::at(100).with_current_account_id(Some("used")),
     )
     .expect("weekly-only candidates should be selectable");
 
-    assert_eq!(selection.account.id, "preferred");
+    assert_eq!(selection.account.id, "zero");
 }
 
 #[test]
-fn deadline_aware_five_hour_only_selection_keeps_a_cold_current_account() {
-    let current = chatgpt_account("current", None);
-    let earlier_reset = chatgpt_account("earlier-reset", None);
-    let current_info = single_window_usage_info(
-        "current",
-        0.0,
-        UsageWindowKind::FiveHour,
-        1_000,
-        UsageWindowSlot::Primary,
-    );
-    let earlier_reset_info = single_window_usage_info(
-        "earlier-reset",
+fn deadline_aware_prioritizes_five_hour_only_zero_usage() {
+    let used = chatgpt_account("used", None);
+    let zero = chatgpt_account("zero", None);
+    let used_info = single_window_usage_info(
+        "used",
         20.0,
         UsageWindowKind::FiveHour,
         10,
         UsageWindowSlot::Primary,
     );
+    let zero_info = single_window_usage_info(
+        "zero",
+        0.0,
+        UsageWindowKind::FiveHour,
+        1_000,
+        UsageWindowSlot::Primary,
+    );
 
     let selection = select_account_with_context(
-        &[
-            candidate(&current, &current_info),
-            candidate(&earlier_reset, &earlier_reset_info),
-        ],
+        &[candidate(&used, &used_info), candidate(&zero, &zero_info)],
         SelectionConfig::default(),
-        SelectionContext::at(100).with_current_account_id(Some("current")),
+        SelectionContext::at(100).with_current_account_id(Some("used")),
     )
     .expect("5-hour-only candidates should be selectable");
 
-    assert_eq!(selection.account.id, "current");
+    assert_eq!(selection.account.id, "zero");
 }
 
 #[test]
@@ -1142,272 +1141,208 @@ fn deadline_aware_ignores_non_cold_current_account_context() {
 }
 
 #[test]
-fn deadline_aware_keeps_current_cold_account_for_first_real_usage() {
-    let current = chatgpt_account("current", None);
-    let used = chatgpt_account("used", None);
-    let current_info = usage_info("current", 0.0, 0.0, 18_000, 604_800);
-    let used_info = usage_info("used", 20.0, 20.0, 300, 604_800);
-    let candidates = [
-        candidate(&used, &used_info),
-        candidate(&current, &current_info),
-    ];
-    let context = SelectionContext::at(0).with_current_account_id(Some("current"));
+fn deadline_aware_keeps_current_among_zero_usage_accounts_for_each_window_shape() {
+    let current = chatgpt_account("current", Some(Utc.timestamp_opt(100, 0).unwrap()));
+    let other = chatgpt_account("other", None);
 
-    let selection = select_account_with_context(&candidates, SelectionConfig::default(), context)
+    for kind in [
+        Some(UsageWindowKind::FiveHour),
+        Some(UsageWindowKind::Weekly),
+        None,
+    ] {
+        let (current_info, other_info) = match kind {
+            Some(kind) => (
+                single_window_usage_info("current", 0.0, kind, 1_000, UsageWindowSlot::Secondary),
+                single_window_usage_info("other", 0.0, kind, 500, UsageWindowSlot::Primary),
+            ),
+            None => (
+                usage_info("current", 0.0, 0.0, 1_000, 2_000),
+                usage_info("other", 0.0, 0.0, 500, 1_500),
+            ),
+        };
+        let candidates = [
+            candidate(&other, &other_info),
+            candidate(&current, &current_info),
+        ];
+        let context = SelectionContext::at(100);
+
+        let without_current =
+            select_account_with_context(&candidates, SelectionConfig::default(), context)
+                .expect("zero-usage accounts should be selectable");
+        assert_eq!(without_current.account.id, "other", "window: {kind:?}");
+
+        let with_current = select_account_with_context(
+            &candidates,
+            SelectionConfig::default(),
+            context.with_current_account_id(Some("current")),
+        )
+        .expect("the current zero-usage account should remain selected");
+        assert_eq!(with_current.account.id, "current", "window: {kind:?}");
+    }
+}
+
+#[test]
+fn deadline_aware_prioritizes_two_window_zero_usage_independent_of_time() {
+    let used = chatgpt_account("used", None);
+    let zero = chatgpt_account("zero", None);
+    let used_info = usage_info("used", 20.0, 20.0, 10, 20);
+    let zero_info = usage_info("zero", 0.0, 0.0, 1_000, 2_000);
+    let candidates = [candidate(&used, &used_info), candidate(&zero, &zero_info)];
+
+    for now in [-1_000_000, 1_000_000] {
+        let selection = select_account_with_context(
+            &candidates,
+            SelectionConfig::default(),
+            SelectionContext::at(now).with_current_account_id(Some("used")),
+        )
         .expect("usable account should be selected");
 
-    assert_eq!(selection.account.id, "current");
+        assert_eq!(selection.account.id, "zero", "now: {now}");
+    }
 }
 
 #[test]
-fn deadline_aware_waits_to_activate_cold_account_until_stagger_interval() {
-    let last_used_at = Utc.with_ymd_and_hms(2026, 5, 10, 0, 0, 0).unwrap();
-    let active = chatgpt_account("active", Some(last_used_at));
-    let cold = chatgpt_account("cold", None);
-    let context_now = last_used_at.timestamp() + (FIVE_HOUR_WINDOW_MINUTES * 60 / 2) - 1;
-    let active_info = usage_info(
-        "active",
+fn deadline_aware_does_not_prioritize_partially_zero_two_window_usage() {
+    let partially_zero = chatgpt_account("partially-zero", None);
+    let earlier_reset = chatgpt_account("earlier-reset", None);
+    let earlier_reset_info = usage_info("earlier-reset", 20.0, 20.0, 10, 20);
+
+    for (five_hour, weekly) in [(0.0, 20.0), (20.0, 0.0)] {
+        let partially_zero_info = usage_info("partially-zero", five_hour, weekly, 1_000, 2_000);
+        let candidates = [
+            candidate(&partially_zero, &partially_zero_info),
+            candidate(&earlier_reset, &earlier_reset_info),
+        ];
+
+        let selection = select_account(&candidates, SelectionConfig::default())
+            .expect("usable account should be selected");
+
+        assert_eq!(
+            selection.account.id, "earlier-reset",
+            "5-hour: {five_hour}, weekly: {weekly}"
+        );
+    }
+}
+
+#[test]
+fn deadline_aware_classifies_zero_usage_before_shared_window_projection() {
+    let complete = chatgpt_account("complete", None);
+    let weekly_only = chatgpt_account("weekly-only", None);
+    let complete_info = usage_info("complete", 50.0, 0.0, 1_000, 1_000);
+    let weekly_only_info = single_window_usage_info(
+        "weekly-only",
         20.0,
-        20.0,
-        last_used_at.timestamp() + FIVE_HOUR_WINDOW_MINUTES * 60,
-        last_used_at.timestamp() + WEEKLY_WINDOW_MINUTES * 60,
-    );
-    let cold_info = usage_info(
-        "cold",
-        0.0,
-        0.0,
-        context_now + FIVE_HOUR_WINDOW_MINUTES * 60,
-        context_now + WEEKLY_WINDOW_MINUTES * 60,
+        UsageWindowKind::Weekly,
+        10,
+        UsageWindowSlot::Primary,
     );
     let candidates = [
-        candidate(&active, &active_info),
-        candidate(&cold, &cold_info),
+        candidate(&complete, &complete_info),
+        candidate(&weekly_only, &weekly_only_info),
     ];
 
-    let selection = select_account_with_context(
-        &candidates,
-        SelectionConfig::default(),
-        SelectionContext::at(context_now).with_current_account_id(Some("active")),
-    )
-    .expect("usable account should be selected");
+    let selection = select_account(&candidates, SelectionConfig::default())
+        .expect("candidates with a shared weekly window should be selectable");
 
-    assert_eq!(selection.account.id, "active");
+    assert_eq!(selection.account.id, "weekly-only");
 }
 
 #[test]
-fn deadline_aware_activates_due_cold_account() {
-    let last_used_at = Utc.with_ymd_and_hms(2026, 5, 10, 0, 0, 0).unwrap();
-    let active = chatgpt_account("active", Some(last_used_at));
-    let cold = chatgpt_account("cold", None);
-    let context_now = last_used_at.timestamp() + (FIVE_HOUR_WINDOW_MINUTES * 60 / 2);
-    let active_info = usage_info(
-        "active",
+fn deadline_aware_zero_usage_tolerance_has_a_strict_boundary() {
+    let used = chatgpt_account("used", None);
+    let boundary = chatgpt_account("boundary", None);
+    let beyond = chatgpt_account("beyond", None);
+    let used_info = single_window_usage_info(
+        "used",
         20.0,
-        20.0,
-        last_used_at.timestamp() + FIVE_HOUR_WINDOW_MINUTES * 60,
-        last_used_at.timestamp() + WEEKLY_WINDOW_MINUTES * 60,
+        UsageWindowKind::FiveHour,
+        10,
+        UsageWindowSlot::Primary,
     );
-    let cold_info = usage_info(
-        "cold",
-        0.0,
-        0.0,
-        context_now + FIVE_HOUR_WINDOW_MINUTES * 60,
-        context_now + WEEKLY_WINDOW_MINUTES * 60,
+    let boundary_info = single_window_usage_info(
+        "boundary",
+        ZERO_USAGE_EPSILON,
+        UsageWindowKind::FiveHour,
+        1_000,
+        UsageWindowSlot::Primary,
     );
-    let candidates = [
-        candidate(&active, &active_info),
-        candidate(&cold, &cold_info),
-    ];
+    let beyond_info = single_window_usage_info(
+        "beyond",
+        ZERO_USAGE_EPSILON * 1.1,
+        UsageWindowKind::FiveHour,
+        1_000,
+        UsageWindowSlot::Primary,
+    );
 
-    let selection = select_account_with_context(
-        &candidates,
+    let boundary_selection = select_account(
+        &[
+            candidate(&used, &used_info),
+            candidate(&boundary, &boundary_info),
+        ],
         SelectionConfig::default(),
-        SelectionContext::at(context_now).with_current_account_id(Some("active")),
     )
-    .expect("usable account should be selected");
+    .expect("boundary usage should be selectable");
+    assert_eq!(boundary_selection.account.id, "boundary");
 
-    assert_eq!(selection.account.id, "cold");
+    let beyond_selection = select_account(
+        &[
+            candidate(&used, &used_info),
+            candidate(&beyond, &beyond_info),
+        ],
+        SelectionConfig::default(),
+    )
+    .expect("usage beyond the boundary should be selectable");
+    assert_eq!(beyond_selection.account.id, "used");
 }
 
 #[test]
-fn deadline_aware_uses_usage_reset_to_stagger_cold_activation_without_last_used_at() {
-    let active = chatgpt_account("active", None);
-    let cold = chatgpt_account("cold", None);
-    let first_usage_at = Utc
-        .with_ymd_and_hms(2026, 5, 10, 0, 0, 0)
-        .unwrap()
-        .timestamp();
-    let before_interval = first_usage_at + (FIVE_HOUR_WINDOW_MINUTES * 60 / 2) - 1;
-    let after_interval = first_usage_at + (FIVE_HOUR_WINDOW_MINUTES * 60 / 2);
-    let active_info = usage_info(
-        "active",
-        20.0,
-        20.0,
-        first_usage_at + FIVE_HOUR_WINDOW_MINUTES * 60,
-        first_usage_at + WEEKLY_WINDOW_MINUTES * 60,
+fn deadline_aware_prefers_never_then_older_used_zero_accounts() {
+    let recent = chatgpt_account(
+        "recent",
+        Some(Utc.with_ymd_and_hms(2026, 5, 10, 2, 0, 0).unwrap()),
     );
-    let before_cold_info = usage_info(
-        "cold",
-        0.0,
-        0.0,
-        before_interval + FIVE_HOUR_WINDOW_MINUTES * 60,
-        before_interval + WEEKLY_WINDOW_MINUTES * 60,
-    );
-    let after_cold_info = usage_info(
-        "cold",
-        0.0,
-        0.0,
-        after_interval + FIVE_HOUR_WINDOW_MINUTES * 60,
-        after_interval + WEEKLY_WINDOW_MINUTES * 60,
-    );
-
-    let before_candidates = [
-        candidate(&active, &active_info),
-        candidate(&cold, &before_cold_info),
-    ];
-    let before_selection = select_account_with_context(
-        &before_candidates,
-        SelectionConfig::default(),
-        SelectionContext::at(before_interval).with_current_account_id(Some("active")),
-    )
-    .expect("usable account should be selected");
-    assert_eq!(before_selection.account.id, "active");
-
-    let after_candidates = [
-        candidate(&active, &active_info),
-        candidate(&cold, &after_cold_info),
-    ];
-    let after_selection = select_account_with_context(
-        &after_candidates,
-        SelectionConfig::default(),
-        SelectionContext::at(after_interval).with_current_account_id(Some("active")),
-    )
-    .expect("usable account should be selected");
-    assert_eq!(after_selection.account.id, "cold");
-}
-
-#[test]
-fn deadline_aware_does_not_activate_cold_account_on_reset_tie_before_interval() {
-    let active = chatgpt_account("active", None);
-    let cold = chatgpt_account("cold", None);
-    let first_usage_at = Utc
-        .with_ymd_and_hms(2026, 5, 10, 0, 0, 0)
-        .unwrap()
-        .timestamp();
-    let active_info = usage_info(
-        "active",
-        20.0,
-        20.0,
-        first_usage_at + FIVE_HOUR_WINDOW_MINUTES * 60,
-        first_usage_at + WEEKLY_WINDOW_MINUTES * 60,
-    );
-    let cold_info = usage_info(
-        "cold",
-        0.0,
-        0.0,
-        first_usage_at + FIVE_HOUR_WINDOW_MINUTES * 60,
-        first_usage_at + WEEKLY_WINDOW_MINUTES * 60,
-    );
-    let candidates = [
-        candidate(&active, &active_info),
-        candidate(&cold, &cold_info),
-    ];
-
-    let selection = select_account_with_context(
-        &candidates,
-        SelectionConfig::default(),
-        SelectionContext::at(first_usage_at).with_current_account_id(Some("active")),
-    )
-    .expect("usable account should be selected");
-
-    assert_eq!(selection.account.id, "active");
-}
-
-#[test]
-fn deadline_aware_allows_cold_account_before_interval_when_non_cold_is_unsafe() {
-    let active = chatgpt_account("active", None);
-    let cold = chatgpt_account("cold", None);
-    let first_usage_at = Utc
-        .with_ymd_and_hms(2026, 5, 10, 0, 0, 0)
-        .unwrap()
-        .timestamp();
-    let active_info = usage_info(
-        "active",
-        98.0,
-        20.0,
-        first_usage_at + 60,
-        first_usage_at + WEEKLY_WINDOW_MINUTES * 60,
-    );
-    let cold_info = usage_info(
-        "cold",
-        0.0,
-        0.0,
-        first_usage_at + FIVE_HOUR_WINDOW_MINUTES * 60,
-        first_usage_at + WEEKLY_WINDOW_MINUTES * 60,
-    );
-    let candidates = [
-        candidate(&active, &active_info),
-        candidate(&cold, &cold_info),
-    ];
-
-    let selection = select_account_with_context(
-        &candidates,
-        SelectionConfig::default(),
-        SelectionContext::at(first_usage_at).with_current_account_id(Some("active")),
-    )
-    .expect("usable account should be selected");
-
-    assert_eq!(selection.account.id, "cold");
-}
-
-#[test]
-fn cold_last_used_at_does_not_delay_activation_without_real_usage() {
-    let active = chatgpt_account("active", None);
-    let cold_recently_switched = chatgpt_account(
-        "cold-recently-switched",
+    let older = chatgpt_account(
+        "older",
         Some(Utc.with_ymd_and_hms(2026, 5, 10, 1, 0, 0).unwrap()),
     );
-    let cold_never_used = chatgpt_account("cold-never-used", None);
-    let first_usage_at = Utc
-        .with_ymd_and_hms(2026, 5, 10, 0, 0, 0)
-        .unwrap()
-        .timestamp();
-    let activation_time = first_usage_at + (FIVE_HOUR_WINDOW_MINUTES * 60 / 3);
-    let active_info = usage_info(
-        "active",
-        20.0,
-        20.0,
-        first_usage_at + FIVE_HOUR_WINDOW_MINUTES * 60,
-        first_usage_at + WEEKLY_WINDOW_MINUTES * 60,
-    );
-    let cold_recently_switched_info = usage_info(
-        "cold-recently-switched",
-        0.0,
-        0.0,
-        activation_time + FIVE_HOUR_WINDOW_MINUTES * 60,
-        activation_time + WEEKLY_WINDOW_MINUTES * 60,
-    );
-    let cold_never_used_info = usage_info(
-        "cold-never-used",
-        0.0,
-        0.0,
-        activation_time + FIVE_HOUR_WINDOW_MINUTES * 60,
-        activation_time + WEEKLY_WINDOW_MINUTES * 60,
-    );
+    let never = chatgpt_account("never", None);
+    let recent_info = usage_info("recent", 0.0, 0.0, 10, 20);
+    let older_info = usage_info("older", 0.0, 0.0, 30, 40);
+    let never_info = usage_info("never", 0.0, 0.0, 50, 60);
+
+    let with_never = [
+        candidate(&recent, &recent_info),
+        candidate(&older, &older_info),
+        candidate(&never, &never_info),
+    ];
+    let selection = select_account(&with_never, SelectionConfig::default())
+        .expect("zero-usage accounts should be selectable");
+    assert_eq!(selection.account.id, "never");
+
+    let used_only = [
+        candidate(&recent, &recent_info),
+        candidate(&older, &older_info),
+    ];
+    let selection = select_account(&used_only, SelectionConfig::default())
+        .expect("zero-usage accounts should be selectable");
+    assert_eq!(selection.account.id, "older");
+}
+
+#[test]
+fn deadline_aware_uses_stable_order_for_zero_usage_ties() {
+    let first = chatgpt_account("first", None);
+    let second = chatgpt_account("second", None);
+    let first_info = usage_info("first", 0.0, 0.0, 1_000, 2_000);
+    let second_info = usage_info("second", 0.0, 0.0, 10, 20);
     let candidates = [
-        candidate(&active, &active_info),
-        candidate(&cold_recently_switched, &cold_recently_switched_info),
-        candidate(&cold_never_used, &cold_never_used_info),
+        candidate(&first, &first_info),
+        candidate(&second, &second_info),
     ];
 
-    let selection = select_account_with_context(
-        &candidates,
-        SelectionConfig::default(),
-        SelectionContext::at(activation_time).with_current_account_id(Some("active")),
-    )
-    .expect("usable account should be selected");
+    let selection = select_account(&candidates, SelectionConfig::default())
+        .expect("zero-usage accounts should be selectable");
 
-    assert_eq!(selection.account.id, "cold-never-used");
+    assert_eq!(selection.account.id, "first");
 }
 
 #[test]
@@ -2177,7 +2112,7 @@ fn consumed_usage_reset_times_use_real_consumption_events() {
 }
 
 #[test]
-fn simulator_staggers_cold_account_activation_across_five_hour_window() {
+fn simulator_immediately_selects_zero_usage_account_after_current_is_used() {
     let mut policy = DeadlineAwarePolicy::default();
     let mut accounts = vec![
         SimAccount::new("account-0", 0, 2),
@@ -2187,14 +2122,11 @@ fn simulator_staggers_cold_account_activation_across_five_hour_window() {
         .expect("first account should be selected");
     accounts[first_selected].consume(0, 100.0);
 
-    let before_interval = select_sim_account(&mut policy, &accounts, 149, Some(first_selected))
-        .expect("account should be selected before interval");
-    let after_interval = select_sim_account(&mut policy, &accounts, 150, Some(first_selected))
-        .expect("account should be selected after interval");
+    let next_selected = select_sim_account(&mut policy, &accounts, 1, Some(first_selected))
+        .expect("zero account should be selected immediately");
 
     assert_eq!(first_selected, 0);
-    assert_eq!(before_interval, 0);
-    assert_eq!(after_interval, 1);
+    assert_eq!(next_selected, 1);
 }
 
 #[test]
