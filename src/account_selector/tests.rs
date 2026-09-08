@@ -1141,21 +1141,44 @@ fn deadline_aware_ignores_non_cold_current_account_context() {
 }
 
 #[test]
-fn deadline_aware_keeps_current_cold_account_for_first_real_usage() {
-    let current = chatgpt_account("current", None);
-    let used = chatgpt_account("used", None);
-    let current_info = usage_info("current", 0.0, 0.0, 18_000, 604_800);
-    let used_info = usage_info("used", 20.0, 20.0, 300, 604_800);
-    let candidates = [
-        candidate(&used, &used_info),
-        candidate(&current, &current_info),
-    ];
-    let context = SelectionContext::at(0).with_current_account_id(Some("current"));
+fn deadline_aware_keeps_current_among_zero_usage_accounts_for_each_window_shape() {
+    let current = chatgpt_account("current", Some(Utc.timestamp_opt(100, 0).unwrap()));
+    let other = chatgpt_account("other", None);
 
-    let selection = select_account_with_context(&candidates, SelectionConfig::default(), context)
-        .expect("usable account should be selected");
+    for kind in [
+        Some(UsageWindowKind::FiveHour),
+        Some(UsageWindowKind::Weekly),
+        None,
+    ] {
+        let (current_info, other_info) = match kind {
+            Some(kind) => (
+                single_window_usage_info("current", 0.0, kind, 1_000, UsageWindowSlot::Secondary),
+                single_window_usage_info("other", 0.0, kind, 500, UsageWindowSlot::Primary),
+            ),
+            None => (
+                usage_info("current", 0.0, 0.0, 1_000, 2_000),
+                usage_info("other", 0.0, 0.0, 500, 1_500),
+            ),
+        };
+        let candidates = [
+            candidate(&other, &other_info),
+            candidate(&current, &current_info),
+        ];
+        let context = SelectionContext::at(100);
 
-    assert_eq!(selection.account.id, "current");
+        let without_current =
+            select_account_with_context(&candidates, SelectionConfig::default(), context)
+                .expect("zero-usage accounts should be selectable");
+        assert_eq!(without_current.account.id, "other", "window: {kind:?}");
+
+        let with_current = select_account_with_context(
+            &candidates,
+            SelectionConfig::default(),
+            context.with_current_account_id(Some("current")),
+        )
+        .expect("the current zero-usage account should remain selected");
+        assert_eq!(with_current.account.id, "current", "window: {kind:?}");
+    }
 }
 
 #[test]
@@ -2030,6 +2053,42 @@ fn replacement_gate_tie_breaks_between_passing_candidates() {
         .expect("passing candidate list should not be empty");
 
     assert_eq!(selected.policy_name, "better");
+}
+
+#[test]
+fn cold_simulated_account_reset_times_drift_until_first_usage() {
+    let mut account = SimAccount::new("account-0", 0, 2);
+    let initial_usage = account.usage_info(0);
+    let later_unused_usage = account.usage_info(60);
+
+    assert_eq!(
+        initial_usage.primary_resets_at,
+        Some(FIVE_HOUR_WINDOW_MINUTES * 60)
+    );
+    assert_eq!(
+        initial_usage.secondary_resets_at,
+        Some(WEEKLY_WINDOW_MINUTES * 60)
+    );
+    assert_eq!(
+        later_unused_usage.primary_resets_at,
+        Some((60 + FIVE_HOUR_WINDOW_MINUTES) * 60)
+    );
+    assert_eq!(
+        later_unused_usage.secondary_resets_at,
+        Some((60 + WEEKLY_WINDOW_MINUTES) * 60)
+    );
+
+    account.consume(60, 100.0);
+    let consumed_usage = account.usage_info(120);
+
+    assert_eq!(
+        consumed_usage.primary_resets_at,
+        Some((60 + FIVE_HOUR_WINDOW_MINUTES) * 60)
+    );
+    assert_eq!(
+        consumed_usage.secondary_resets_at,
+        Some((60 + WEEKLY_WINDOW_MINUTES) * 60)
+    );
 }
 
 #[test]
