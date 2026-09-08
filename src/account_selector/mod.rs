@@ -16,6 +16,7 @@ pub use shadow_price::ShadowPricePolicy;
 
 pub const DEFAULT_MIN_SAFE_HEADROOM: f64 = 5.0;
 pub const DEFAULT_WEEKLY_TO_FIVE_HOUR_RATIO: f64 = 5.0;
+const ZERO_USAGE_EPSILON: f64 = 0.000_001;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SelectionConfig {
@@ -124,7 +125,7 @@ struct EvaluatedCandidate<'a> {
     account: &'a StoredAccount,
     five_hour: Option<EvaluatedWindow>,
     weekly: Option<EvaluatedWindow>,
-    active_windows: ActiveUsageWindows,
+    is_zero_usage: bool,
     metrics: UsageSelectionMetrics,
     order: usize,
 }
@@ -141,7 +142,6 @@ impl EvaluatedCandidate<'_> {
 struct EvaluatedUsage {
     five_hour: Option<EvaluatedWindow>,
     weekly: Option<EvaluatedWindow>,
-    active_windows: ActiveUsageWindows,
     metrics: UsageSelectionMetrics,
 }
 
@@ -188,6 +188,15 @@ struct ValidatedUsage {
     five_hour: Option<ValidatedWindow>,
     weekly: Option<ValidatedWindow>,
     available_windows: ActiveUsageWindows,
+}
+
+impl ValidatedUsage {
+    fn is_zero_usage(&self) -> bool {
+        [self.five_hour, self.weekly]
+            .into_iter()
+            .flatten()
+            .all(|window| window.used_percent.abs() <= ZERO_USAGE_EPSILON)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -304,6 +313,7 @@ fn evaluated_candidates<'a>(
     validated
         .into_iter()
         .filter_map(|(order, account, usage)| {
+            let is_zero_usage = usage.is_zero_usage();
             evaluate_usage(
                 usage,
                 active_windows,
@@ -314,7 +324,7 @@ fn evaluated_candidates<'a>(
                 account,
                 five_hour: evaluated.five_hour,
                 weekly: evaluated.weekly,
-                active_windows: evaluated.active_windows,
+                is_zero_usage,
                 metrics: evaluated.metrics,
                 order,
             })
@@ -400,7 +410,6 @@ fn evaluate_usage(
     Some(EvaluatedUsage {
         five_hour,
         weekly,
-        active_windows,
         metrics: UsageSelectionMetrics {
             five_hour_headroom: five_hour.map(|window| window.headroom),
             weekly_headroom: weekly.map(|window| window.headroom),
